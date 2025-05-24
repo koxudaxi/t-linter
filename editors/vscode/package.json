@@ -1,0 +1,112 @@
+{
+  "name": "t-linter",
+  "displayName": "Python Template Strings (PEP 750)",
+  "description": "Syntax highlighting for Python template strings with embedded languages",
+  "version": "0.1.0",
+  "publisher": "koxudaxi",
+  "author": {
+    "name": "Koudai Aono",
+    "email": "koxudaxi@gmail.com"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/koxudaxi/t-linter"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "keywords": [
+    "python",
+    "template strings",
+    "pep750",
+    "syntax highlighting",
+    "lsp"
+  ],
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "activationEvents": [
+    "onLanguage:python"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "semanticTokenScopes": [
+      {
+        "scopes": {
+          "string": ["meta.template-string.python"]
+        }
+      }
+    ],
+    "configurationDefaults": {
+      "[python]": {
+        "editor.semanticHighlighting.enabled": true
+      }
+    },
+    "configuration": {
+      "title": "T-Linter",
+      "properties": {
+        "t-linter.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable/disable t-linter"
+        },
+        "t-linter.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces the communication between VSCode and the t-linter language server"
+        },
+        "t-linter.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to t-linter executable. Run 'cargo install t-linter' to install."
+        },
+        "t-linter.highlightUntyped": {
+          "type": "boolean",
+          "default": true,
+          "description": "Highlight template strings without type annotations"
+        },
+        "t-linter.enableTypeChecking": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable integration with Python type checkers for cross-module type resolution"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "t-linter.restart",
+        "title": "Restart T-Linter Server",
+        "category": "T-Linter"
+      },
+      {
+        "command": "t-linter.showStats",
+        "title": "Show Template String Statistics",
+        "category": "T-Linter"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "node build.js",
+    "watch": "node build.js --watch",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.74.0",
+    "@vscode/vsce": "^2.22.0",
+    "esbuild": "^0.25.4",
+    "typescript": "^5.3.0"
+  }
+}

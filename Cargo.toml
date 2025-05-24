@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/t-linter",
+    "crates/t-linter-core",
+    "crates/t-linter-lsp",
+    "crates/t-linter-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Koudai Aono <koxudaxi@gmail.com>"]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/koxudaxi/t-linter"
+
+[workspace.dependencies]
+anyhow = "1.0.98"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tree-sitter = "0.25.4"
+tree-sitter-python = { git = "https://github.com/koxudaxi/tree-sitter-python", branch = "feature/pep-750-template-strings" }
+tree-sitter-highlight = "0.25.4"
+tree-sitter-html = "0.23.2"
+tree-sitter-css = "0.23.2"
+tree-sitter-javascript = "0.23.1"
+tree-sitter-json = "0.24.8"
+tree-sitter-sequel = "0.3.8"
+tokio = { version = "1.45.0", features = ["full"] }
+tower-lsp = "0.20"
+clap = { version = "4.5.38", features = ["derive"] }
+tracing = "0.1.41"
+tracing-subscriber = { version =  "0.3.19", features = ["env-filter", "fmt"] }

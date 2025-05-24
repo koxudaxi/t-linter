@@ -1,0 +1,18 @@
+[package]
+name = "t-linter"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "t-linter"
+path = "src/main.rs"
+
+[dependencies]
+t-linter-lsp = { path = "../t-linter-lsp" }
+t-linter-cli = { path = "../t-linter-cli" }
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true

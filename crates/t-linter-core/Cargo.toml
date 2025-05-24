@@ -1,0 +1,26 @@
+[package]
+name = "t-linter-core"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tree-sitter.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-highlight = "0.25.4"
+tree-sitter-html = "0.23.2"
+tree-sitter-css = "0.23.2"
+tree-sitter-javascript = "0.23.1"
+tree-sitter-json = "0.24.8"
+tracing.workspace = true
+regex = "1.11.1"
+
+[features]
+default = ["sql"]
+sql = ["tree-sitter-sequel"]
+
+[dependencies.tree-sitter-sequel]
+version = "0.3.8"
+optional = true

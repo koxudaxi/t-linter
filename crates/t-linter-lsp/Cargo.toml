@@ -1,0 +1,15 @@
+[package]
+name = "t-linter-lsp"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+t-linter-core = { path = "../t-linter-core" }
+anyhow.workspace = true
+serde.workspace = true
+tower-lsp.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+dashmap = "6.1.0"
