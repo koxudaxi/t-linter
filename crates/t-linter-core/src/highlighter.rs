@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use tracing::info;
 use tree_sitter::{Parser, Language};
 use tree_sitter_highlight::{Highlighter, HighlightConfiguration, HighlightEvent};
-use crate::parser::{TemplateStringInfo, Expression};
+use crate::parser::{TemplateStringInfo, Expression, Location};
 
 
 
@@ -215,7 +215,7 @@ impl TemplateHighlighter {
                 end: placeholder_end,
             });
 
-            last_end = absolute_pos + 2;  // Skip {}
+            last_end = absolute_pos + 2;
             search_start = absolute_pos + 2;
         }
 
@@ -238,7 +238,7 @@ impl TemplateHighlighter {
             sanitized
         }
     }
-    
+
 
     fn get_highlight_index(&self, name: &str) -> usize {
         self.highlight_names.iter()
@@ -268,7 +268,7 @@ impl TemplateHighlighter {
 
         (line, col)
     }
-    
+
     pub fn to_lsp_tokens(
         &self,
         ranges: Vec<HighlightedRange>,
@@ -291,62 +291,39 @@ impl TemplateHighlighter {
             ));
         }
 
-        let actual_content = &template.raw_content[prefix_len..template.raw_content.len() - 1]; // 末尾の引用符を除く
+        let suffix_len = if template.flags.is_triple { 3 } else { 1 };
+        let actual_content = &template.raw_content[prefix_len..template.raw_content.len() - suffix_len];
 
         for (i, range) in ranges.iter().enumerate() {
             if range.highlight_name == "variable.parameter" {
                 continue;
             }
 
-            let mut content_idx = 0;
-            let mut actual_idx = 0;
-            let content_bytes = template.content.as_bytes();
-            let actual_bytes = actual_content.as_bytes();
+            let (doc_line, doc_col) = self.map_template_position_to_document(
+                &template.content,
+                actual_content,
+                range.start_byte,
+                template_start_line,
+                template_start_col,
+                prefix_len,
+            );
 
-            while content_idx < range.start_byte && actual_idx < actual_bytes.len() {
-                if content_idx + 1 < content_bytes.len() &&
-                    content_bytes[content_idx] == b'{' &&
-                    content_bytes[content_idx + 1] == b'}' {
-                    if actual_idx < actual_bytes.len() && actual_bytes[actual_idx] == b'{' {
-                        let mut expr_end = actual_idx + 1;
-                        while expr_end < actual_bytes.len() && actual_bytes[expr_end] != b'}' {
-                            expr_end += 1;
-                        }
-                        if expr_end < actual_bytes.len() {
-                            expr_end += 1;
-                        }
-                        actual_idx = expr_end;
-                    }
-                    content_idx += 2;
-                } else {
-                    content_idx += 1;
-                    actual_idx += 1;
-                }
-            }
+            let length = range.end_byte - range.start_byte;
 
-            let start_in_actual = actual_idx;
-
-            let length_in_content = range.end_byte - range.start_byte;
-            let end_in_actual = start_in_actual + length_in_content;
-
-            info!("Range {}: {} content[{}..{}]='{}' -> actual[{}..{}]", 
+            info!("Range {}: {} content[{}..{}]='{}' -> line {} col {}", 
                 i, 
                 range.highlight_name,
                 range.start_byte,
                 range.end_byte,
-                &template.content[range.start_byte..range.end_byte],
-                start_in_actual,
-                end_in_actual
+                &template.content[range.start_byte..range.end_byte].replace('\n', "\\n"),
+                doc_line,
+                doc_col
             );
-
-            let line = template_start_line;
-            let col = template_start_col + prefix_len + start_in_actual;
-            let length = end_in_actual - start_in_actual;
 
             if length > 0 {
                 tokens.push((
-                    line as u32,
-                    col as u32,
+                    doc_line as u32,
+                    doc_col as u32,
                     length as u32,
                     self.token_type_to_index(&range.highlight_name),
                     0,
@@ -382,7 +359,7 @@ impl TemplateHighlighter {
         mappings
     }
 
-    
+
     fn calculate_template_content_offset(&self, raw_content: &str) -> usize {
         if raw_content.starts_with("t\"\"\"") || raw_content.starts_with("t'''") {
             4
@@ -397,15 +374,59 @@ impl TemplateHighlighter {
         }
     }
 
+    fn map_template_position_to_document(
+        &self,
+        template_content: &str,
+        actual_content: &str,
+        position_in_template: usize,
+        template_start_line: usize,
+        template_start_col: usize,
+        prefix_len: usize,
+    ) -> (usize, usize) {
+        let mut template_idx = 0;
+        let mut actual_idx = 0;
+        let template_bytes = template_content.as_bytes();
+        let actual_bytes = actual_content.as_bytes();
+
+        while template_idx < position_in_template && actual_idx < actual_bytes.len() {
+            if template_idx + 1 < template_bytes.len() &&
+                template_bytes[template_idx] == b'{' &&
+                template_bytes[template_idx + 1] == b'}' {
+                if actual_idx < actual_bytes.len() && actual_bytes[actual_idx] == b'{' {
+                    let mut expr_end = actual_idx + 1;
+                    while expr_end < actual_bytes.len() && actual_bytes[expr_end] != b'}' {
+                        expr_end += 1;
+                    }
+                    if expr_end < actual_bytes.len() {
+                        expr_end += 1;
+                    }
+                    actual_idx = expr_end;
+                }
+                template_idx += 2;
+            } else {
+                template_idx += 1;
+                actual_idx += 1;
+            }
+        }
+
+        let mut line = template_start_line;
+        let mut col = template_start_col + prefix_len;
+
+        for i in 0..actual_idx {
+            if actual_bytes[i] == b'\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+
+        (line, col)
+    }
+
 
     fn token_type_to_index(&self, highlight_name: &str) -> u32 {
         match highlight_name {
-            // VSCode token type indices:
-            // 0: namespace, 1: type, 2: class, 3: enum, 4: interface, 5: struct,
-            // 6: typeParameter, 7: parameter, 8: variable, 9: property, 10: enumMember,
-            // 11: event, 12: function, 13: method, 14: macro, 15: keyword, 16: modifier,
-            // 17: comment, 18: string, 19: number, 20: regexp, 21: operator, 22: decorator
-
             "keyword" => 15,
             "function" | "function.builtin" => 12,
             "variable" | "variable.builtin" | "variable.parameter" => 8,
@@ -415,11 +436,11 @@ impl TemplateHighlighter {
             "type" | "type.builtin" => 1,
             "class" | "constructor" => 2,
             "property" => 9,
-            "tag" => 2,  // Map HTML tags to class
-            "attribute" => 9,  // Map attributes to property
+            "tag" => 2,
+            "attribute" => 9,
             "operator" => 21,
-            "punctuation" | "punctuation.bracket" | "punctuation.delimiter" => 21,  // Map to operator
-            _ => 8,  // Default to variable
+            "punctuation" | "punctuation.bracket" | "punctuation.delimiter" => 21,
+            _ => 8,
         }
     }
 }
@@ -459,9 +480,65 @@ mod tests {
 
         let ranges = highlighter.highlight_template(&template).unwrap();
 
-        // Should have highlights for tags, attributes, and the placeholder
         assert!(ranges.iter().any(|r| r.highlight_name == "tag"));
         assert!(ranges.iter().any(|r| r.highlight_name == "attribute"));
         assert!(ranges.iter().any(|r| r.highlight_name == "variable.parameter"));
+    }
+
+    #[test]
+    fn test_multiline_html_highlighting() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+
+        let mut flags = TemplateStringFlags::default();
+        flags.is_triple = true;
+
+        let template = TemplateStringInfo {
+            content: "<div>\n  <span>{}</span>\n  {}\n</div>".to_string(),
+            raw_content: r#"t"""<div>
+  <span>{name}</span>
+  {123}
+</div>""""#.to_string(),
+            variable_name: Some("html".to_string()),
+            function_name: None,
+            language: Some("html".to_string()),
+            location: Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 4,
+                end_column: 10,
+            },
+            expressions: vec![
+                Expression {
+                    content: "name".to_string(),
+                    location: Location {
+                        start_line: 2,
+                        start_column: 10,
+                        end_line: 2,
+                        end_column: 14,
+                    },
+                },
+                Expression {
+                    content: "123".to_string(),
+                    location: Location {
+                        start_line: 3,
+                        start_column: 4,
+                        end_line: 3,
+                        end_column: 7,
+                    },
+                },
+            ],
+            flags,
+        };
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+
+        assert!(ranges.iter().any(|r| r.highlight_name == "tag"));
+        assert_eq!(ranges.iter().filter(|r| r.highlight_name == "variable.parameter").count(), 2);
+
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+        assert!(!tokens.is_empty());
+
+        let lines: Vec<_> = tokens.iter().map(|t| t.0).collect();
+        assert!(lines.iter().max().unwrap() > lines.iter().min().unwrap());
     }
 }

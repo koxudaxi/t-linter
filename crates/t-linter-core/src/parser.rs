@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
+use tracing::info;
 
 pub struct TemplateStringParser {
     parser: Parser,
@@ -143,6 +144,10 @@ impl TemplateStringParser {
             None
         };
 
+        info!("Extracted template: triple={}, content length={}, raw length={}", 
+            flags.is_triple, content.len(), raw_content.len());
+        info!("Content preview: '{}'", content.chars().take(50).collect::<String>().replace('\n', "\\n"));
+
         Ok(TemplateStringInfo {
             content,
             raw_content: raw_content.to_string(),
@@ -181,10 +186,19 @@ impl TemplateStringParser {
         let mut content_parts = Vec::new();
         let mut expressions = Vec::new();
         let mut cursor = string_node.walk();
+        let mut last_end_byte = 0;
 
         for child in string_node.children(&mut cursor) {
             match child.kind() {
                 "string_content" => {
+                    let start_byte = child.start_byte();
+                    let end_byte = child.end_byte();
+
+                    if last_end_byte > 0 && start_byte > last_end_byte {
+                        let between = &source[last_end_byte..start_byte];
+                        content_parts.push(between.to_string());
+                    }
+
                     let text = child.utf8_text(source.as_bytes())?;
                     let mut processed_content = String::new();
                     let mut chars = text.chars();
@@ -211,23 +225,52 @@ impl TemplateStringParser {
                     }
 
                     content_parts.push(processed_content);
+                    last_end_byte = end_byte;
                 }
                 "interpolation" => {
+                    let start_byte = child.start_byte();
+
+                    if last_end_byte > 0 && start_byte > last_end_byte {
+                        let between = &source[last_end_byte..start_byte];
+                        content_parts.push(between.to_string());
+                    }
+
                     content_parts.push("{}".to_string());
 
                     if let Some(expr) = self.extract_interpolation_expression(&child, source)? {
                         expressions.push(expr);
                     }
+
+                    last_end_byte = child.end_byte();
                 }
                 "escape_interpolation" => {
+                    let start_byte = child.start_byte();
+
+                    if last_end_byte > 0 && start_byte > last_end_byte {
+                        let between = &source[last_end_byte..start_byte];
+                        content_parts.push(between.to_string());
+                    }
+
                     let text = child.utf8_text(source.as_bytes())?;
                     if text == "{{" {
                         content_parts.push("{".to_string());
                     } else if text == "}}" {
                         content_parts.push("}".to_string());
                     }
+
+                    last_end_byte = child.end_byte();
                 }
-                _ => {}
+                "string_start" | "string_end" => {
+                    last_end_byte = child.end_byte();
+                }
+                _ => {
+                    let start_byte = child.start_byte();
+                    if last_end_byte > 0 && start_byte > last_end_byte {
+                        let between = &source[last_end_byte..start_byte];
+                        content_parts.push(between.to_string());
+                    }
+                    last_end_byte = child.end_byte();
+                }
             }
         }
 
@@ -403,5 +446,31 @@ html_content: Annotated[Template, "html"] = t"<h1>{title}</h1>"
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("html".to_string()));
         assert_eq!(templates[0].variable_name, Some("html_content".to_string()));
+    }
+
+    #[test]
+    fn test_multiline_template_with_expressions() {
+        let source = r#"
+html: Annotated[Template, "html"] = t"""<div>
+  <span>{name}</span>
+  {123}
+</div>"""
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        let template = &templates[0];
+
+        assert_eq!(template.language, Some("html".to_string()));
+        assert!(template.flags.is_triple);
+        assert_eq!(template.expressions.len(), 2);
+        assert_eq!(template.expressions[0].content, "name");
+        assert_eq!(template.expressions[1].content, "123");
+
+        assert!(template.content.contains('\n'));
+        assert!(template.content.contains("<div>\n"));
+        assert!(template.content.contains("<span>{}</span>"));
     }
 }

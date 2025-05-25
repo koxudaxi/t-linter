@@ -27,6 +27,41 @@ impl TLinterLanguageServer {
             highlighter: Arc::new(tokio::sync::Mutex::new(TemplateHighlighter::new()?)),
         })
     }
+
+    fn generate_fallback_tokens(
+        &self,
+        template: &TemplateStringInfo,
+        text: &str,
+    ) -> Vec<(u32, u32, u32, u32, u32)> {
+        let mut tokens = Vec::new();
+
+        let start_line = (template.location.start_line - 1) as u32;
+        let start_col = (template.location.start_column - 1) as u32;
+        let end_line = (template.location.end_line - 1) as u32;
+        let end_col = (template.location.end_column - 1) as u32;
+
+        if start_line == end_line {
+            let length = end_col - start_col;
+            tokens.push((start_line, start_col, length, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE));
+        } else {
+            let lines: Vec<&str> = text.lines().collect();
+
+            if let Some(first_line) = lines.get(start_line as usize) {
+                let first_line_len = first_line.len() as u32 - start_col;
+                tokens.push((start_line, start_col, first_line_len, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE));
+            }
+
+            for line_idx in (start_line + 1)..end_line {
+                if let Some(line) = lines.get(line_idx as usize) {
+                    tokens.push((line_idx, 0, line.len() as u32, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE));
+                }
+            }
+
+            tokens.push((end_line, 0, end_col, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE));
+        }
+
+        tokens
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -41,7 +76,6 @@ impl LanguageServer for TLinterLanguageServer {
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
                             legend: SemanticTokensLegend {
-                                // Match VSCode's expected token types
                                 token_types: vec![
                                     SemanticTokenType::NAMESPACE,
                                     SemanticTokenType::TYPE,
@@ -273,15 +307,15 @@ impl TLinterLanguageServer {
 
         for (idx, template) in templates.iter().enumerate() {
             info!(
-            "Template {}: language={:?}, raw='{}', location={}:{}-{}:{}",
-            idx,
-            template.language,
-            template.raw_content.chars().take(30).collect::<String>(),
-            template.location.start_line,
-            template.location.start_column,
-            template.location.end_line,
-            template.location.end_column
-        );
+                "Template {}: language={:?}, raw='{}', location={}:{}-{}:{}",
+                idx,
+                template.language,
+                template.raw_content.chars().take(50).collect::<String>().replace('\n', "\\n"),
+                template.location.start_line,
+                template.location.start_column,
+                template.location.end_line,
+                template.location.end_column
+            );
 
             if let Some(lang) = &template.language {
                 info!("Attempting to highlight {} template", lang);
@@ -291,9 +325,9 @@ impl TLinterLanguageServer {
                     Ok(ranges) => {
                         info!("Successfully highlighted {} ranges", ranges.len());
 
-                        for (i, range) in ranges.iter().take(3).enumerate() {
+                        for (i, range) in ranges.iter().take(5).enumerate() {
                             info!("  Range {}: {}..{} type={}", 
-                            i, range.start_byte, range.end_byte, range.highlight_name);
+                                i, range.start_byte, range.end_byte, range.highlight_name);
                         }
 
                         let tokens = highlighter.to_lsp_tokens(ranges, template);
@@ -309,44 +343,14 @@ impl TLinterLanguageServer {
                             )
                             .await;
 
-                        let start_line = (template.location.start_line - 1) as u32;
-                        let start_col = (template.location.start_column - 1) as u32;
-                        let end_col = (template.location.end_column - 1) as u32;
-                        let length = end_col - start_col;
-
-                        all_tokens.push((start_line, start_col, length, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE));
+                        let tokens = self.generate_fallback_tokens(template, &text);
+                        all_tokens.extend(tokens);
                     }
                 }
             } else {
-                info!("No language specified, using single token");
-
-                let start_line = (template.location.start_line - 1) as u32;
-                let start_col = (template.location.start_column - 1) as u32;
-                let end_line = (template.location.end_line - 1) as u32;
-                let end_col = (template.location.end_column - 1) as u32;
-
-                if start_line == end_line {
-                    let length = end_col - start_col;
-                    info!(
-                    "Single-line template token: line={}, col={}, len={}",
-                    start_line, start_col, length
-                );
-
-                    all_tokens.push((start_line, start_col, length, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE));
-                } else {
-                    info!("Multi-line template from line {} to {}", start_line + 1, end_line + 1);
-
-                    let first_line = text.lines().nth(start_line as usize).unwrap_or("");
-                    let first_line_len = first_line.len() as u32 - start_col;
-                    all_tokens.push((start_line, start_col, first_line_len, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE));
-
-                    for line_idx in (start_line + 1)..end_line {
-                        let line = text.lines().nth(line_idx as usize).unwrap_or("");
-                        all_tokens.push((line_idx, 0, line.len() as u32, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE));
-                    }
-
-                    all_tokens.push((end_line, 0, end_col, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE));
-                }
+                info!("No language specified, using fallback tokens");
+                let tokens = self.generate_fallback_tokens(template, &text);
+                all_tokens.extend(tokens);
             }
         }
 
@@ -358,8 +362,8 @@ impl TLinterLanguageServer {
             a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3 && a.4 == b.4
         });
 
-        info!("Sorted tokens:");
-        for (i, &(line, col, len, typ, _)) in all_tokens.iter().enumerate() {
+        info!("Final sorted tokens:");
+        for (i, &(line, col, len, typ, _)) in all_tokens.iter().enumerate().take(10) {
             info!("  Token {}: line={}, col={}, len={}, type={}", i, line, col, len, typ);
         }
 
