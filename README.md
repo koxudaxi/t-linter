@@ -13,6 +13,8 @@ t-linter provides intelligent syntax highlighting and linting for Python templat
 - **🔧 Command-line tool**: Install via PyPI (`pip install t-linter`) for direct CLI usage and LSP server
 - **🎨 VSCode Extension**: Install from the Visual Studio Code Marketplace for seamless editor integration
 
+![T-Linter VSCode Extension in action](editors/vscode/images/img.png)
+
 ## Features
 
 - 🎨 **Smart Syntax Highlighting** - Detects embedded languages in `t"..."` strings
