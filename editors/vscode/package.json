@@ -1,7 +1,7 @@
 {
   "name": "t-linter",
-  "displayName": "Python Template Strings (PEP 750)",
-  "description": "Syntax highlighting for Python template strings with embedded languages",
+  "displayName": "T-Linter - Python Template Strings Highlighter & Linter",
+  "description": "Syntax highlighting, linting, and type checking for Python template strings (PEP 750). Supports embedded languages in t\"\" strings.",
   "version": "0.1.0",
   "publisher": "koxudaxi",
   "icon": "icon.png",

@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
@@ -23,11 +23,21 @@ jobs:
     - name: Compile
       working-directory: editors/vscode
       run: npm run compile
-    
+
+    - name: Package Extension
+      working-directory: editors/vscode
+      run: |
+        npm install -g @vscode/vsce
+        vsce package
+
     - name: Publish to VSCode Marketplace
       working-directory: editors/vscode
       env:
         VSCE_PAT: ${{ secrets.VSCE_PAT }}
-      run: |
-        npm install -g @vscode/vsce
-        vsce publish
+      run: vsce publish
+
+    - name: Upload to GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: editors/vscode/*.vsix
+        token: ${{ secrets.GITHUB_TOKEN }}
