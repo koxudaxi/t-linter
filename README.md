@@ -11,3 +11,35 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 - 🚀 **Fast** - Built with Rust and Tree-sitter for optimal performance
 - 🔧 **Extensible** - Support for HTML, SQL, JavaScript, CSS, and more
 
+## Installation
+
+Install using pip:
+
+```bash
+pip install t-linter
+```
+
+## Usage
+
+Run the language server:
+
+```bash
+t-linter lsp
+```
+
+Check files:
+
+```bash
+t-linter check file.py
+```
+
+## Development
+
+For development, you can also build from source:
+
+```bash
+git clone https://github.com/koxudaxi/t-linter
+cd t-linter
+cargo install --path crates/t-linter
+```
+

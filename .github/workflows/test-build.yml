@@ -1,0 +1,25 @@
+name: Test Build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test-build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Build wheel
+      uses: PyO3/maturin-action@v1
+      with:
+        args: --release --out dist
+    
+    - name: Test installation
+      run: |
+        pip install dist/*.whl
+        t-linter --version
