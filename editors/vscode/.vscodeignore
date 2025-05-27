@@ -2,11 +2,15 @@
 .vscode-test/**
 src/**
 .gitignore
+.yarnrc
 tsconfig.json
-webpack.config.js
 build.js
 node_modules/**
+*.ts
+\!*.d.ts
 **/*.map
-.eslintrc.json
 **/*.ts
-!out/extension.js
+.github/**
+*.vsix
+icon-placeholder.txt
+EOF < /dev/null
