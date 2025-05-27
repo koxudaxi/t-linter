@@ -2,6 +2,8 @@
 
 Intelligent syntax highlighting and validation for Python template strings (PEP 750) with embedded language support.
 
+![T-Linter in action](images/img.png)
+
 ## Features
 
 - 🎨 **Smart Syntax Highlighting** - Automatic detection and highlighting of embedded languages
@@ -21,20 +23,56 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 
 - Visual Studio Code 1.74.0 or higher
 - Python 3.9+ (PEP 750 template strings require Python 3.14+)
-- `t-linter` language server (installed automatically or manually)
+- `t-linter` language server (must be installed via PyPI)
 
 ## Installation
 
-### Option 1: Install from VSCode Marketplace
-1. Open VSCode
-2. Go to Extensions (Ctrl+Shift+X)
-3. Search for "t-linter"
-4. Click Install
+**⚠️ Important**: This extension requires the t-linter language server to be installed separately.
 
-### Option 2: Install t-linter manually
+### Step 1: Install the t-linter language server
 ```bash
 pip install t-linter
 ```
+
+### Step 2: Install the VSCode extension
+1. Open VSCode
+2. Go to Extensions (Ctrl+Shift+X)
+3. Search for "t-linter"
+4. Click Install on "T-Linter - Python Template Strings Highlighter & Linter" by koxudaxi
+
+### Step 3: Configure server path (if needed)
+If the extension can't find the t-linter binary automatically:
+
+1. **Find your t-linter path**:
+   ```bash
+   which t-linter     # macOS/Linux
+   where t-linter     # Windows
+   ```
+
+2. **Set the path in VSCode settings**:
+   - Open Settings (Ctrl+, / Cmd+,)
+   - Search for `t-linter.serverPath`
+   - Enter the full path to your t-linter executable
+
+### Optional: PEP 750 Support with Patched Pyright
+
+Since PEP 750 template strings (`t"..."`) are not yet supported in the official Pyright extension, you can install a patched version that adds PEP 750 t-string support:
+
+1. **Download the patched Pyright extension**:
+   - Go to [Patched Pyright Releases](https://github.com/koxudaxi/pyright/releases/tag/untagged-7b5f847f7a434b72a328)
+   - Download the `.vsix` file
+
+2. **Install the patched extension**:
+   - Open VSCode
+   - Press `Ctrl+Shift+P` (Cmd+Shift+P on macOS)
+   - Type "Extensions: Install from VSIX..."
+   - Select the downloaded `.vsix` file
+
+3. **Disable the original Pyright extension** (if installed):
+   - Go to Extensions tab
+   - Find "Pyright" and click "Disable"
+
+This patched version enables Pyright to recognize and type-check PEP 750 template strings, providing better integration with t-linter for comprehensive template string analysis.
 
 ## Usage
 
@@ -101,19 +139,34 @@ This extension contributes the following commands:
 ## Troubleshooting
 
 ### Language server not found
-If you see "t-linter binary not found", install it using:
-```bash
-pip install t-linter
-```
+If you see "t-linter binary not found":
+
+1. **Ensure t-linter is installed**:
+   ```bash
+   pip install t-linter
+   ```
+
+2. **Verify installation**:
+   ```bash
+   t-linter --version
+   ```
+
+3. **Configure server path manually**:
+   - Find the path: `which t-linter` (macOS/Linux) or `where t-linter` (Windows)
+   - Set `t-linter.serverPath` in VSCode settings
+   - Restart VSCode
 
 ### No syntax highlighting
-1. Ensure Python semantic highlighting is enabled
-2. Check that your template strings use the `t"..."` syntax
-3. Verify type annotations are correctly formatted
+1. Ensure both the PyPI package AND VSCode extension are installed
+2. Check that Python semantic highlighting is enabled in VSCode
+3. Verify your template strings use the `t"..."` syntax
+4. Ensure type annotations are correctly formatted
+5. Try restarting the language server: `Ctrl+Shift+P` → "T-Linter: Restart Server"
 
 ### Performance issues
 - Disable `t-linter.enableTypeChecking` if you don't need cross-module type resolution
 - Set `t-linter.trace.server` to "off" in production
+- Restart VSCode after changing settings
 
 ## Known Issues
 
