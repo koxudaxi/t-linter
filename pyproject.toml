@@ -34,9 +34,6 @@ Homepage = "https://github.com/koxudaxi/t-linter"
 Repository = "https://github.com/koxudaxi/t-linter"
 Issues = "https://github.com/koxudaxi/t-linter/issues"
 
-[project.scripts]
-t-linter = "t_linter:main"
-
 [tool.maturin]
 bindings = "bin"
 manifest-path = "crates/t-linter/Cargo.toml"
