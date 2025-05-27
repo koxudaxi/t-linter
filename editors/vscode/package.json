@@ -2,7 +2,7 @@
   "name": "t-linter",
   "displayName": "T-Linter - Python Template Strings Highlighter & Linter",
   "description": "Syntax highlighting, linting, and type checking for Python template strings (PEP 750). Supports embedded languages in t\"\" strings.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "koxudaxi",
   "icon": "icon.png",
   "author": {
