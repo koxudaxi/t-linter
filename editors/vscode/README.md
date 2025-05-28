@@ -168,7 +168,7 @@ This extension contributes the following settings:
 This extension contributes the following commands:
 
 - **`T-Linter: Restart Server`**: Restart the t-linter language server
-- **`T-Linter: Show Template String Statistics`**: Display statistics about template strings in the current file
+- **`T-Linter: Show Template String Statistics`**: Display statistics about template strings in the current file (🚧 Coming soon)
 
 ## Troubleshooting
 

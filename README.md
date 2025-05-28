@@ -139,15 +139,41 @@ If you installed via PyPI, you can use t-linter from the command line:
 t-linter lsp
 ```
 
-**Check individual files**:
+**Check files for issues** (🚧 Coming soon):
 ```bash
+# Check Python files for template string issues
 t-linter check file.py
+t-linter check src/
+
+# Output formats (when implemented)
+t-linter check file.py --format json
+t-linter check file.py --format github  # GitHub Actions annotations
+t-linter check file.py --error-on-issues  # Exit with error code if issues found
 ```
 
-**Get statistics** about template strings in a file:
+**Get template string statistics** (🚧 Coming soon):
 ```bash
-t-linter stats file.py
+# Analyze template string usage in your codebase
+t-linter stats .  # Current directory
+t-linter stats src/  # Specific directory
+
+# Expected output (when implemented):
+# - Number of template strings by language
+# - Template string locations
+# - Language detection methods used
+# - Type alias usage statistics
 ```
+
+## Roadmap
+
+### Planned Features
+- ✅ **Language Server Protocol (LSP)** - Fully implemented
+- ✅ **Syntax Highlighting** - Supports HTML, SQL, JavaScript, CSS, JSON
+- ✅ **Type Alias Support** - Recognizes `type html = Annotated[Template, "html"]`
+- 🚧 **Linting (`check` command)** - Validate template strings for syntax errors
+- 🚧 **Statistics (`stats` command)** - Analyze template string usage across codebases
+- 📋 **Cross-file Type Resolution** - Track type aliases across module boundaries
+- 📋 **Auto-completion** - Context-aware completions within template strings
 
 ## Quick Start Example
 
