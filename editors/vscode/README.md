@@ -40,7 +40,23 @@ pip install t-linter
 3. Search for "t-linter"
 4. Click Install on "T-Linter - Python Template Strings Highlighter & Linter" by koxudaxi
 
-### Step 3: Configure server path (if needed)
+### Step 3: Disable Python Language Server
+To prevent conflicts with t-linter's syntax highlighting, you need to disable the Python language server:
+
+1. Open VSCode Settings (Ctrl+, / Cmd+,)
+2. Search for "python.languageServer"
+3. Set it to "None"
+
+Alternatively, add to your settings.json:
+```json
+{
+    "python.languageServer": "None"
+}
+```
+
+[Learn more about Python language server settings](https://code.visualstudio.com/docs/python/settings-reference#_intellisense-engine-settings)
+
+### Step 4: Configure server path (if needed)
 If the extension can't find the t-linter binary automatically:
 
 1. **Find your t-linter path**:
@@ -158,10 +174,11 @@ If you see "t-linter binary not found":
 
 ### No syntax highlighting
 1. Ensure both the PyPI package AND VSCode extension are installed
-2. Check that Python semantic highlighting is enabled in VSCode
-3. Verify your template strings use the `t"..."` syntax
-4. Ensure type annotations are correctly formatted
-5. Try restarting the language server: `Ctrl+Shift+P` → "T-Linter: Restart Server"
+2. **Verify that Python language server is disabled**: `python.languageServer` should be set to "None"
+3. Check that Python semantic highlighting is enabled in VSCode
+4. Verify your template strings use the `t"..."` syntax
+5. Ensure type annotations are correctly formatted
+6. Try restarting the language server: `Ctrl+Shift+P` → "T-Linter: Restart Server"
 
 ### Performance issues
 - Disable `t-linter.enableTypeChecking` if you don't need cross-module type resolution
