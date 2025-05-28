@@ -30,8 +30,23 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 **⚠️ Important**: This extension requires the t-linter language server to be installed separately.
 
 ### Step 1: Install the t-linter language server
+Install t-linter as a project dependency (recommended):
 ```bash
 pip install t-linter
+```
+
+For better project isolation, add it to your project's requirements:
+```bash
+# Add to requirements.txt
+echo "t-linter" >> requirements.txt
+pip install -r requirements.txt
+
+# Or add to pyproject.toml
+[project]
+dependencies = [
+    "t-linter",
+    # other dependencies...
+]
 ```
 
 ### Step 2: Install the VSCode extension
@@ -157,9 +172,11 @@ This extension contributes the following commands:
 ### Language server not found
 If you see "t-linter binary not found":
 
-1. **Ensure t-linter is installed**:
+1. **Ensure t-linter is installed in your project**:
    ```bash
    pip install t-linter
+   # Or if using requirements.txt:
+   pip install -r requirements.txt
    ```
 
 2. **Verify installation**:
@@ -169,6 +186,10 @@ If you see "t-linter binary not found":
 
 3. **Configure server path manually**:
    - Find the path: `which t-linter` (macOS/Linux) or `where t-linter` (Windows)
+   - Common installation paths:
+     - **Windows**: `C:\Users\YourName\AppData\Local\Programs\Python\Python3xx\Scripts\t-linter.exe`
+     - **macOS**: `/Users/yourname/.local/bin/t-linter` or `/usr/local/bin/t-linter`
+     - **Linux**: `/home/yourname/.local/bin/t-linter` or `/usr/local/bin/t-linter`
    - Set `t-linter.serverPath` in VSCode settings
    - Restart VSCode
 

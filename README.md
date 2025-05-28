@@ -27,9 +27,16 @@ t-linter provides intelligent syntax highlighting and linting for Python templat
 ### Option 1: VSCode Extension (Recommended for VSCode users)
 
 **Step 1: Install the t-linter binary**
-First, install the language server via PyPI:
+Install t-linter as a project dependency (recommended):
 ```bash
 pip install t-linter
+```
+
+For better project isolation, add it to your project's requirements:
+```bash
+# Add to requirements.txt or pyproject.toml
+echo "t-linter" >> requirements.txt
+pip install -r requirements.txt
 ```
 
 **Step 2: Install the VSCode extension**
@@ -67,17 +74,30 @@ If t-linter is not in your PATH, configure the server path in VSCode settings:
 3. Search for "t-linter.serverPath"
 4. Set the full path to your t-linter executable:
    - **Windows**: `C:\Users\YourName\AppData\Local\Programs\Python\Python3xx\Scripts\t-linter.exe`
-   - **macOS**: `/opt/homebrew/bin/t-linter` or `/usr/local/bin/t-linter`
+   - **macOS**: `/Users/yourname/.local/bin/t-linter` or `/usr/local/bin/t-linter`
    - **Linux**: `/home/yourname/.local/bin/t-linter` or `/usr/local/bin/t-linter`
 
 **[→ Install from VSCode Marketplace](https://marketplace.visualstudio.com/items?itemName=koxudaxi.t-linter)**
 
 ### Option 2: PyPI Package Only (CLI tool and LSP server)
 
-For command-line usage or integration with other editors, install only the PyPI package:
+For command-line usage or integration with other editors, install t-linter as a project dependency:
 
 ```bash
 pip install t-linter
+```
+
+Or add to your project's dependencies:
+```bash
+# requirements.txt
+t-linter
+
+# or in pyproject.toml
+[project]
+dependencies = [
+    "t-linter",
+    # other dependencies...
+]
 ```
 
 This provides the `t-linter` command-line tool and LSP server without the VSCode extension.
