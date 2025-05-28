@@ -37,11 +37,14 @@ pip install t-linter
 
 For better project isolation, add it to your project's requirements:
 ```bash
-# Add to requirements.txt
+# Using pip with requirements.txt
 echo "t-linter" >> requirements.txt
 pip install -r requirements.txt
 
-# Or add to pyproject.toml
+# Or using uv (recommended for faster installs)
+uv add t-linter
+
+# Or manually add to pyproject.toml
 [project]
 dependencies = [
     "t-linter",

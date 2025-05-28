@@ -34,9 +34,12 @@ pip install t-linter
 
 For better project isolation, add it to your project's requirements:
 ```bash
-# Add to requirements.txt or pyproject.toml
+# Using pip with requirements.txt
 echo "t-linter" >> requirements.txt
 pip install -r requirements.txt
+
+# Or using uv (recommended for faster installs)
+uv add t-linter
 ```
 
 **Step 2: Install the VSCode extension**
@@ -89,10 +92,13 @@ pip install t-linter
 
 Or add to your project's dependencies:
 ```bash
-# requirements.txt
+# Using requirements.txt
 t-linter
 
-# or in pyproject.toml
+# Using uv
+uv add t-linter
+
+# Or manually in pyproject.toml
 [project]
 dependencies = [
     "t-linter",
