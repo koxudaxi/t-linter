@@ -133,7 +133,7 @@ page = t"""
 query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
 ```
 
-### Type Alias Support (Python 3.12+)
+### Type Alias Support
 ```python
 # Define reusable type aliases
 type html = Annotated[Template, "html"]
