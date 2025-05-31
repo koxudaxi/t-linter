@@ -210,7 +210,7 @@ WHERE u.created_at > {start_date}
 ORDER BY u.name
 """
 
-# Type aliases for reusable templates (Python 3.12+)
+# Type aliases for reusable templates
 type css = Annotated[Template, "css"]
 type js = Annotated[Template, "javascript"]
 
