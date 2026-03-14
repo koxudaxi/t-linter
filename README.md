@@ -123,7 +123,7 @@ cargo install --path crates/t-linter
 ## Usage
 
 ### VSCode Extension
-After installing both the PyPI package and VSCode extension, t-linter will automatically provide syntax highlighting for Python template strings. 
+After installing both the PyPI package and VSCode extension, t-linter will automatically provide syntax highlighting for Python template strings and document formatting for supported embedded languages.
 
 **Troubleshooting**: If syntax highlighting doesn't work:
 1. Ensure `t-linter` is installed: Run `t-linter --version` in terminal
@@ -153,6 +153,24 @@ t-linter check file.py --error-on-issues  # Exit with error code if issues found
 
 `check` supports `human`, `json`, and `github` output formats.
 
+**Format template strings**:
+```bash
+# Rewrite supported embedded templates in place
+t-linter format file.py
+t-linter format src/
+
+# Check whether formatting changes are needed
+t-linter format file.py --check
+```
+
+`format` currently supports `html`, `css`, `javascript`, `json`, `yaml`, and `toml`. `sql` formatting is not implemented yet.
+
+Formatting uses external tools:
+- `prettier` for `html`, `css`, `javascript`, `json`, and `yaml`
+- `taplo` for `toml`
+
+`t-linter` prefers `node_modules/.bin/prettier` from the workspace root and falls back to `prettier` on `PATH`. `taplo` is resolved from `PATH`.
+
 Configuration can be provided via `pyproject.toml`:
 
 ```toml
@@ -172,6 +190,11 @@ Exit codes:
 - `0`: Run completed successfully
 - `1`: Issues were found and `--error-on-issues` was set
 - `2`: Operational failure such as an unreadable file
+
+`format` exit codes:
+- `0`: Formatting completed successfully, or `--check` found no changes
+- `1`: `--check` found files that would be reformatted
+- `2`: Operational failure such as a missing formatter or unreadable file
 
 Example input:
 ```python
@@ -235,6 +258,22 @@ Example `github` output:
 ```text
 ::error file=example.py,line=4,col=46,title=t-linter(embedded-parse-error)::Invalid json syntax in template string (language=json)
 ```
+
+Example `format` input:
+```python
+from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "json"] = t"""{{"name": {value}}}"""
+```
+
+Example `format --check` output:
+```text
+Would reformat: example.py
+1 file would be reformatted, 0 files already formatted
+```
+
+The LSP server uses the same formatting engine, so editor actions such as "Format Document" work for supported embedded template languages as long as the required external formatter is available.
 
 **Get template string statistics** (🚧 Coming soon):
 ```bash

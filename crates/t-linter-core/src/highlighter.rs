@@ -528,6 +528,7 @@ mod tests {
             },
             expressions: vec![Expression {
                 content: "value".to_string(),
+                raw_content: "{value}".to_string(),
                 location: Location {
                     start_line: 1,
                     start_column: 20,
@@ -536,6 +537,8 @@ mod tests {
                 },
             }],
             flags: TemplateStringFlags::default(),
+            start_byte: 0,
+            end_byte: 0,
         };
 
         let ranges = highlighter.highlight_template(&template).unwrap();
@@ -575,6 +578,7 @@ mod tests {
             expressions: vec![
                 Expression {
                     content: "name".to_string(),
+                    raw_content: "{name}".to_string(),
                     location: Location {
                         start_line: 2,
                         start_column: 10,
@@ -584,6 +588,7 @@ mod tests {
                 },
                 Expression {
                     content: "123".to_string(),
+                    raw_content: "{123}".to_string(),
                     location: Location {
                         start_line: 3,
                         start_column: 4,
@@ -593,6 +598,8 @@ mod tests {
                 },
             ],
             flags,
+            start_byte: 0,
+            end_byte: 0,
         };
 
         let ranges = highlighter.highlight_template(&template).unwrap();
@@ -633,6 +640,7 @@ mod tests {
             },
             expressions: vec![Expression {
                 content: "value".to_string(),
+                raw_content: "{value}".to_string(),
                 location: Location {
                     start_line: 1,
                     start_column: 30,
@@ -641,6 +649,8 @@ mod tests {
                 },
             }],
             flags: TemplateStringFlags::default(),
+            start_byte: 0,
+            end_byte: 0,
         };
 
         let ranges = highlighter.highlight_template(&template).unwrap();
@@ -677,6 +687,7 @@ mod tests {
             },
             expressions: vec![Expression {
                 content: "value".to_string(),
+                raw_content: "{value}".to_string(),
                 location: Location {
                     start_line: 3,
                     start_column: 8,
@@ -685,6 +696,8 @@ mod tests {
                 },
             }],
             flags: TemplateStringFlags::default(),
+            start_byte: 0,
+            end_byte: 0,
         };
 
         let ranges = highlighter.highlight_template(&template).unwrap();
@@ -717,6 +730,7 @@ mod tests {
             },
             expressions: vec![Expression {
                 content: "value".to_string(),
+                raw_content: "{value}".to_string(),
                 location: Location {
                     start_line: 3,
                     start_column: 9,
@@ -725,6 +739,8 @@ mod tests {
                 },
             }],
             flags: TemplateStringFlags::default(),
+            start_byte: 0,
+            end_byte: 0,
         };
 
         let ranges = highlighter.highlight_template(&template).unwrap();

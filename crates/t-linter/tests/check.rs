@@ -8,10 +8,7 @@ fn test_dir(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "t-linter-{name}-{}-{nanos}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("t-linter-{name}-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -118,7 +115,13 @@ template: Annotated[Template, "toml"] = t"title ="
 
     let output = run_check(
         &dir,
-        &["check", "broken.py", "--format", "github", "--error-on-issues"],
+        &[
+            "check",
+            "broken.py",
+            "--format",
+            "github",
+            "--error-on-issues",
+        ],
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();

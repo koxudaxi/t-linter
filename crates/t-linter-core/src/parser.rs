@@ -399,6 +399,8 @@ impl TemplateStringParser {
             },
             expressions,
             flags,
+            start_byte: node.start_byte(),
+            end_byte: node.end_byte(),
         })
     }
 
@@ -534,6 +536,7 @@ impl TemplateStringParser {
 
                 return Ok(Some(Expression {
                     content: expr_content.to_string(),
+                    raw_content: interpolation_node.utf8_text(source.as_bytes())?.to_string(),
                     location: Location {
                         start_line: start.row + 1,
                         start_column: start.column + 1,
@@ -753,6 +756,8 @@ pub struct TemplateStringInfo {
     pub location: Location,
     pub expressions: Vec<Expression>,
     pub flags: TemplateStringFlags,
+    pub start_byte: usize,
+    pub end_byte: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -766,6 +771,7 @@ pub struct Location {
 #[derive(Debug, Clone)]
 pub struct Expression {
     pub content: String,
+    pub raw_content: String,
     pub location: Location,
 }
 

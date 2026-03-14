@@ -151,8 +151,10 @@ fn lint_template(path: &Path, template: &TemplateStringInfo) -> Result<Vec<LintD
     };
 
     for node in nodes {
-        let start_offset = map_processed_offset(&processed.processed_to_original, node.start_byte());
-        let mut end_offset = map_processed_offset(&processed.processed_to_original, node.end_byte());
+        let start_offset =
+            map_processed_offset(&processed.processed_to_original, node.start_byte());
+        let mut end_offset =
+            map_processed_offset(&processed.processed_to_original, node.end_byte());
 
         if end_offset <= start_offset {
             end_offset = next_char_boundary(&template.content, start_offset);

@@ -7,7 +7,7 @@ use clap::Subcommand;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::Serialize;
 use t_linter_core::{
-    file_read_error, lint_source, LintDiagnostic, LintFileResult, LintRunSummary,
+    LintDiagnostic, LintFileResult, LintRunSummary, file_read_error, format_source, lint_source,
 };
 
 const DEFAULT_EXCLUDES: &[&str] = &[
@@ -37,6 +37,13 @@ pub enum Commands {
         #[arg(long)]
         error_on_issues: bool,
     },
+    Format {
+        #[arg(required = true)]
+        paths: Vec<String>,
+
+        #[arg(long)]
+        check: bool,
+    },
     Stats {
         #[arg(default_value = ".")]
         path: String,
@@ -60,7 +67,14 @@ struct CheckReport {
 #[derive(Default)]
 struct WalkReport {
     python_files: Vec<PathBuf>,
-    failures: Vec<LintFileResult>,
+    failures: Vec<PathBuf>,
+}
+
+#[derive(Default)]
+struct FormatSummary {
+    reformatted: usize,
+    unchanged: usize,
+    failed: usize,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -91,7 +105,11 @@ struct DiscoveryConfig {
 
 pub fn check(paths: Vec<String>, format: OutputFormat, error_on_issues: bool) -> Result<i32> {
     let walk_report = collect_python_files(&paths)?;
-    let mut file_results = walk_report.failures;
+    let mut file_results = walk_report
+        .failures
+        .into_iter()
+        .map(|path| file_read_error(&path))
+        .collect::<Vec<_>>();
 
     for path in walk_report.python_files {
         match fs::read_to_string(&path) {
@@ -119,9 +137,15 @@ pub fn check(paths: Vec<String>, format: OutputFormat, error_on_issues: bool) ->
 
     let summary = LintRunSummary {
         files_scanned: file_results.len(),
-        templates_scanned: file_results.iter().map(|result| result.template_count).sum(),
+        templates_scanned: file_results
+            .iter()
+            .map(|result| result.template_count)
+            .sum(),
         diagnostics: diagnostics.len(),
-        failed_files: file_results.iter().filter(|result| has_read_failure(result)).count(),
+        failed_files: file_results
+            .iter()
+            .filter(|result| has_read_failure(result))
+            .count(),
     };
 
     let report = CheckReport {
@@ -152,25 +176,105 @@ pub fn stats(path: String) -> Result<()> {
     Ok(())
 }
 
-fn collect_python_files(paths: &[String]) -> Result<WalkReport> {
-    let mut report = WalkReport::default();
+pub fn format(paths: Vec<String>, check: bool) -> Result<i32> {
     let discovery = load_discovery_config(&std::env::current_dir()?)?;
+    let walk_report = collect_python_files_with_discovery(&paths, &discovery);
+    let mut summary = FormatSummary::default();
 
+    for failure in walk_report.failures {
+        eprintln!("Failed to read {}", failure.display());
+        summary.failed += 1;
+    }
+
+    for path in walk_report.python_files {
+        let source = match fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(_) => {
+                eprintln!("Failed to read {}", path.display());
+                summary.failed += 1;
+                continue;
+            }
+        };
+
+        match format_source(&source, &discovery.root) {
+            Ok(result) => {
+                if result.changed {
+                    if check {
+                        println!("Would reformat: {}", path.display());
+                    } else {
+                        fs::write(&path, result.formatted_source)
+                            .with_context(|| format!("Failed to write {}", path.display()))?;
+                    }
+                    summary.reformatted += 1;
+                } else {
+                    summary.unchanged += 1;
+                }
+            }
+            Err(error) => {
+                eprintln!("Failed to format {}: {}", path.display(), error);
+                summary.failed += 1;
+            }
+        }
+    }
+
+    if check {
+        println!(
+            "{} file{} would be reformatted, {} file{} already formatted",
+            summary.reformatted,
+            plural_suffix(summary.reformatted),
+            summary.unchanged,
+            plural_suffix(summary.unchanged),
+        );
+    } else {
+        println!(
+            "{} file{} reformatted, {} file{} left unchanged",
+            summary.reformatted,
+            plural_suffix(summary.reformatted),
+            summary.unchanged,
+            plural_suffix(summary.unchanged),
+        );
+    }
+
+    if summary.failed > 0 {
+        eprintln!(
+            "{} file{} failed to format",
+            summary.failed,
+            plural_suffix(summary.failed),
+        );
+        Ok(2)
+    } else if check && summary.reformatted > 0 {
+        Ok(1)
+    } else {
+        Ok(0)
+    }
+}
+
+fn collect_python_files(paths: &[String]) -> Result<WalkReport> {
+    let discovery = load_discovery_config(&std::env::current_dir()?)?;
+    Ok(collect_python_files_with_discovery(paths, &discovery))
+}
+
+fn collect_python_files_with_discovery(
+    paths: &[String],
+    discovery: &DiscoveryConfig,
+) -> WalkReport {
+    let mut report = WalkReport::default();
     for path in paths {
         collect_path(Path::new(path), &mut report, &discovery);
     }
 
     report.python_files.sort();
     report.python_files.dedup();
-    report.failures.sort_by(|left, right| left.file.cmp(&right.file));
-    Ok(report)
+    report.failures.sort();
+    report.failures.dedup();
+    report
 }
 
 fn collect_path(path: &Path, report: &mut WalkReport, discovery: &DiscoveryConfig) {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(_) => {
-            report.failures.push(file_read_error(path));
+            report.failures.push(path.to_path_buf());
             return;
         }
     };
@@ -187,7 +291,7 @@ fn collect_path(path: &Path, report: &mut WalkReport, discovery: &DiscoveryConfi
         let mut entries = match fs::read_dir(path) {
             Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
             Err(_) => {
-                report.failures.push(file_read_error(path));
+                report.failures.push(path.to_path_buf());
                 return;
             }
         };
@@ -230,10 +334,12 @@ fn load_discovery_config(start_dir: &Path) -> Result<DiscoveryConfig> {
 
     let mut builder = GitignoreBuilder::new(&root);
 
-    let base_excludes = config
-        .exclude
-        .clone()
-        .unwrap_or_else(|| DEFAULT_EXCLUDES.iter().map(|value| (*value).to_string()).collect());
+    let base_excludes = config.exclude.clone().unwrap_or_else(|| {
+        DEFAULT_EXCLUDES
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect()
+    });
     for pattern in base_excludes {
         builder
             .add_line(None, &pattern)
@@ -273,10 +379,7 @@ fn should_ignore_path(path: &Path, is_dir: bool, discovery: &DiscoveryConfig) ->
         return false;
     }
 
-    discovery
-        .matcher
-        .matched(relative, is_dir)
-        .is_ignore()
+    discovery.matcher.matched(relative, is_dir).is_ignore()
 }
 
 fn is_python_file(path: &Path) -> bool {
@@ -284,6 +387,10 @@ fn is_python_file(path: &Path) -> bool {
         .and_then(OsStr::to_str)
         .map(|extension| extension.eq_ignore_ascii_case("py"))
         .unwrap_or(false)
+}
+
+fn plural_suffix(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
 }
 
 fn print_human_report(report: &CheckReport) {

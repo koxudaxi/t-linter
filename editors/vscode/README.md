@@ -7,6 +7,7 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 ## Features
 
 - 🎨 **Smart Syntax Highlighting** - Automatic detection and highlighting of embedded languages
+- 🧹 **Document Formatting** - Format supported embedded template strings via "Format Document"
 - 🔍 **Type-based Detection** - Understands `Annotated[Template, "language"]` annotations
 - 💡 **IntelliSense Support** - Code completion within template strings
 - 🚀 **Fast & Lightweight** - Built with Rust for optimal performance
@@ -20,6 +21,8 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 - JSON
 - YAML
 - TOML
+
+Formatting support is currently available for HTML, JavaScript, CSS, JSON, YAML, and TOML. SQL highlighting is supported, but SQL formatting is not yet implemented.
 
 ## Requirements
 
@@ -52,6 +55,16 @@ dependencies = [
     "t-linter",
     # other dependencies...
 ]
+```
+
+If you want to use document formatting, install the external formatters used by t-linter:
+
+```bash
+# JavaScript, HTML, CSS, JSON, YAML
+npm install --save-dev prettier
+
+# TOML
+cargo install taplo-cli
 ```
 
 ### Step 2: Install the VSCode extension
@@ -141,6 +154,8 @@ app:
   debug: true
 """
 ```
+
+Use VS Code's "Format Document" command to format supported template strings in the current Python file. t-linter formats only the inner template content and keeps the surrounding Python string syntax unchanged.
 
 ### Type Alias Support
 ```python

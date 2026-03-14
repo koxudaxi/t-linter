@@ -1,9 +1,10 @@
 use anyhow::Result;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
-use t_linter_core::{TemplateHighlighter, TemplateStringInfo, TemplateStringParser};
-use tower_lsp::jsonrpc::Result as JsonRpcResult;
+use t_linter_core::{TemplateHighlighter, TemplateStringInfo, TemplateStringParser, format_source};
+use tower_lsp::jsonrpc::{Error as JsonRpcError, ErrorCode, Result as JsonRpcResult};
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tracing::{debug, info};
@@ -16,6 +17,7 @@ pub struct TLinterLanguageServer {
     document_cache: Arc<DashMap<Url, String>>,
     parser: Arc<tokio::sync::Mutex<TemplateStringParser>>,
     highlighter: Arc<tokio::sync::Mutex<TemplateHighlighter>>,
+    workspace_root: Arc<tokio::sync::RwLock<Option<PathBuf>>>,
 }
 
 impl TLinterLanguageServer {
@@ -25,6 +27,7 @@ impl TLinterLanguageServer {
             document_cache: Arc::new(DashMap::new()),
             parser: Arc::new(tokio::sync::Mutex::new(TemplateStringParser::new()?)),
             highlighter: Arc::new(tokio::sync::Mutex::new(TemplateHighlighter::new()?)),
+            workspace_root: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
 
@@ -84,12 +87,22 @@ impl TLinterLanguageServer {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for TLinterLanguageServer {
-    async fn initialize(&self, _: InitializeParams) -> JsonRpcResult<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> JsonRpcResult<InitializeResult> {
+        let workspace_root = params
+            .workspace_folders
+            .as_ref()
+            .and_then(|folders| folders.first())
+            .map(|folder| folder.uri.clone())
+            .or(params.root_uri)
+            .and_then(|uri| uri.to_file_path().ok());
+        *self.workspace_root.write().await = workspace_root;
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
@@ -205,6 +218,30 @@ impl LanguageServer for TLinterLanguageServer {
                 Ok(None)
             }
         }
+    }
+
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> JsonRpcResult<Option<Vec<TextEdit>>> {
+        let uri = params.text_document.uri;
+        let text = self
+            .document_cache
+            .get(&uri)
+            .ok_or_else(|| internal_error("Document not found in cache"))?
+            .clone();
+        let workspace_root = self.workspace_root_for_uri(&uri).await;
+        let result = format_source(&text, &workspace_root)
+            .map_err(|error| internal_error(&error.to_string()))?;
+
+        if !result.changed {
+            return Ok(Some(Vec::new()));
+        }
+
+        Ok(Some(vec![TextEdit {
+            range: full_document_range(&text),
+            new_text: result.formatted_source,
+        }]))
     }
 }
 
@@ -436,6 +473,17 @@ impl TLinterLanguageServer {
 
         semantic_tokens
     }
+
+    async fn workspace_root_for_uri(&self, uri: &Url) -> PathBuf {
+        if let Some(root) = self.workspace_root.read().await.clone() {
+            return root;
+        }
+
+        uri.to_file_path()
+            .ok()
+            .and_then(|path| path.parent().map(PathBuf::from))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
 }
 
 pub async fn run_server() -> Result<()> {
@@ -465,5 +513,207 @@ impl Default for TLinterConfig {
             pyright_path: None,
             highlight_untyped_templates: true,
         }
+    }
+}
+
+fn full_document_range(text: &str) -> Range {
+    let mut line = 0u32;
+    let mut col = 0u32;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+
+    Range {
+        start: Position::new(0, 0),
+        end: Position::new(line, col),
+    }
+}
+
+fn internal_error(message: &str) -> JsonRpcError {
+    JsonRpcError {
+        code: ErrorCode::InternalError,
+        message: message.to_string().into(),
+        data: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tower::{Service, ServiceExt};
+    use tower_lsp::jsonrpc::Request;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "t-linter-lsp-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
+    }
+
+    fn write_executable(path: &Path, contents: &str) {
+        write_file(path, contents);
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    fn install_mock_prettier(dir: &Path) {
+        write_executable(
+            &dir.join("node_modules/.bin/prettier"),
+            r#"#!/bin/sh
+parser=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--parser" ]; then
+    parser="$2"
+    shift 2
+  else
+    shift
+  fi
+done
+
+case "$parser" in
+  json)
+    printf '{\n  "name": "__T_LINTER_SLOT_0__"\n}\n'
+    ;;
+  *)
+    cat
+    ;;
+esac
+"#,
+        );
+    }
+
+    fn initialize_request(id: i64, root: &Path) -> Request {
+        Request::build("initialize")
+            .params(json!({
+                "capabilities": {},
+                "rootUri": Url::from_file_path(root).unwrap(),
+            }))
+            .id(id)
+            .finish()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initialize_advertises_document_formatting() {
+        let dir = test_dir("initialize");
+        let (mut service, _) =
+            LspService::new(|client| TLinterLanguageServer::new(client).unwrap());
+
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialize_request(1, &dir))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = response.result().unwrap();
+        assert_eq!(
+            result["capabilities"]["documentFormattingProvider"],
+            json!(true)
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn formatting_returns_full_document_edit() {
+        let dir = test_dir("formatting");
+        install_mock_prettier(&dir);
+        let file = dir.join("example.py");
+        let uri = Url::from_file_path(&file).unwrap();
+        let text = r#"from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "json"] = t"""{{"name": {value}}}"""
+"#;
+
+        let (mut service, _) =
+            LspService::new(|client| TLinterLanguageServer::new(client).unwrap());
+
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialize_request(1, &dir))
+            .await
+            .unwrap();
+
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::build("textDocument/didOpen")
+                    .params(json!({
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": "python",
+                            "version": 1,
+                            "text": text,
+                        }
+                    }))
+                    .finish(),
+            )
+            .await
+            .unwrap();
+
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::build("textDocument/formatting")
+                    .params(json!({
+                        "textDocument": { "uri": uri },
+                        "options": { "tabSize": 4, "insertSpaces": true }
+                    }))
+                    .id(2)
+                    .finish(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let edits = response.result().unwrap().as_array().unwrap();
+        assert_eq!(edits.len(), 1);
+        assert!(
+            edits[0]["newText"]
+                .as_str()
+                .unwrap()
+                .contains("t\"\"\"{{\n  \"name\": {value}\n}}\"\"\"")
+        );
+
+        let _ = fs::remove_dir_all(dir);
     }
 }
