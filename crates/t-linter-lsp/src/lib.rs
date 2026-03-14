@@ -42,18 +42,36 @@ impl TLinterLanguageServer {
 
         if start_line == end_line {
             let length = end_col - start_col;
-            tokens.push((start_line, start_col, length, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE));
+            tokens.push((
+                start_line,
+                start_col,
+                length,
+                TOKEN_TYPE_MACRO,
+                TOKEN_MODIFIER_NONE,
+            ));
         } else {
             let lines: Vec<&str> = text.lines().collect();
 
             if let Some(first_line) = lines.get(start_line as usize) {
                 let first_line_len = first_line.len() as u32 - start_col;
-                tokens.push((start_line, start_col, first_line_len, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE));
+                tokens.push((
+                    start_line,
+                    start_col,
+                    first_line_len,
+                    TOKEN_TYPE_MACRO,
+                    TOKEN_MODIFIER_NONE,
+                ));
             }
 
             for line_idx in (start_line + 1)..end_line {
                 if let Some(line) = lines.get(line_idx as usize) {
-                    tokens.push((line_idx, 0, line.len() as u32, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE));
+                    tokens.push((
+                        line_idx,
+                        0,
+                        line.len() as u32,
+                        TOKEN_TYPE_MACRO,
+                        TOKEN_MODIFIER_NONE,
+                    ));
                 }
             }
 
@@ -284,7 +302,12 @@ impl TLinterLanguageServer {
         let length = if template.location.start_line == template.location.end_line {
             end_col - start_col
         } else {
-            template.raw_content.lines().next().map(|l| l.len()).unwrap_or(0) as u32
+            template
+                .raw_content
+                .lines()
+                .next()
+                .map(|l| l.len())
+                .unwrap_or(0) as u32
         };
 
         tokens.push((line, start_col, length, 18, 0));
@@ -310,7 +333,12 @@ impl TLinterLanguageServer {
                 "Template {}: language={:?}, raw='{}', location={}:{}-{}:{}",
                 idx,
                 template.language,
-                template.raw_content.chars().take(50).collect::<String>().replace('\n', "\\n"),
+                template
+                    .raw_content
+                    .chars()
+                    .take(50)
+                    .collect::<String>()
+                    .replace('\n', "\\n"),
                 template.location.start_line,
                 template.location.start_column,
                 template.location.end_line,
@@ -326,8 +354,10 @@ impl TLinterLanguageServer {
                         info!("Successfully highlighted {} ranges", ranges.len());
 
                         for (i, range) in ranges.iter().take(5).enumerate() {
-                            info!("  Range {}: {}..{} type={}", 
-                                i, range.start_byte, range.end_byte, range.highlight_name);
+                            info!(
+                                "  Range {}: {}..{} type={}",
+                                i, range.start_byte, range.end_byte, range.highlight_name
+                            );
                         }
 
                         let tokens = highlighter.to_lsp_tokens(ranges, template);
@@ -354,17 +384,17 @@ impl TLinterLanguageServer {
             }
         }
 
-        all_tokens.sort_by(|a, b| {
-            a.0.cmp(&b.0).then(a.1.cmp(&b.1))
-        });
+        all_tokens.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
-        all_tokens.dedup_by(|a, b| {
-            a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3 && a.4 == b.4
-        });
+        all_tokens
+            .dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3 && a.4 == b.4);
 
         info!("Final sorted tokens:");
         for (i, &(line, col, len, typ, _)) in all_tokens.iter().enumerate().take(10) {
-            info!("  Token {}: line={}, col={}, len={}, type={}", i, line, col, len, typ);
+            info!(
+                "  Token {}: line={}, col={}, len={}, type={}",
+                i, line, col, len, typ
+            );
         }
 
         let data = self.convert_to_semantic_tokens(all_tokens);

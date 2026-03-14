@@ -1,10 +1,10 @@
 use anyhow::Result;
 
-pub mod parser;
 pub mod highlighter;
+pub mod parser;
 
-pub use parser::{TemplateStringParser, TemplateStringInfo, Location, Expression};
-pub use highlighter::{TemplateHighlighter, HighlightedRange};
+pub use highlighter::{HighlightedRange, TemplateHighlighter};
+pub use parser::{Expression, Location, TemplateStringInfo, TemplateStringParser};
 
 pub fn init() -> Result<()> {
     tracing::info!("t-linter-core initialized");
