@@ -240,7 +240,12 @@ fn format_template(
     runner: &dyn FormatterRunner,
 ) -> Result<String> {
     let prepared = prepare_template_for_format(template, language)?;
-    let formatted = runner.run(language, &prepared.formatter_input, workspace_root)?;
+    let formatted = runner
+        .run(language, &prepared.formatter_input, workspace_root)
+        .map_err(|error| anyhow::anyhow!(restore_placeholders_in_error_message(
+            &error.to_string(),
+            &prepared.slots,
+        )))?;
     let restored = restore_formatted_content(&formatted, &prepared)?;
 
     Ok(rebuild_raw_template(template, &restored, &prepared.slots))
@@ -436,6 +441,21 @@ fn rebuild_raw_template(
     format!("{prefix}{escaped_content}{suffix}")
 }
 
+fn restore_placeholders_in_error_message(message: &str, slots: &[PlaceholderSlot]) -> String {
+    let mut restored = message.to_string();
+
+    for slot in slots {
+        restored = restored.replace(&slot.placeholder, &slot.raw_expression);
+
+        let bare_placeholder = slot.placeholder.trim_matches('"');
+        if bare_placeholder != slot.placeholder {
+            restored = restored.replace(bare_placeholder, &slot.raw_expression);
+        }
+    }
+
+    restored
+}
+
 fn escape_literal_braces(content: &str) -> String {
     content.replace('{', "{{").replace('}', "}}")
 }
@@ -508,6 +528,16 @@ mod tests {
     impl FormatterRunner for MissingPlaceholderRunner {
         fn run(&self, _: &str, _: &str, _: &Path) -> Result<String> {
             Ok("{\n  \"name\": \"lost\"\n}\n".to_string())
+        }
+    }
+
+    struct ErroringRunner;
+
+    impl FormatterRunner for ErroringRunner {
+        fn run(&self, _: &str, _: &str, _: &Path) -> Result<String> {
+            bail!(
+                "[error] stdin: SyntaxError: Unexpected token (1:33)\n[error] > 1 | {{ \"name\": \"__T_LINTER_SLOT_0__\",, \"name\": \"__T_LINTER_SLOT_1__\" }}\n[error]     |                                 ^"
+            )
         }
     }
 
@@ -602,6 +632,23 @@ payload: Annotated[Template, "json"] = t"""{"name": {value}}"""
                 .unwrap_err();
 
         assert!(error.to_string().contains("placeholder"));
+    }
+
+    #[test]
+    fn formatter_errors_restore_interpolations_in_messages() {
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "json"] = t"""{{"name": {value}, "name": {other}}}"""
+"#;
+
+        let error = format_source_with_runner(source, Path::new("."), &ErroringRunner, None)
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains(r#"{ "name": {value},, "name": {other} }"#));
+        assert!(!message.contains("__T_LINTER_SLOT_0__"));
+        assert!(!message.contains("__T_LINTER_SLOT_1__"));
     }
 
     #[test]

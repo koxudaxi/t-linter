@@ -650,6 +650,20 @@ esac
         );
     }
 
+    fn install_failing_prettier(dir: &Path) {
+        write_executable(
+            &dir.join("node_modules/.bin/prettier"),
+            r#"#!/bin/sh
+cat <<'EOF' 1>&2
+[error] stdin: SyntaxError: Unexpected token (1:33)
+[error] > 1 | { "name": "__T_LINTER_SLOT_0__",, "name": "__T_LINTER_SLOT_1__" }
+[error]     |                                 ^
+EOF
+exit 1
+"#,
+        );
+    }
+
     fn initialize_request(id: i64, root: &Path) -> Request {
         Request::build("initialize")
             .params(json!({
@@ -832,6 +846,74 @@ second: Annotated[Template, "json"] = t"""{{"name": {second}}}"""
             new_text
                 .contains(r#"second: Annotated[Template, "json"] = t"""{{"name": {second}}}""""#)
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn formatting_errors_restore_interpolations_in_lsp_response() {
+        let dir = test_dir("formatting-error");
+        install_failing_prettier(&dir);
+        let file = dir.join("example.py");
+        let uri = Url::from_file_path(&file).unwrap();
+        let text = r#"from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "json"] = t"""{{"name": {value}, "name": {other}}}"""
+"#;
+
+        let (mut service, _) =
+            LspService::new(|client| TLinterLanguageServer::new(client).unwrap());
+
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialize_request(1, &dir))
+            .await
+            .unwrap();
+
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::build("textDocument/didOpen")
+                    .params(json!({
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": "python",
+                            "version": 1,
+                            "text": text,
+                        }
+                    }))
+                    .finish(),
+            )
+            .await
+            .unwrap();
+
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::build("textDocument/formatting")
+                    .params(json!({
+                        "textDocument": { "uri": uri },
+                        "options": { "tabSize": 4, "insertSpaces": true }
+                    }))
+                    .id(4)
+                    .finish(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(response.is_error());
+        let message = response.error().unwrap().message.as_ref();
+        assert!(message.contains(r#"{ "name": {value},, "name": {other} }"#));
+        assert!(!message.contains("__T_LINTER_SLOT_0__"));
+        assert!(!message.contains("__T_LINTER_SLOT_1__"));
 
         let _ = fs::remove_dir_all(dir);
     }
