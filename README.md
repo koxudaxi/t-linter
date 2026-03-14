@@ -20,7 +20,7 @@ t-linter provides intelligent syntax highlighting and linting for Python templat
 - 🎨 **Smart Syntax Highlighting** - Detects embedded languages in `t"..."` strings
 - 🔍 **Type-based Detection** - Understands `Annotated[Template, "html"]` annotations
 - 🚀 **Fast** - Built with Rust and Tree-sitter for optimal performance
-- 🔧 **Extensible** - Support for HTML, SQL, JavaScript, CSS, and more
+- 🔧 **Extensible** - Support for HTML, SQL, JavaScript, CSS, JSON, YAML, TOML, and more
 
 ## Installation
 
@@ -168,7 +168,7 @@ t-linter stats src/  # Specific directory
 
 ### Planned Features
 - ✅ **Language Server Protocol (LSP)** - Fully implemented
-- ✅ **Syntax Highlighting** - Supports HTML, SQL, JavaScript, CSS, JSON
+- ✅ **Syntax Highlighting** - Supports HTML, SQL, JavaScript, CSS, JSON, YAML, TOML
 - ✅ **Type Alias Support** - Recognizes `type html = Annotated[Template, "html"]`
 - 🚧 **Linting (`check` command)** - Validate template strings for syntax errors
 - 🚧 **Statistics (`stats` command)** - Analyze template string usage across codebases
@@ -213,6 +213,8 @@ ORDER BY u.name
 # Type aliases for reusable templates
 type css = Annotated[Template, "css"]
 type js = Annotated[Template, "javascript"]
+type yaml_config = Annotated[Template, "yaml"]
+type toml_config = Annotated[Template, "toml"]
 
 styles: css = t"""
 .container {
@@ -221,5 +223,16 @@ styles: css = t"""
     padding: {padding}px;
 }
 """
-```
 
+settings: yaml_config = t"""
+app:
+  name: {app_name}
+  debug: true
+"""
+
+pyproject: toml_config = t"""
+[project]
+name = "{project_name}"
+version = "{version}"
+"""
+```

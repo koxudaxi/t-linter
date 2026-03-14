@@ -936,6 +936,38 @@ page: Annotated[Template, "html"] = t"<div>Test</div>"
     }
 
     #[test]
+    fn test_yaml_annotation_detection() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+config: Annotated[Template, "yaml"] = t"name: {name}"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+        assert_eq!(templates[0].content, "name: {}");
+    }
+
+    #[test]
+    fn test_toml_type_alias_detection() {
+        let source = r#"
+type toml_config = Annotated[Template, "toml"]
+config: toml_config = t"title = {title}"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("toml".to_string()));
+        assert_eq!(templates[0].content, "title = {}");
+    }
+
+    #[test]
     fn test_function_parameter_inference() {
         let source = r#"
 type sql = Annotated[Template, "sql"]
