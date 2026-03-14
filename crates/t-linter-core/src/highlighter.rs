@@ -1,14 +1,12 @@
 #[cfg(feature = "sql")]
 use tree_sitter_sequel;
 
-use anyhow::{Result};
+use crate::parser::{Expression, TemplateStringInfo};
+use anyhow::Result;
 use std::collections::HashMap;
 use tracing::info;
-use tree_sitter::{Parser, Language};
-use tree_sitter_highlight::{Highlighter, HighlightConfiguration, HighlightEvent};
-use crate::parser::{TemplateStringInfo, Expression, Location};
-
-
+use tree_sitter::{Language, Parser};
+use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 #[derive(Debug, Clone)]
 pub struct HighlightedRange {
@@ -63,19 +61,25 @@ impl TemplateHighlighter {
             "variable.builtin",
             "variable.parameter",
         ]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        .into_iter()
+        .map(String::from)
+        .collect();
 
         let mut language_configs = HashMap::new();
 
-        language_configs.insert("html".to_string(), LanguageConfig {
-            language: tree_sitter_html::LANGUAGE.into(),
-        });
+        language_configs.insert(
+            "html".to_string(),
+            LanguageConfig {
+                language: tree_sitter_html::LANGUAGE.into(),
+            },
+        );
 
-        language_configs.insert("css".to_string(), LanguageConfig {
-            language: tree_sitter_css::LANGUAGE.into(),
-        });
+        language_configs.insert(
+            "css".to_string(),
+            LanguageConfig {
+                language: tree_sitter_css::LANGUAGE.into(),
+            },
+        );
 
         let js_config = LanguageConfig {
             language: tree_sitter_javascript::LANGUAGE.into(),
@@ -83,14 +87,20 @@ impl TemplateHighlighter {
         language_configs.insert("javascript".to_string(), js_config.clone());
         language_configs.insert("js".to_string(), js_config);
 
-        language_configs.insert("json".to_string(), LanguageConfig {
-            language: tree_sitter_json::LANGUAGE.into(),
-        });
+        language_configs.insert(
+            "json".to_string(),
+            LanguageConfig {
+                language: tree_sitter_json::LANGUAGE.into(),
+            },
+        );
 
         #[cfg(feature = "sql")]
-        language_configs.insert("sql".to_string(), LanguageConfig {
-            language: tree_sitter_sequel::LANGUAGE.into(),
-        });
+        language_configs.insert(
+            "sql".to_string(),
+            LanguageConfig {
+                language: tree_sitter_sequel::LANGUAGE.into(),
+            },
+        );
 
         Ok(Self {
             highlighter: Highlighter::new(),
@@ -99,20 +109,31 @@ impl TemplateHighlighter {
         })
     }
 
-    pub fn highlight_template(&mut self, template: &TemplateStringInfo) -> Result<Vec<HighlightedRange>> {
-        let language = template.language.as_ref()
+    pub fn highlight_template(
+        &mut self,
+        template: &TemplateStringInfo,
+    ) -> Result<Vec<HighlightedRange>> {
+        let language = template
+            .language
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No language specified for template"))?;
 
-        info!("Highlighting {} template, content: '{}'", language, template.content);
+        info!(
+            "Highlighting {} template, content: '{}'",
+            language, template.content
+        );
 
-        let config = self.language_configs.get(language.to_lowercase().as_str())
+        let config = self
+            .language_configs
+            .get(language.to_lowercase().as_str())
             .ok_or_else(|| anyhow::anyhow!("Unsupported language: {}", language))?;
 
         let processed_content = template.content.clone();
 
         let mut parser = Parser::new();
         parser.set_language(&config.language)?;
-        let tree = parser.parse(&processed_content, None)
+        let _tree = parser
+            .parse(&processed_content, None)
             .ok_or_else(|| anyhow::anyhow!("Failed to parse template content"))?;
 
         let mut temp_config = HighlightConfiguration::new(
@@ -125,19 +146,21 @@ impl TemplateHighlighter {
                 "json" => tree_sitter_json::HIGHLIGHTS_QUERY,
                 #[cfg(feature = "sql")]
                 "sql" => tree_sitter_sequel::HIGHLIGHTS_QUERY,
-                _ => return Err(anyhow::anyhow!("No highlight query for language: {}", language)),
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "No highlight query for language: {}",
+                        language
+                    ));
+                }
             },
             "",
             "",
         )?;
         temp_config.configure(&self.highlight_names);
 
-        let highlights = self.highlighter.highlight(
-            &temp_config,
-            processed_content.as_bytes(),
-            None,
-            |_| None,
-        )?;
+        let highlights =
+            self.highlighter
+                .highlight(&temp_config, processed_content.as_bytes(), None, |_| None)?;
 
         let mut highlighted_ranges = Vec::new();
         let mut active_highlights: Vec<usize> = Vec::new();
@@ -179,7 +202,10 @@ impl TemplateHighlighter {
 
         info!("Found {} highlight ranges", highlighted_ranges.len());
         for (i, range) in highlighted_ranges.iter().take(5).enumerate() {
-            info!("  Range {}: {}..{} '{}'", i, range.start_byte, range.end_byte, range.highlight_name);
+            info!(
+                "  Range {}: {}..{} '{}'",
+                i, range.start_byte, range.end_byte, range.highlight_name
+            );
         }
 
         Ok(highlighted_ranges)
@@ -226,8 +252,15 @@ impl TemplateHighlighter {
         (processed, placeholders)
     }
     fn sanitize_identifier(&self, expr: &str) -> String {
-        let sanitized: String = expr.chars()
-            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        let sanitized: String = expr
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
 
         if sanitized.chars().next().map_or(false, |c| c.is_numeric()) {
@@ -239,9 +272,9 @@ impl TemplateHighlighter {
         }
     }
 
-
     fn get_highlight_index(&self, name: &str) -> usize {
-        self.highlight_names.iter()
+        self.highlight_names
+            .iter()
             .position(|n| n == name)
             .unwrap_or(0)
     }
@@ -292,7 +325,8 @@ impl TemplateHighlighter {
         }
 
         let suffix_len = if template.flags.is_triple { 3 } else { 1 };
-        let actual_content = &template.raw_content[prefix_len..template.raw_content.len() - suffix_len];
+        let actual_content =
+            &template.raw_content[prefix_len..template.raw_content.len() - suffix_len];
 
         for (i, range) in ranges.iter().enumerate() {
             if range.highlight_name == "variable.parameter" {
@@ -310,8 +344,9 @@ impl TemplateHighlighter {
 
             let length = range.end_byte - range.start_byte;
 
-            info!("Range {}: {} content[{}..{}]='{}' -> line {} col {}", 
-                i, 
+            info!(
+                "Range {}: {} content[{}..{}]='{}' -> line {} col {}",
+                i,
                 range.highlight_name,
                 range.start_byte,
                 range.end_byte,
@@ -350,7 +385,12 @@ impl TemplateHighlighter {
                 let placeholder_start = absolute_pos;
                 let placeholder_end = placeholder_start + placeholder_text.len();
 
-                mappings.push((absolute_pos, absolute_pos + 2, placeholder_start, placeholder_end));
+                mappings.push((
+                    absolute_pos,
+                    absolute_pos + 2,
+                    placeholder_start,
+                    placeholder_end,
+                ));
             }
 
             search_start = absolute_pos + 2;
@@ -358,7 +398,6 @@ impl TemplateHighlighter {
 
         mappings
     }
-
 
     fn calculate_template_content_offset(&self, raw_content: &str) -> usize {
         if raw_content.starts_with("t\"\"\"") || raw_content.starts_with("t'''") {
@@ -389,9 +428,10 @@ impl TemplateHighlighter {
         let actual_bytes = actual_content.as_bytes();
 
         while template_idx < position_in_template && actual_idx < actual_bytes.len() {
-            if template_idx + 1 < template_bytes.len() &&
-                template_bytes[template_idx] == b'{' &&
-                template_bytes[template_idx + 1] == b'}' {
+            if template_idx + 1 < template_bytes.len()
+                && template_bytes[template_idx] == b'{'
+                && template_bytes[template_idx + 1] == b'}'
+            {
                 if actual_idx < actual_bytes.len() && actual_bytes[actual_idx] == b'{' {
                     let mut expr_end = actual_idx + 1;
                     while expr_end < actual_bytes.len() && actual_bytes[expr_end] != b'}' {
@@ -423,7 +463,6 @@ impl TemplateHighlighter {
 
         (line, col)
     }
-
 
     fn token_type_to_index(&self, highlight_name: &str) -> u32 {
         match highlight_name {
@@ -482,7 +521,11 @@ mod tests {
 
         assert!(ranges.iter().any(|r| r.highlight_name == "tag"));
         assert!(ranges.iter().any(|r| r.highlight_name == "attribute"));
-        assert!(ranges.iter().any(|r| r.highlight_name == "variable.parameter"));
+        assert!(
+            ranges
+                .iter()
+                .any(|r| r.highlight_name == "variable.parameter")
+        );
     }
 
     #[test]
@@ -497,7 +540,8 @@ mod tests {
             raw_content: r#"t"""<div>
   <span>{name}</span>
   {123}
-</div>""""#.to_string(),
+</div>""""#
+                .to_string(),
             variable_name: Some("html".to_string()),
             function_name: None,
             language: Some("html".to_string()),
@@ -533,7 +577,13 @@ mod tests {
         let ranges = highlighter.highlight_template(&template).unwrap();
 
         assert!(ranges.iter().any(|r| r.highlight_name == "tag"));
-        assert_eq!(ranges.iter().filter(|r| r.highlight_name == "variable.parameter").count(), 2);
+        assert_eq!(
+            ranges
+                .iter()
+                .filter(|r| r.highlight_name == "variable.parameter")
+                .count(),
+            2
+        );
 
         let tokens = highlighter.to_lsp_tokens(ranges, &template);
         assert!(!tokens.is_empty());

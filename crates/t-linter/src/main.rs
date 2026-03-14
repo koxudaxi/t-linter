@@ -35,9 +35,12 @@ async fn main() -> Result<()> {
         Some(t_linter_cli::Commands::Lsp { stdio: _ }) => {
             init_logging();
             t_linter_lsp::run_server().await?;
-            
         }
-        Some(t_linter_cli::Commands::Check { paths, format, error_on_issues }) => {
+        Some(t_linter_cli::Commands::Check {
+            paths,
+            format,
+            error_on_issues,
+        }) => {
             init_logging();
             t_linter_cli::check(paths, format, error_on_issues)?;
         }
