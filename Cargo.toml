@@ -25,9 +25,11 @@ tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25.0"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-json = "0.24.8"
+tree-sitter-yaml = "0.7.2"
+tree-sitter-toml-ng = "0.7.0"
 tree-sitter-sequel = "0.3.11"
 tokio = { version = "1.50.0", features = ["full"] }
 tower-lsp = "0.20"
 clap = { version = "4.6.0", features = ["derive"] }
 tracing = "0.1.44"
-tracing-subscriber = { version =  "0.3.23", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }

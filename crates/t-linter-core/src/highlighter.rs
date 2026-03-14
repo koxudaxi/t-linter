@@ -37,6 +37,7 @@ impl TemplateHighlighter {
     pub fn new() -> Result<Self> {
         let highlight_names: Vec<String> = vec![
             "attribute",
+            "boolean",
             "comment",
             "constant",
             "constant.builtin",
@@ -45,6 +46,7 @@ impl TemplateHighlighter {
             "function",
             "function.builtin",
             "keyword",
+            "label",
             "number",
             "operator",
             "property",
@@ -54,6 +56,7 @@ impl TemplateHighlighter {
             "punctuation.special",
             "string",
             "string.special",
+            "string.special.key",
             "tag",
             "type",
             "type.builtin",
@@ -91,6 +94,19 @@ impl TemplateHighlighter {
             "json".to_string(),
             LanguageConfig {
                 language: tree_sitter_json::LANGUAGE.into(),
+            },
+        );
+
+        let yaml_config = LanguageConfig {
+            language: tree_sitter_yaml::LANGUAGE.into(),
+        };
+        language_configs.insert("yaml".to_string(), yaml_config.clone());
+        language_configs.insert("yml".to_string(), yaml_config);
+
+        language_configs.insert(
+            "toml".to_string(),
+            LanguageConfig {
+                language: tree_sitter_toml_ng::LANGUAGE.into(),
             },
         );
 
@@ -144,6 +160,8 @@ impl TemplateHighlighter {
                 "css" => tree_sitter_css::HIGHLIGHTS_QUERY,
                 "javascript" | "js" => tree_sitter_javascript::HIGHLIGHT_QUERY,
                 "json" => tree_sitter_json::HIGHLIGHTS_QUERY,
+                "yaml" | "yml" => tree_sitter_yaml::HIGHLIGHTS_QUERY,
+                "toml" => tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
                 #[cfg(feature = "sql")]
                 "sql" => tree_sitter_sequel::HIGHLIGHTS_QUERY,
                 _ => {
@@ -467,11 +485,14 @@ impl TemplateHighlighter {
     fn token_type_to_index(&self, highlight_name: &str) -> u32 {
         match highlight_name {
             "keyword" => 15,
+            "boolean" => 19,
             "function" | "function.builtin" => 12,
             "variable" | "variable.builtin" | "variable.parameter" => 8,
             "string" | "string.special" => 18,
+            "string.special.key" => 9,
             "number" => 19,
             "comment" => 17,
+            "label" => 22,
             "type" | "type.builtin" => 1,
             "class" | "constructor" => 2,
             "property" => 9,
@@ -590,5 +611,132 @@ mod tests {
 
         let lines: Vec<_> = tokens.iter().map(|t| t.0).collect();
         assert!(lines.iter().max().unwrap() > lines.iter().min().unwrap());
+    }
+
+    #[test]
+    fn test_json_highlighting() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+
+        let template = TemplateStringInfo {
+            content: r#"{"name": "codex", "count": 3, "value": {}, "enabled": true}"#.to_string(),
+            raw_content:
+                r#"t"{\"name\": \"codex\", \"count\": 3, \"value\": {value}, \"enabled\": true}""#
+                    .to_string(),
+            variable_name: Some("payload".to_string()),
+            function_name: None,
+            language: Some("json".to_string()),
+            location: Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 52,
+            },
+            expressions: vec![Expression {
+                content: "value".to_string(),
+                location: Location {
+                    start_line: 1,
+                    start_column: 30,
+                    end_line: 1,
+                    end_column: 35,
+                },
+            }],
+            flags: TemplateStringFlags::default(),
+        };
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+
+        assert!(ranges.iter().any(|r| r.highlight_name == "string"));
+        assert!(ranges.iter().any(|r| r.highlight_name == "number"));
+        assert!(
+            ranges
+                .iter()
+                .any(|r| r.highlight_name == "constant.builtin")
+        );
+        assert!(
+            ranges
+                .iter()
+                .any(|r| r.highlight_name == "variable.parameter")
+        );
+    }
+
+    #[test]
+    fn test_yaml_highlighting_with_yml_alias() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+
+        let template = TemplateStringInfo {
+            content: "name: codex\nenabled: true\nvalue: {}\n".to_string(),
+            raw_content: "t\"name: codex\\nenabled: true\\nvalue: {value}\\n\"".to_string(),
+            variable_name: Some("config".to_string()),
+            function_name: None,
+            language: Some("yml".to_string()),
+            location: Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 3,
+                end_column: 10,
+            },
+            expressions: vec![Expression {
+                content: "value".to_string(),
+                location: Location {
+                    start_line: 3,
+                    start_column: 8,
+                    end_line: 3,
+                    end_column: 13,
+                },
+            }],
+            flags: TemplateStringFlags::default(),
+        };
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+
+        assert!(ranges.iter().any(|r| r.highlight_name == "property"));
+        assert!(ranges.iter().any(|r| r.highlight_name == "boolean"));
+        assert!(
+            ranges
+                .iter()
+                .any(|r| r.highlight_name == "variable.parameter")
+        );
+    }
+
+    #[test]
+    fn test_toml_highlighting() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+
+        let template = TemplateStringInfo {
+            content: "title = \"T-Linter\"\nenabled = true\nvalue = {}\n".to_string(),
+            raw_content: "t\"title = \\\"T-Linter\\\"\\nenabled = true\\nvalue = {value}\\n\""
+                .to_string(),
+            variable_name: Some("config".to_string()),
+            function_name: None,
+            language: Some("toml".to_string()),
+            location: Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 3,
+                end_column: 11,
+            },
+            expressions: vec![Expression {
+                content: "value".to_string(),
+                location: Location {
+                    start_line: 3,
+                    start_column: 9,
+                    end_line: 3,
+                    end_column: 14,
+                },
+            }],
+            flags: TemplateStringFlags::default(),
+        };
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+
+        assert!(ranges.iter().any(|r| r.highlight_name == "property"));
+        assert!(ranges.iter().any(|r| r.highlight_name == "string"));
+        assert!(ranges.iter().any(|r| r.highlight_name == "boolean"));
+        assert!(ranges.iter().any(|r| r.highlight_name == "operator"));
+        assert!(
+            ranges
+                .iter()
+                .any(|r| r.highlight_name == "variable.parameter")
+        );
     }
 }

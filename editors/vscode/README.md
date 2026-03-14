@@ -18,6 +18,8 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 - JavaScript
 - CSS
 - JSON
+- YAML
+- TOML
 
 ## Requirements
 
@@ -131,6 +133,13 @@ page = t"""
 
 # SQL highlighting
 query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
+
+# YAML highlighting
+config: Annotated[Template, "yaml"] = t"""
+app:
+  name: {app_name}
+  debug: true
+"""
 ```
 
 ### Type Alias Support
@@ -138,10 +147,12 @@ query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
 # Define reusable type aliases
 type html = Annotated[Template, "html"]
 type sql = Annotated[Template, "sql"]
+type toml_config = Annotated[Template, "toml"]
 
 # Use with automatic language detection
 content: html = t"<div>{message}</div>"
 db_query: sql = t"UPDATE users SET name = {name} WHERE id = {id}"
+package: toml_config = t"name = {package_name}"
 ```
 
 ### Function Parameter Inference
