@@ -139,16 +139,101 @@ If you installed via PyPI, you can use t-linter from the command line:
 t-linter lsp
 ```
 
-**Check files for issues** (🚧 Coming soon):
+**Check files for issues**:
 ```bash
 # Check Python files for template string issues
 t-linter check file.py
 t-linter check src/
 
-# Output formats (when implemented)
+# Output formats
 t-linter check file.py --format json
 t-linter check file.py --format github  # GitHub Actions annotations
 t-linter check file.py --error-on-issues  # Exit with error code if issues found
+```
+
+`check` supports `human`, `json`, and `github` output formats.
+
+Configuration can be provided via `pyproject.toml`:
+
+```toml
+[tool.t-linter]
+extend-exclude = ["generated", "vendor"]
+ignore-file = ".t-linterignore"
+```
+
+Supported keys:
+- `exclude`: override the built-in default excludes
+- `extend-exclude`: add more exclude patterns on top of the defaults
+- `ignore-file`: path to a gitignore-style ignore file, relative to the project root
+
+By default, `t-linter` also reads `.t-linterignore` from the project root if it exists.
+
+Exit codes:
+- `0`: Run completed successfully
+- `1`: Issues were found and `--error-on-issues` was set
+- `2`: Operational failure such as an unreadable file
+
+Example input:
+```python
+from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "json"] = t"""[1,,2]"""
+```
+
+Example `human` output:
+```text
+example.py:4:46: error[embedded-parse-error] Invalid json syntax in template string (language=json)
+1 files scanned, 1 templates scanned, 1 diagnostics, 0 failed files
+```
+
+Example `json` output:
+```json
+{
+  "files": [
+    {
+      "file": "example.py",
+      "template_count": 1,
+      "diagnostics": [
+        {
+          "rule": "embedded-parse-error",
+          "severity": "error",
+          "language": "json",
+          "message": "Invalid json syntax in template string",
+          "file": "example.py",
+          "start_line": 4,
+          "start_column": 46,
+          "end_line": 4,
+          "end_column": 47
+        }
+      ]
+    }
+  ],
+  "diagnostics": [
+    {
+      "rule": "embedded-parse-error",
+      "severity": "error",
+      "language": "json",
+      "message": "Invalid json syntax in template string",
+      "file": "example.py",
+      "start_line": 4,
+      "start_column": 46,
+      "end_line": 4,
+      "end_column": 47
+    }
+  ],
+  "summary": {
+    "files_scanned": 1,
+    "templates_scanned": 1,
+    "diagnostics": 1,
+    "failed_files": 0
+  }
+}
+```
+
+Example `github` output:
+```text
+::error file=example.py,line=4,col=46,title=t-linter(embedded-parse-error)::Invalid json syntax in template string (language=json)
 ```
 
 **Get template string statistics** (🚧 Coming soon):
@@ -170,7 +255,7 @@ t-linter stats src/  # Specific directory
 - ✅ **Language Server Protocol (LSP)** - Fully implemented
 - ✅ **Syntax Highlighting** - Supports HTML, SQL, JavaScript, CSS, JSON, YAML, TOML
 - ✅ **Type Alias Support** - Recognizes `type html = Annotated[Template, "html"]`
-- 🚧 **Linting (`check` command)** - Validate template strings for syntax errors
+- ✅ **Linting (`check` command)** - Validate template strings for syntax errors
 - 🚧 **Statistics (`stats` command)** - Analyze template string usage across codebases
 - 📋 **Cross-file Type Resolution** - Track type aliases across module boundaries
 - 📋 **Auto-completion** - Context-aware completions within template strings
