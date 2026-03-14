@@ -152,6 +152,7 @@ t-linter check file.py --error-on-issues  # Exit with error code if issues found
 ```
 
 `check` supports `human`, `json`, and `github` output formats.
+For JSON templates, `check` also reports duplicate object keys such as repeated `"name"` entries.
 
 **Format template strings**:
 ```bash

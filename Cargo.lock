@@ -938,6 +938,7 @@ dependencies = [
  "anyhow",
  "regex",
  "serde",
+ "serde_json",
  "tracing",
  "tree-sitter",
  "tree-sitter-css",

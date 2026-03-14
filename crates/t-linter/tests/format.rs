@@ -73,6 +73,15 @@ fn run_command(dir: &Path, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+fn run_command_with_missing_taplo(dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_t-linter"))
+        .args(args)
+        .current_dir(dir)
+        .env("T_LINTER_TAPLO", dir.join("missing-taplo"))
+        .output()
+        .unwrap()
+}
+
 #[test]
 fn format_rewrites_supported_templates_in_place() {
     let dir = test_dir("in-place");
@@ -86,7 +95,7 @@ payload: Annotated[Template, "json"] = t"""{{"name": {value}}}"""
 "#,
     );
 
-    let output = run_command(&dir, &["format", "example.py"]);
+    let output = run_command_with_missing_taplo(&dir, &["format", "example.py"]);
     let contents = fs::read_to_string(dir.join("example.py")).unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
 
@@ -163,7 +172,7 @@ config: Annotated[Template, "toml"] = t"title = {value}"
 "#,
     );
 
-    let output = run_command(&dir, &["format", "example.py"]);
+    let output = run_command_with_missing_taplo(&dir, &["format", "example.py"]);
     let stderr = String::from_utf8(output.stderr).unwrap();
 
     assert_eq!(output.status.code(), Some(2));

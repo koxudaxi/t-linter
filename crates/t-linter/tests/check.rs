@@ -151,6 +151,34 @@ fn check_file_read_errors_return_exit_code_two() {
 }
 
 #[test]
+fn check_reports_duplicate_json_keys() {
+    let dir = test_dir("duplicate-json-key");
+    write_file(
+        &dir.join("duplicate.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+value = 123
+payload: Annotated[Template, "json"] = t"""{{"name": {value}, "name": {value}}}"""
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "duplicate.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "json-duplicate-key");
+    assert_eq!(
+        json["diagnostics"][0]["message"],
+        "Duplicate json object key \"name\" in template string"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_respects_pyproject_extend_exclude() {
     let dir = test_dir("pyproject-exclude");
     write_file(

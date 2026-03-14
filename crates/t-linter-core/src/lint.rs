@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -8,6 +9,7 @@ use crate::{TemplateStringInfo, TemplateStringParser};
 
 const RULE_EMBEDDED_PARSE_ERROR: &str = "embedded-parse-error";
 const RULE_FILE_READ_ERROR: &str = "file-read-error";
+const RULE_JSON_DUPLICATE_KEY: &str = "json-duplicate-key";
 const RULE_PYTHON_PARSE_ERROR: &str = "python-parse-error";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -138,42 +140,42 @@ fn lint_template(path: &Path, template: &TemplateStringInfo) -> Result<Vec<LintD
     let processed = prepare_template_for_lint(template, &language);
     let tree = parse_embedded(&language, &processed.content)?;
 
-    if !tree.root_node().has_error() {
-        return Ok(Vec::new());
-    }
-
     let mut diagnostics = Vec::new();
-    let error_nodes = collect_error_nodes(tree.root_node());
-    let nodes = if error_nodes.is_empty() {
-        vec![tree.root_node()]
-    } else {
-        error_nodes
-    };
+    if tree.root_node().has_error() {
+        let error_nodes = collect_error_nodes(tree.root_node());
+        let nodes = if error_nodes.is_empty() {
+            vec![tree.root_node()]
+        } else {
+            error_nodes
+        };
 
-    for node in nodes {
-        let start_offset =
-            map_processed_offset(&processed.processed_to_original, node.start_byte());
-        let mut end_offset =
-            map_processed_offset(&processed.processed_to_original, node.end_byte());
+        for node in nodes {
+            let start_offset =
+                map_processed_offset(&processed.processed_to_original, node.start_byte());
+            let mut end_offset =
+                map_processed_offset(&processed.processed_to_original, node.end_byte());
 
-        if end_offset <= start_offset {
-            end_offset = next_char_boundary(&template.content, start_offset);
+            if end_offset <= start_offset {
+                end_offset = next_char_boundary(&template.content, start_offset);
+            }
+
+            let ((start_line, start_column), (end_line, end_column)) =
+                map_content_range_to_document(template, start_offset, end_offset);
+
+            diagnostics.push(LintDiagnostic {
+                rule: RULE_EMBEDDED_PARSE_ERROR.to_string(),
+                severity: LintSeverity::Error,
+                language: Some(language.clone()),
+                message: format!("Invalid {} syntax in template string", language),
+                file: path.to_path_buf(),
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+            });
         }
-
-        let ((start_line, start_column), (end_line, end_column)) =
-            map_content_range_to_document(template, start_offset, end_offset);
-
-        diagnostics.push(LintDiagnostic {
-            rule: RULE_EMBEDDED_PARSE_ERROR.to_string(),
-            severity: LintSeverity::Error,
-            language: Some(language.clone()),
-            message: format!("Invalid {} syntax in template string", language),
-            file: path.to_path_buf(),
-            start_line,
-            start_column,
-            end_line,
-            end_column,
-        });
+    } else if language == "json" {
+        diagnostics.extend(lint_json_duplicate_keys(path, template, &processed, tree.root_node())?);
     }
 
     sort_and_dedup_diagnostics(&mut diagnostics);
@@ -422,6 +424,93 @@ fn normalize_language(language: &str) -> Option<&str> {
     }
 }
 
+fn lint_json_duplicate_keys(
+    path: &Path,
+    template: &TemplateStringInfo,
+    processed: &ProcessedTemplate,
+    node: Node<'_>,
+) -> Result<Vec<LintDiagnostic>> {
+    let mut diagnostics = Vec::new();
+    collect_json_duplicate_key_diagnostics(path, template, processed, node, &mut diagnostics)?;
+    Ok(diagnostics)
+}
+
+fn collect_json_duplicate_key_diagnostics(
+    path: &Path,
+    template: &TemplateStringInfo,
+    processed: &ProcessedTemplate,
+    node: Node<'_>,
+    diagnostics: &mut Vec<LintDiagnostic>,
+) -> Result<()> {
+    if node.kind() == "object" {
+        let mut seen_keys = HashSet::new();
+        let mut cursor = node.walk();
+
+        for child in node.named_children(&mut cursor) {
+            if child.kind() != "pair" {
+                continue;
+            }
+
+            let Some(key_node) = child.child_by_field_name("key") else {
+                continue;
+            };
+            let key_text = decode_json_string_node(key_node, &processed.content)?;
+
+            if !seen_keys.insert(key_text.clone()) {
+                diagnostics.push(json_duplicate_key_diagnostic(
+                    path,
+                    template,
+                    processed,
+                    key_node,
+                    &key_text,
+                ));
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_json_duplicate_key_diagnostics(path, template, processed, child, diagnostics)?;
+    }
+
+    Ok(())
+}
+
+fn decode_json_string_node(node: Node<'_>, source: &str) -> Result<String> {
+    let raw_text = node.utf8_text(source.as_bytes())?;
+    serde_json::from_str(raw_text).with_context(|| format!("Failed to decode JSON key {raw_text}"))
+}
+
+fn json_duplicate_key_diagnostic(
+    path: &Path,
+    template: &TemplateStringInfo,
+    processed: &ProcessedTemplate,
+    key_node: Node<'_>,
+    key_text: &str,
+) -> LintDiagnostic {
+    let start_offset = map_processed_offset(&processed.processed_to_original, key_node.start_byte());
+    let mut end_offset = map_processed_offset(&processed.processed_to_original, key_node.end_byte());
+
+    if end_offset <= start_offset {
+        end_offset = next_char_boundary(&template.content, start_offset);
+    }
+
+    let ((start_line, start_column), (end_line, end_column)) =
+        map_content_range_to_document(template, start_offset, end_offset);
+
+    LintDiagnostic {
+        rule: RULE_JSON_DUPLICATE_KEY.to_string(),
+        severity: LintSeverity::Error,
+        language: Some("json".to_string()),
+        message: format!("Duplicate json object key \"{key_text}\" in template string"),
+        file: path.to_path_buf(),
+        start_line,
+        start_column,
+        end_line,
+        end_column,
+    }
+}
+
 fn sort_and_dedup_diagnostics(diagnostics: &mut Vec<LintDiagnostic>) {
     diagnostics.sort_by(|left, right| {
         left.file
@@ -517,6 +606,26 @@ value: Annotated[Template, "{language}"] = t"""{python_template}"""
                 result.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn duplicate_json_keys_are_reported() {
+        let result = lint_embedded("json", r#"{"name": {}, "name": {}}"#);
+
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.rule == RULE_JSON_DUPLICATE_KEY),
+            "expected duplicate json key diagnostic, got {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(r#""name""#))
+        );
     }
 
     #[test]

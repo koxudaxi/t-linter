@@ -137,7 +137,7 @@ fn run_prettier(language: &str, input: &str, workspace_root: &Path) -> Result<St
 
 fn run_taplo(input: &str, workspace_root: &Path) -> Result<String> {
     run_command(
-        &PathBuf::from("taplo"),
+        &resolve_taplo(),
         &["format", "-"],
         input,
         workspace_root,
@@ -210,6 +210,10 @@ fn missing_taplo_message() -> String {
 }
 
 fn resolve_prettier(workspace_root: &Path) -> PathBuf {
+    if let Some(prettier) = std::env::var_os("T_LINTER_PRETTIER") {
+        return PathBuf::from(prettier);
+    }
+
     let local_bin = workspace_root.join("node_modules").join(".bin");
     let prettier = local_bin.join(if cfg!(windows) {
         "prettier.cmd"
@@ -221,6 +225,12 @@ fn resolve_prettier(workspace_root: &Path) -> PathBuf {
     } else {
         PathBuf::from("prettier")
     }
+}
+
+fn resolve_taplo() -> PathBuf {
+    std::env::var_os("T_LINTER_TAPLO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("taplo"))
 }
 
 fn format_template(
