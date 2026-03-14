@@ -6,7 +6,7 @@ use t_linter_core::{TemplateHighlighter, TemplateStringInfo, TemplateStringParse
 use tower_lsp::jsonrpc::Result as JsonRpcResult;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 const TOKEN_TYPE_MACRO: u32 = 14;
 const TOKEN_MODIFIER_NONE: u32 = 0;

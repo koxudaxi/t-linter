@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+serde.workspace = true
 tree-sitter.workspace = true
 tree-sitter-python.workspace = true
 tree-sitter-highlight = "0.26.6"
