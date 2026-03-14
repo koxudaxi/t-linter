@@ -65,6 +65,20 @@ esac
     );
 }
 
+fn install_failing_prettier(dir: &Path) {
+    write_executable(
+        &dir.join("node_modules/.bin/prettier"),
+        r#"#!/bin/sh
+cat <<'EOF' 1>&2
+[error] stdin: SyntaxError: Unexpected token (1:33)
+[error] > 1 | { "name": "__T_LINTER_SLOT_0__",, "name": "__T_LINTER_SLOT_1__" }
+[error]     |                                 ^
+EOF
+exit 1
+"#,
+    );
+}
+
 fn run_command(dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_t-linter"))
         .args(args)
@@ -192,6 +206,31 @@ fn format_help_mentions_required_formatters() {
     assert!(stdout.contains("prettier"));
     assert!(stdout.contains("taplo"));
     assert!(stdout.contains("npm install --save-dev prettier"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_errors_show_interpolations_and_adjusted_column() {
+    let dir = test_dir("formatter-error");
+    install_failing_prettier(&dir);
+    write_file(
+        &dir.join("example.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "json"] = t"""{{"name": {value}, "name": {other}}}"""
+"#,
+    );
+
+    let output = run_command(&dir, &["format", "example.py"]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr.contains("SyntaxError: Unexpected token (1:19)"));
+    assert!(stderr.contains(r#"{ "name": {value},, "name": {other} }"#));
+    assert!(stderr.contains("[error]     |                   ^"));
+    assert!(!stderr.contains("__T_LINTER_SLOT_0__"));
 
     let _ = fs::remove_dir_all(dir);
 }

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
+use regex::Regex;
 
 use crate::{TemplateStringInfo, TemplateStringParser};
 
@@ -442,18 +443,136 @@ fn rebuild_raw_template(
 }
 
 fn restore_placeholders_in_error_message(message: &str, slots: &[PlaceholderSlot]) -> String {
-    let mut restored = message.to_string();
+    let content_line_regex = Regex::new(r"^(?P<prefix>.*>\s*(?P<line>\d+)\s*\|)(?P<content>.*)$")
+        .expect("content line regex");
+    let position_regex =
+        Regex::new(r"\((?P<line>\d+):(?P<column>\d+)\)").expect("position regex");
+    let pointer_line_regex =
+        Regex::new(r"^(?P<prefix>.*\|)(?P<spaces>\s*)(?P<marker>\S.*)$").expect("pointer regex");
 
-    for slot in slots {
-        restored = restored.replace(&slot.placeholder, &slot.raw_expression);
+    let mut line_mappings = std::collections::HashMap::new();
+    let mut transformed_lines = Vec::new();
 
-        let bare_placeholder = slot.placeholder.trim_matches('"');
-        if bare_placeholder != slot.placeholder {
-            restored = restored.replace(bare_placeholder, &slot.raw_expression);
+    for line in message.lines() {
+        if let Some(captures) = content_line_regex.captures(line) {
+            let line_number = captures["line"].parse::<usize>().ok();
+            let content = captures.name("content").map(|m| m.as_str()).unwrap_or("");
+            let (restored_content, mapping) = replace_placeholders_with_mapping(content, slots);
+            if let Some(line_number) = line_number {
+                line_mappings.insert(line_number, mapping);
+            }
+            transformed_lines.push(format!("{}{}", &captures["prefix"], restored_content));
+        } else {
+            transformed_lines.push(line.to_string());
         }
     }
 
-    restored
+    let mut result = Vec::new();
+    let mut previous_mapping: Option<&Vec<usize>> = None;
+
+    for line in transformed_lines {
+        if let Some(captures) = content_line_regex.captures(&line) {
+            let line_number = captures["line"].parse::<usize>().ok();
+            previous_mapping = line_number.and_then(|line_number| line_mappings.get(&line_number));
+            result.push(update_position_columns(&line, &position_regex, &line_mappings));
+            continue;
+        }
+
+        let updated = update_position_columns(&line, &position_regex, &line_mappings);
+        if let Some(mapping) = previous_mapping {
+            if let Some(captures) = pointer_line_regex.captures(&updated) {
+                let old_spaces = captures.name("spaces").map(|m| m.as_str()).unwrap_or("");
+                let marker = captures.name("marker").map(|m| m.as_str()).unwrap_or("");
+                let mapped_offset = map_offset(mapping, old_spaces.len());
+                result.push(format!(
+                    "{}{}{}",
+                    &captures["prefix"],
+                    " ".repeat(mapped_offset),
+                    marker
+                ));
+                previous_mapping = None;
+                continue;
+            }
+        }
+
+        previous_mapping = None;
+        result.push(updated);
+    }
+
+    result.join("\n")
+}
+
+fn replace_placeholders_with_mapping(
+    content: &str,
+    slots: &[PlaceholderSlot],
+) -> (String, Vec<usize>) {
+    let mut output = String::new();
+    let mut mapping = vec![0];
+    let mut cursor = 0usize;
+
+    while let Some((start, slot)) = find_next_placeholder(content, cursor, slots) {
+        append_unchanged_segment(&mut output, &mut mapping, &content[cursor..start]);
+
+        let replacement_start = output.len();
+        output.push_str(&slot.raw_expression);
+        for _ in 0..slot.placeholder.len() {
+            mapping.push(replacement_start);
+        }
+        if let Some(last) = mapping.last_mut() {
+            *last = replacement_start + slot.raw_expression.len();
+        }
+
+        cursor = start + slot.placeholder.len();
+    }
+
+    append_unchanged_segment(&mut output, &mut mapping, &content[cursor..]);
+    (output, mapping)
+}
+
+fn find_next_placeholder<'a>(
+    content: &str,
+    cursor: usize,
+    slots: &'a [PlaceholderSlot],
+) -> Option<(usize, &'a PlaceholderSlot)> {
+    slots
+        .iter()
+        .filter_map(|slot| content[cursor..].find(&slot.placeholder).map(|offset| (cursor + offset, slot)))
+        .min_by_key(|(offset, _)| *offset)
+}
+
+fn append_unchanged_segment(
+    output: &mut String,
+    mapping: &mut Vec<usize>,
+    segment: &str,
+) {
+    let new_start = output.len();
+    output.push_str(segment);
+    for offset in 1..=segment.len() {
+        mapping.push(new_start + offset);
+    }
+}
+
+fn update_position_columns(
+    line: &str,
+    position_regex: &Regex,
+    line_mappings: &std::collections::HashMap<usize, Vec<usize>>,
+) -> String {
+    position_regex
+        .replace_all(line, |captures: &regex::Captures<'_>| {
+            let line_number = captures["line"].parse::<usize>().unwrap_or(0);
+            let column = captures["column"].parse::<usize>().unwrap_or(1);
+            let mapped_column = line_mappings
+                .get(&line_number)
+                .map(|mapping| map_offset(mapping, column.saturating_sub(1)) + 1)
+                .unwrap_or(column);
+            format!("({line_number}:{mapped_column})")
+        })
+        .into_owned()
+}
+
+fn map_offset(mapping: &[usize], old_offset: usize) -> usize {
+    let index = old_offset.min(mapping.len().saturating_sub(1));
+    mapping[index]
 }
 
 fn escape_literal_braces(content: &str) -> String {
@@ -646,7 +765,9 @@ payload: Annotated[Template, "json"] = t"""{{"name": {value}, "name": {other}}}"
             .unwrap_err();
 
         let message = error.to_string();
+        assert!(message.contains("(1:19)"));
         assert!(message.contains(r#"{ "name": {value},, "name": {other} }"#));
+        assert!(message.contains("[error]     |                   ^"));
         assert!(!message.contains("__T_LINTER_SLOT_0__"));
         assert!(!message.contains("__T_LINTER_SLOT_1__"));
     }

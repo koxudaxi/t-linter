@@ -911,7 +911,9 @@ payload: Annotated[Template, "json"] = t"""{{"name": {value}, "name": {other}}}"
 
         assert!(response.is_error());
         let message = response.error().unwrap().message.as_ref();
+        assert!(message.contains("SyntaxError: Unexpected token (1:19)"));
         assert!(message.contains(r#"{ "name": {value},, "name": {other} }"#));
+        assert!(message.contains("[error]     |                   ^"));
         assert!(!message.contains("__T_LINTER_SLOT_0__"));
         assert!(!message.contains("__T_LINTER_SLOT_1__"));
 
