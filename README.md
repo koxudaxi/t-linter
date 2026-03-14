@@ -170,6 +170,7 @@ Formatting uses external tools:
 - `taplo` for `toml`
 
 `t-linter` prefers `node_modules/.bin/prettier` from the workspace root and falls back to `prettier` on `PATH`. `taplo` is resolved from `PATH`.
+If a required formatter is missing, `t-linter format` fails with an install hint and returns exit code `2`. LSP formatting requests fail the same way without changing the document.
 
 Configuration can be provided via `pyproject.toml`:
 

@@ -168,6 +168,21 @@ config: Annotated[Template, "toml"] = t"title = {value}"
 
     assert_eq!(output.status.code(), Some(2));
     assert!(stderr.contains("Failed to format example.py"));
+    assert!(stderr.contains("cargo install taplo-cli"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_help_mentions_required_formatters() {
+    let dir = test_dir("help");
+    let output = run_command(&dir, &["format", "--help"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout.contains("prettier"));
+    assert!(stdout.contains("taplo"));
+    assert!(stdout.contains("npm install --save-dev prettier"));
 
     let _ = fs::remove_dir_all(dir);
 }

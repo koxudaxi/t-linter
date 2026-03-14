@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -131,6 +131,7 @@ fn run_prettier(language: &str, input: &str, workspace_root: &Path) -> Result<St
         input,
         workspace_root,
         "prettier",
+        Some(missing_prettier_message(language)),
     )
 }
 
@@ -141,6 +142,7 @@ fn run_taplo(input: &str, workspace_root: &Path) -> Result<String> {
         input,
         workspace_root,
         "taplo",
+        Some(missing_taplo_message()),
     )
 }
 
@@ -150,15 +152,28 @@ fn run_command(
     input: &str,
     workspace_root: &Path,
     command_name: &str,
+    missing_command_message: Option<String>,
 ) -> Result<String> {
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(args)
         .current_dir(workspace_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("Failed to start {command_name}"))?;
+        .stderr(Stdio::piped());
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            if let Some(message) = missing_command_message {
+                bail!("{message}");
+            }
+            bail!("Failed to start {command_name}: {error}");
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to start {command_name}"));
+        }
+    };
 
     child
         .stdin
@@ -182,6 +197,16 @@ fn run_command(
     }
 
     String::from_utf8(output.stdout).context("Formatter returned non-UTF-8 output")
+}
+
+fn missing_prettier_message(language: &str) -> String {
+    format!(
+        "prettier is required to format {language} templates. Install it with `npm install --save-dev prettier` or make `prettier` available on PATH."
+    )
+}
+
+fn missing_taplo_message() -> String {
+    "taplo is required to format toml templates. Install it with `cargo install taplo-cli` or make `taplo` available on PATH.".to_string()
 }
 
 fn resolve_prettier(workspace_root: &Path) -> PathBuf {

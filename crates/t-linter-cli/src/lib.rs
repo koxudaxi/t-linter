@@ -37,11 +37,18 @@ pub enum Commands {
         #[arg(long)]
         error_on_issues: bool,
     },
+    #[command(
+        about = "Format embedded template strings in Python files",
+        long_about = "Format embedded template strings in Python files.\n\nSupported embedded languages:\n  - html, css, javascript/js, json, yaml/yml via prettier\n  - toml via taplo\n\nFormatter resolution:\n  - prettier: workspace_root/node_modules/.bin/prettier, then PATH\n  - taplo: PATH\n\nInstall examples:\n  - npm install --save-dev prettier\n  - cargo install taplo-cli"
+    )]
     Format {
-        #[arg(required = true)]
+        #[arg(required = true, help = "Python files or directories to format")]
         paths: Vec<String>,
 
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Check whether formatting changes are needed without writing files"
+        )]
         check: bool,
     },
     Stats {

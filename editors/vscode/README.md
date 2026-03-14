@@ -67,6 +67,8 @@ npm install --save-dev prettier
 cargo install taplo-cli
 ```
 
+If a required formatter is missing, t-linter returns a formatter-specific install hint and leaves the document unchanged.
+
 ### Step 2: Install the VSCode extension
 1. Open VSCode
 2. Go to Extensions (Ctrl+Shift+X)
