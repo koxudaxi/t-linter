@@ -123,7 +123,7 @@ cargo install --path crates/t-linter
 ## Usage
 
 ### VSCode Extension
-After installing both the PyPI package and VSCode extension, t-linter will automatically provide syntax highlighting for Python template strings and document formatting for supported embedded languages.
+After installing both the PyPI package and VSCode extension, t-linter will automatically provide syntax highlighting for Python template strings plus standard LSP formatting actions for supported embedded languages.
 
 **Troubleshooting**: If syntax highlighting doesn't work:
 1. Ensure `t-linter` is installed: Run `t-linter --version` in terminal
@@ -273,7 +273,12 @@ Would reformat: example.py
 1 file would be reformatted, 0 files already formatted
 ```
 
-The LSP server uses the same formatting engine, so editor actions such as "Format Document" work for supported embedded template languages as long as the required external formatter is available.
+The LSP server uses the same formatting engine, so editor actions such as "Format Document" and "Format Selection" work for supported embedded template languages as long as the required external formatter is available.
+
+Range formatting behavior:
+- If the selection overlaps a template string, t-linter formats the entire overlapping template string.
+- If the selection overlaps multiple template strings in the same Python file, t-linter formats each overlapping template string.
+- If the selection does not overlap any supported template string, no edits are produced.
 
 **Get template string statistics** (🚧 Coming soon):
 ```bash

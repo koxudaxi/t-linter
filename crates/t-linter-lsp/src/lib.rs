@@ -3,7 +3,10 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use t_linter_core::{TemplateHighlighter, TemplateStringInfo, TemplateStringParser, format_source};
+use t_linter_core::{
+    FormatRange, TemplateHighlighter, TemplateStringInfo, TemplateStringParser, format_source,
+    format_source_in_ranges,
+};
 use tower_lsp::jsonrpc::{Error as JsonRpcError, ErrorCode, Result as JsonRpcResult};
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -103,6 +106,7 @@ impl LanguageServer for TLinterLanguageServer {
                     TextDocumentSyncKind::FULL,
                 )),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                document_range_formatting_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
                         SemanticTokensOptions {
@@ -232,6 +236,31 @@ impl LanguageServer for TLinterLanguageServer {
             .clone();
         let workspace_root = self.workspace_root_for_uri(&uri).await;
         let result = format_source(&text, &workspace_root)
+            .map_err(|error| internal_error(&error.to_string()))?;
+
+        if !result.changed {
+            return Ok(Some(Vec::new()));
+        }
+
+        Ok(Some(vec![TextEdit {
+            range: full_document_range(&text),
+            new_text: result.formatted_source,
+        }]))
+    }
+
+    async fn range_formatting(
+        &self,
+        params: DocumentRangeFormattingParams,
+    ) -> JsonRpcResult<Option<Vec<TextEdit>>> {
+        let uri = params.text_document.uri;
+        let text = self
+            .document_cache
+            .get(&uri)
+            .ok_or_else(|| internal_error("Document not found in cache"))?
+            .clone();
+        let workspace_root = self.workspace_root_for_uri(&uri).await;
+        let range = lsp_range_to_format_range(&params.range);
+        let result = format_source_in_ranges(&text, &workspace_root, &[range])
             .map_err(|error| internal_error(&error.to_string()))?;
 
         if !result.changed {
@@ -543,6 +572,15 @@ fn internal_error(message: &str) -> JsonRpcError {
     }
 }
 
+fn lsp_range_to_format_range(range: &Range) -> FormatRange {
+    FormatRange {
+        start_line: range.start.line as usize + 1,
+        start_column: range.start.character as usize + 1,
+        end_line: range.end.line as usize + 1,
+        end_column: range.end.character as usize + 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +680,10 @@ esac
             result["capabilities"]["documentFormattingProvider"],
             json!(true)
         );
+        assert_eq!(
+            result["capabilities"]["documentRangeFormattingProvider"],
+            json!(true)
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -712,6 +754,83 @@ payload: Annotated[Template, "json"] = t"""{{"name": {value}}}"""
                 .as_str()
                 .unwrap()
                 .contains("t\"\"\"{{\n  \"name\": {value}\n}}\"\"\"")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn range_formatting_only_updates_overlapping_templates() {
+        let dir = test_dir("range-formatting");
+        install_mock_prettier(&dir);
+        let file = dir.join("example.py");
+        let uri = Url::from_file_path(&file).unwrap();
+        let text = r#"from typing import Annotated
+from string.templatelib import Template
+
+first: Annotated[Template, "json"] = t"""{{"name": {first}}}"""
+second: Annotated[Template, "json"] = t"""{{"name": {second}}}"""
+"#;
+
+        let (mut service, _) =
+            LspService::new(|client| TLinterLanguageServer::new(client).unwrap());
+
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(initialize_request(1, &dir))
+            .await
+            .unwrap();
+
+        service
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::build("textDocument/didOpen")
+                    .params(json!({
+                        "textDocument": {
+                            "uri": uri,
+                            "languageId": "python",
+                            "version": 1,
+                            "text": text,
+                        }
+                    }))
+                    .finish(),
+            )
+            .await
+            .unwrap();
+
+        let response = service
+            .ready()
+            .await
+            .unwrap()
+            .call(
+                Request::build("textDocument/rangeFormatting")
+                    .params(json!({
+                        "textDocument": { "uri": uri },
+                        "range": {
+                            "start": { "line": 3, "character": 50 },
+                            "end": { "line": 3, "character": 60 }
+                        },
+                        "options": { "tabSize": 4, "insertSpaces": true }
+                    }))
+                    .id(3)
+                    .finish(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let edits = response.result().unwrap().as_array().unwrap();
+        assert_eq!(edits.len(), 1);
+        let new_text = edits[0]["newText"].as_str().unwrap();
+        assert!(new_text.contains(r#"first: Annotated[Template, "json"] = t"""{{"#));
+        assert!(new_text.contains("  \"name\": {first}"));
+        assert!(
+            new_text
+                .contains(r#"second: Annotated[Template, "json"] = t"""{{"name": {second}}}""""#)
         );
 
         let _ = fs::remove_dir_all(dir);

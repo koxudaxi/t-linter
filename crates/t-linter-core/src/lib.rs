@@ -5,7 +5,7 @@ pub mod highlighter;
 pub mod lint;
 pub mod parser;
 
-pub use format::{FormatResult, format_source};
+pub use format::{FormatRange, FormatResult, format_source, format_source_in_ranges};
 pub use highlighter::{HighlightedRange, TemplateHighlighter};
 pub use lint::{
     LintDiagnostic, LintFileResult, LintRunSummary, LintSeverity, file_read_error, lint_source,

@@ -13,14 +13,36 @@ pub struct FormatResult {
     pub formatted_templates: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatRange {
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
 pub fn format_source(source: &str, workspace_root: &Path) -> Result<FormatResult> {
-    format_source_with_runner(source, workspace_root, &ExternalFormatterRunner)
+    format_source_with_runner(source, workspace_root, &ExternalFormatterRunner, None)
+}
+
+pub fn format_source_in_ranges(
+    source: &str,
+    workspace_root: &Path,
+    ranges: &[FormatRange],
+) -> Result<FormatResult> {
+    format_source_with_runner(
+        source,
+        workspace_root,
+        &ExternalFormatterRunner,
+        Some(ranges),
+    )
 }
 
 fn format_source_with_runner(
     source: &str,
     workspace_root: &Path,
     runner: &dyn FormatterRunner,
+    ranges: Option<&[FormatRange]>,
 ) -> Result<FormatResult> {
     let mut parser = TemplateStringParser::new()?;
     let templates = parser.find_template_strings(source)?;
@@ -28,6 +50,15 @@ fn format_source_with_runner(
     let mut formatted_templates = 0;
 
     for template in templates {
+        if let Some(ranges) = ranges {
+            if !ranges
+                .iter()
+                .any(|range| range_overlaps_template(range, &template))
+            {
+                continue;
+            }
+        }
+
         let Some(language) = template
             .language
             .as_deref()
@@ -408,6 +439,15 @@ fn normalize_language(language: &str) -> Option<&str> {
     }
 }
 
+fn range_overlaps_template(range: &FormatRange, template: &TemplateStringInfo) -> bool {
+    let range_start = (range.start_line, range.start_column);
+    let range_end = (range.end_line, range.end_column);
+    let template_start = (template.location.start_line, template.location.start_column);
+    let template_end = (template.location.end_line, template.location.end_column);
+
+    range_start < template_end && template_start < range_end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,7 +485,7 @@ payload: Annotated[Template, "json"] = t"""{{"name": {value}}}"""
 "#;
 
         let result =
-            format_source_with_runner(source, Path::new("."), &MockFormatterRunner).unwrap();
+            format_source_with_runner(source, Path::new("."), &MockFormatterRunner, None).unwrap();
 
         assert!(result.changed);
         assert!(
@@ -466,7 +506,7 @@ page: Annotated[Template, "html"] = t"""
 "#;
 
         let result =
-            format_source_with_runner(source, Path::new("."), &MockFormatterRunner).unwrap();
+            format_source_with_runner(source, Path::new("."), &MockFormatterRunner, None).unwrap();
 
         assert!(
             result
@@ -485,7 +525,7 @@ second: Annotated[Template, "toml"] = t"title = {second}"
 "#;
 
         let result =
-            format_source_with_runner(source, Path::new("."), &MockFormatterRunner).unwrap();
+            format_source_with_runner(source, Path::new("."), &MockFormatterRunner, None).unwrap();
 
         assert!(
             result
@@ -508,7 +548,7 @@ query: Annotated[Template, "sql"] = t"select * from users"
 "#;
 
         let result =
-            format_source_with_runner(source, Path::new("."), &MockFormatterRunner).unwrap();
+            format_source_with_runner(source, Path::new("."), &MockFormatterRunner, None).unwrap();
 
         assert!(!result.changed);
         assert_eq!(result.formatted_source, source);
@@ -522,9 +562,68 @@ from string.templatelib import Template
 payload: Annotated[Template, "json"] = t"""{"name": {value}}"""
 "#;
 
-        let error = format_source_with_runner(source, Path::new("."), &MissingPlaceholderRunner)
-            .unwrap_err();
+        let error =
+            format_source_with_runner(source, Path::new("."), &MissingPlaceholderRunner, None)
+                .unwrap_err();
 
         assert!(error.to_string().contains("placeholder"));
+    }
+
+    #[test]
+    fn format_only_updates_templates_that_overlap_requested_ranges() {
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+first: Annotated[Template, "json"] = t"""{{"name": {first}}}"""
+second: Annotated[Template, "html"] = t"<div>{second}</div>"
+"#;
+
+        let result = format_source_with_runner(
+            source,
+            Path::new("."),
+            &MockFormatterRunner,
+            Some(&[FormatRange {
+                start_line: 4,
+                start_column: 45,
+                end_line: 4,
+                end_column: 52,
+            }]),
+        )
+        .unwrap();
+
+        assert!(result.formatted_source.contains(
+            "first: Annotated[Template, \"json\"] = t\"\"\"{{\n  \"name\": {first}\n}}\"\"\""
+        ));
+        assert!(
+            result
+                .formatted_source
+                .contains(r#"second: Annotated[Template, "html"] = t"<div>{second}</div>""#)
+        );
+        assert_eq!(result.formatted_templates, 1);
+    }
+
+    #[test]
+    fn format_range_is_noop_when_selection_misses_templates() {
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "json"] = t"""{{"name": {value}}}"""
+"#;
+
+        let result = format_source_with_runner(
+            source,
+            Path::new("."),
+            &MockFormatterRunner,
+            Some(&[FormatRange {
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 5,
+            }]),
+        )
+        .unwrap();
+
+        assert!(!result.changed);
+        assert_eq!(result.formatted_source, source);
     }
 }
