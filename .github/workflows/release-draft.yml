@@ -2,10 +2,8 @@ name: Release Draft
 
 on:
   pull_request_target:
-    types:
-      - closed
-    branches:
-      - main
+    types: [closed]
+    branches: [main]
 
 concurrency:
   group: release-draft
@@ -16,160 +14,279 @@ permissions:
   pull-requests: write
 
 jobs:
-  update-draft:
-    if: ${{ github.event.pull_request.merged == true }}
+  analyze-and-draft:
+    if: |
+      github.event.pull_request.merged == true &&
+      !contains(github.event.pull_request.labels.*.name, 'breaking-change-analyzed')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Ensure breaking-change label exists
+      - name: Ensure labels exist
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          gh label create "breaking-change-analyzed" --color "0E8A16" --description "PR has been analyzed for breaking changes" 2>/dev/null || true
           gh label create "breaking-change" --color "D93F0B" --description "PR contains breaking changes" 2>/dev/null || true
 
-      - name: Calculate next version and update draft release
+      - name: Run Claude Code Analysis
+        id: claude
+        timeout-minutes: 10
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          show_full_output: true
+          prompt: |
+            Analyze PR #${{ github.event.pull_request.number }} for breaking changes.
+
+            PR Title: ${{ github.event.pull_request.title }}
+            PR Body:
+            ${{ github.event.pull_request.body }}
+
+            Analyze the merged changes and determine if this PR contains breaking changes.
+
+            Breaking changes for t-linter include:
+            1. CLI Changes - Changes to command-line options, flags, or output formats
+            2. LSP Protocol Changes - Changes to LSP server behavior, capabilities, or diagnostics
+            3. Configuration Changes - Changes to pyproject.toml options or .t-linterignore behavior
+            4. Language Detection Changes - Changes to how template string languages are detected or validated
+            5. Default Behavior Changes - Changes to default values, exit codes, or error handling
+            6. Python or Runtime Support Changes - Dropping Python versions or changing supported runtime assumptions
+
+            If breaking changes are found, format them EXACTLY like this CHANGELOG.md format:
+
+            ### Category Name
+            * Description of breaking change - Detailed explanation (#${{ github.event.pull_request.number }})
+
+            Rules:
+            - Each category should be a ### heading
+            - Each item starts with "* " followed by a brief title, then " - " and detailed explanation
+            - Include PR number at the end as (#NUMBER)
+            - If code examples help, include them in markdown code blocks
+            - Only include categories that have actual breaking changes
+            - Return empty string for breaking_changes_content if no breaking changes
+
+          claude_args: |
+            --model claude-opus-4-6
+            --max-turns 50
+            --json-schema '{"type":"object","properties":{"has_breaking_changes":{"type":"boolean","description":"Whether this PR contains breaking changes"},"breaking_changes_content":{"type":"string","description":"Formatted breaking changes section content (without ## Breaking Changes header), or empty string if none"},"reasoning":{"type":"string","description":"Brief explanation of why this is or is not a breaking change"}},"required":["has_breaking_changes","breaking_changes_content","reasoning"]}'
+
+      - name: Parse Claude output
+        id: parse
         env:
-          GH_TOKEN: ${{ github.token }}
-          HAS_BREAKING_CHANGE: ${{ contains(github.event.pull_request.labels.*.name, 'breaking-change') }}
+          CLAUDE_OUTPUT: ${{ steps.claude.outputs.structured_output }}
+        run: |
+          HAS_BC=$(echo "$CLAUDE_OUTPUT" | jq -r '.has_breaking_changes // false')
+          BC_CONTENT=$(echo "$CLAUDE_OUTPUT" | jq -r '.breaking_changes_content // ""')
+          REASONING=$(echo "$CLAUDE_OUTPUT" | jq -r '.reasoning // ""')
+
+          echo "has_breaking_changes=$HAS_BC" >> $GITHUB_OUTPUT
+
+          DELIMITER="EOF_$(date +%s%N)"
+
+          {
+            echo "breaking_changes_content<<$DELIMITER"
+            printf '%s\n' "$BC_CONTENT"
+            echo "$DELIMITER"
+          } >> $GITHUB_OUTPUT
+
+          {
+            echo "reasoning<<$DELIMITER"
+            printf '%s\n' "$REASONING"
+            echo "$DELIMITER"
+          } >> $GITHUB_OUTPUT
+
+      - name: Add breaking-change-analyzed label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} --add-label "breaking-change-analyzed"
+
+      - name: Add breaking-change label if applicable
+        if: steps.parse.outputs.has_breaking_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} --add-label "breaking-change"
+
+      - name: Post analysis result to PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HAS_BC: ${{ steps.parse.outputs.has_breaking_changes }}
+          BC_CONTENT: ${{ steps.parse.outputs.breaking_changes_content }}
+          REASONING: ${{ steps.parse.outputs.reasoning }}
+        run: |
+          TMPFILE=$(mktemp)
+          trap 'rm -f "$TMPFILE"' EXIT
+
+          {
+            printf '## Breaking Change Analysis\n\n'
+            if [ "$HAS_BC" = "true" ]; then
+              printf 'Result: Breaking changes detected\n\n'
+              printf 'Reasoning: %s\n\n' "$REASONING"
+              printf '### Content for Release Notes\n\n%s\n\n' "$BC_CONTENT"
+            else
+              printf 'Result: No breaking changes detected\n\n'
+              printf 'Reasoning: %s\n\n' "$REASONING"
+            fi
+            printf -- '---\n'
+            printf '*This analysis was performed by Claude Code Action*\n'
+          } > "$TMPFILE"
+
+          gh pr comment ${{ github.event.pull_request.number }} --body-file "$TMPFILE"
+
+      - name: Calculate version and update draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HAS_BC: ${{ steps.parse.outputs.has_breaking_changes }}
+          BC_CONTENT: ${{ steps.parse.outputs.breaking_changes_content }}
         run: |
           set -euo pipefail
 
-          PROJECT_VERSION=$(python3 - <<'PY'
-          import tomllib
-          from pathlib import Path
+          LATEST_TAG_RAW=$(gh release list --limit 1 --exclude-drafts --json tagName --jq '.[0].tagName // "0.0.0"')
+          LATEST_TAG="${LATEST_TAG_RAW#v}"
+          LATEST_TAG="${LATEST_TAG#V}"
+          echo "Latest published tag: $LATEST_TAG_RAW (parsed as: $LATEST_TAG)"
 
-          with Path("pyproject.toml").open("rb") as f:
-              data = tomllib.load(f)
+          MAJOR=$(echo "$LATEST_TAG" | cut -d. -f1)
+          MINOR=$(echo "$LATEST_TAG" | cut -d. -f2)
+          PATCH=$(echo "$LATEST_TAG" | cut -d. -f3)
 
-          print(data["project"]["version"])
-          PY
-          )
+          if ! [[ "$MAJOR" =~ ^[0-9]+$ ]] || ! [[ "$MINOR" =~ ^[0-9]+$ ]] || ! [[ "$PATCH" =~ ^[0-9]+$ ]]; then
+            echo "Warning: Could not parse version from tag '$LATEST_TAG_RAW', using 0.0.0"
+            MAJOR=0
+            MINOR=0
+            PATCH=0
+          fi
 
-          RELEASES_JSON=$(gh release list --limit 100 --json tagName,isDraft)
-          export PROJECT_VERSION RELEASES_JSON HAS_BREAKING_CHANGE
+          DRAFT_TAG_RAW=$(gh release list --json tagName,isDraft --jq '[.[] | select(.isDraft == true)] | .[0].tagName // ""')
+          DRAFT_TAG="${DRAFT_TAG_RAW#v}"
+          DRAFT_TAG="${DRAFT_TAG#V}"
+          BC_SOURCE_TAG_RAW="$DRAFT_TAG_RAW"
 
-          VERSION_INFO=$(python3 - <<'PY'
-          import json
-          import os
-          import re
+          if [ -n "$DRAFT_TAG" ]; then
+            echo "Existing draft: $DRAFT_TAG_RAW"
+            DRAFT_PATCH=$(echo "$DRAFT_TAG" | cut -d. -f3)
 
-          semver_pattern = re.compile(r"(\d+\.\d+\.\d+)$")
-          releases = json.loads(os.environ["RELEASES_JSON"])
+            if [ "$HAS_BC" = "true" ] && [ "$DRAFT_PATCH" != "0" ]; then
+              echo "Upgrading from patch to minor release due to breaking changes"
+              NEW_MINOR=$((MINOR + 1))
+              NEXT_VERSION="${MAJOR}.${NEW_MINOR}.0"
+              OLD_DRAFT_TAG="$DRAFT_TAG_RAW"
+              DRAFT_TAG_RAW=""
+              DRAFT_TAG=""
+            else
+              NEXT_VERSION="$DRAFT_TAG"
+              OLD_DRAFT_TAG=""
+            fi
+          else
+            OLD_DRAFT_TAG=""
+            BC_SOURCE_TAG_RAW=""
+            if [ "$HAS_BC" = "true" ]; then
+              NEW_MINOR=$((MINOR + 1))
+              NEXT_VERSION="${MAJOR}.${NEW_MINOR}.0"
+            else
+              NEW_PATCH=$((PATCH + 1))
+              NEXT_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+            fi
+          fi
 
-          latest_published_tag = "v0.0.0"
-          latest_published_version = "0.0.0"
-          draft_tag = ""
-          draft_version = ""
-
-          def version_tuple(value: str) -> tuple[int, int, int]:
-              major, minor, patch = value.split(".", 2)
-              return int(major), int(minor), int(patch)
-
-          published_versions: list[tuple[tuple[int, int, int], str, str]] = []
-          for release in releases:
-              match = semver_pattern.search(release["tagName"])
-              if not match:
-                  continue
-              parsed_version = match.group(1)
-              parsed_tuple = version_tuple(parsed_version)
-              if release.get("isDraft"):
-                  if not draft_version or parsed_tuple > version_tuple(draft_version):
-                      draft_version = parsed_version
-                      draft_tag = release["tagName"]
-              else:
-                  published_versions.append((parsed_tuple, parsed_version, release["tagName"]))
-
-          if published_versions:
-              published_versions.sort()
-              _, latest_published_version, latest_published_tag = published_versions[-1]
-
-          print(latest_published_tag)
-          print(latest_published_version)
-          print(draft_tag)
-          print(draft_version)
-          PY
-          )
-
-          LATEST_TAG_RAW=$(printf '%s\n' "$VERSION_INFO" | sed -n '1p')
-          LATEST_TAG=$(printf '%s\n' "$VERSION_INFO" | sed -n '2p')
-          DRAFT_TAG_RAW=$(printf '%s\n' "$VERSION_INFO" | sed -n '3p')
-          DRAFT_TAG=$(printf '%s\n' "$VERSION_INFO" | sed -n '4p')
-          export PROJECT_VERSION LATEST_TAG DRAFT_TAG HAS_BREAKING_CHANGE
-
-          NEXT_VERSION=$(python3 - <<'PY'
-          import os
-
-          def parse_version(value: str) -> tuple[int, int, int]:
-              try:
-                  major, minor, patch = value.split(".", 2)
-                  return int(major), int(minor), int(patch)
-              except Exception:
-                  return (0, 0, 0)
-
-          project_version = os.environ["PROJECT_VERSION"]
-          latest_tag = os.environ["LATEST_TAG"]
-          draft_tag = os.environ["DRAFT_TAG"]
-          has_breaking_change = os.environ["HAS_BREAKING_CHANGE"] == "true"
-
-          if parse_version(latest_tag) == (0, 0, 0):
-              candidate = project_version
-          elif draft_tag:
-              candidate = draft_tag
-          else:
-              major, minor, patch = parse_version(latest_tag)
-              if has_breaking_change:
-                  candidate = f"{major}.{minor + 1}.0"
-              else:
-                  candidate = f"{major}.{minor}.{patch + 1}"
-
-          if parse_version(candidate) < parse_version(project_version):
-              candidate = project_version
-
-          print(candidate)
-          PY
-          )
-
-          NEXT_TAG="v$NEXT_VERSION"
+          echo "Next version: $NEXT_VERSION"
 
           if [ -n "$LATEST_TAG" ] && [ "$LATEST_TAG" != "0.0.0" ]; then
-            gh api \
+            GENERATED_NOTES=$(gh api \
               --method POST \
               -H "Accept: application/vnd.github+json" \
               /repos/${{ github.repository }}/releases/generate-notes \
-              -f tag_name="$NEXT_TAG" \
+              -f tag_name="$NEXT_VERSION" \
               -f previous_tag_name="$LATEST_TAG_RAW" \
-              --jq '.body' > generated_notes.md
+              --jq '.body')
           else
-            gh api \
+            GENERATED_NOTES=$(gh api \
               --method POST \
               -H "Accept: application/vnd.github+json" \
               /repos/${{ github.repository }}/releases/generate-notes \
-              -f tag_name="$NEXT_TAG" \
-              --jq '.body' > generated_notes.md
+              -f tag_name="$NEXT_VERSION" \
+              --jq '.body')
           fi
 
-          if [ "$HAS_BREAKING_CHANGE" = "true" ]; then
-            python3 scripts/compose_release_notes.py \
-              --generated-notes-file generated_notes.md \
-              --breaking-pr-number "${{ github.event.pull_request.number }}" > release_body.md
+          EXISTING_BC=""
+          if [ -n "$BC_SOURCE_TAG_RAW" ]; then
+            EXISTING_BODY=$(gh release view "$BC_SOURCE_TAG_RAW" --json body --jq '.body // ""')
+            if echo "$EXISTING_BODY" | grep -q '^## Breaking Changes$'; then
+              EXISTING_BC=$(echo "$EXISTING_BODY" | awk '
+                /^## Breaking Changes$/ { found=1; next }
+                found && /^## / { exit }
+                found { print }
+              ')
+            fi
+          fi
+
+          FINAL_BC=""
+          if [ -n "$BC_CONTENT" ] && [ -n "$EXISTING_BC" ]; then
+            MERGED_BC=$(printf '%s\n\n%s' "$EXISTING_BC" "$BC_CONTENT" | awk '
+              BEGIN { current_section = ""; in_fence = 0; }
+              /^```/ || /^~~~/ { in_fence = !in_fence; }
+              /^### / && !in_fence {
+                current_section = $0;
+                if (!(current_section in sections)) {
+                  order[++order_count] = current_section;
+                }
+                next;
+              }
+              /^[[:space:]]*$/ && !in_fence { next; }
+              current_section != "" {
+                if (sections[current_section] != "") {
+                  sections[current_section] = sections[current_section] "\n" $0;
+                } else {
+                  sections[current_section] = $0;
+                }
+              }
+              END {
+                for (i = 1; i <= order_count; i++) {
+                  section = order[i];
+                  if (i > 1) print "";
+                  print section;
+                  print sections[section];
+                }
+              }
+            ')
+            FINAL_BC=$(printf '## Breaking Changes\n\n%s' "$MERGED_BC")
+          elif [ -n "$BC_CONTENT" ]; then
+            FINAL_BC=$(printf '## Breaking Changes\n\n%s' "$BC_CONTENT")
+          elif [ -n "$EXISTING_BC" ]; then
+            FINAL_BC=$(printf '## Breaking Changes\n\n%s' "$EXISTING_BC")
+          fi
+
+          if [ -n "$FINAL_BC" ]; then
+            RELEASE_BODY=$(printf '%s\n\n%s' "$FINAL_BC" "$GENERATED_NOTES")
           else
-            python3 scripts/compose_release_notes.py \
-              --generated-notes-file generated_notes.md > release_body.md
+            RELEASE_BODY="$GENERATED_NOTES"
           fi
 
-          python3 scripts/validate_release_notes.py release_body.md
-
-          if [ -n "$DRAFT_TAG_RAW" ]; then
-            gh release edit "$DRAFT_TAG_RAW" \
+          if [ -n "$DRAFT_TAG_RAW" ] && [ "$DRAFT_TAG" = "$NEXT_VERSION" ]; then
+            echo "Updating existing draft release: $DRAFT_TAG_RAW"
+            echo "$RELEASE_BODY" | gh release edit "$DRAFT_TAG_RAW" \
               --title "$NEXT_VERSION" \
-              --notes-file release_body.md
+              --notes-file -
           else
-            gh release create "$NEXT_TAG" \
+            echo "Creating new draft release: $NEXT_VERSION"
+            if echo "$RELEASE_BODY" | gh release create "$NEXT_VERSION" \
               --title "$NEXT_VERSION" \
-              --notes-file release_body.md \
-              --draft
+              --notes-file - \
+              --draft; then
+              if [ -n "$OLD_DRAFT_TAG" ]; then
+                echo "Deleting old draft: $OLD_DRAFT_TAG"
+                gh release delete "$OLD_DRAFT_TAG" --yes 2>/dev/null || true
+              fi
+            else
+              echo "Failed to create new draft release"
+              exit 1
+            fi
           fi
+
+          echo "Draft release updated: $NEXT_VERSION"

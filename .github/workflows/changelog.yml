@@ -32,8 +32,6 @@ jobs:
           TAG="${{ github.event.release.tag_name }}"
           DATE=$(gh release view "$TAG" --json publishedAt --jq '.publishedAt | split("T")[0]')
           BODY=$(gh release view "$TAG" --json body --jq '.body // ""')
-          printf '%s\n' "$BODY" > release_body.md
-          python3 scripts/validate_release_notes.py release_body.md
 
           {
             echo "## [$TAG](https://github.com/${{ github.repository }}/releases/tag/$TAG) - $DATE"
@@ -59,7 +57,7 @@ jobs:
           awk '/^---$/ && !found {found=1; print > "header.md"; next} !found {print > "header.md"} found {print > "old_entries.md"}' CHANGELOG.md
           touch old_entries.md
           cat header.md new_entry.md old_entries.md > CHANGELOG.md
-          rm -f header.md new_entry.md old_entries.md release_body.md
+          rm -f header.md new_entry.md old_entries.md
 
       - name: Commit and push
         run: |
