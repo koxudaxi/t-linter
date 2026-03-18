@@ -23,6 +23,13 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: '18'
+
+    - name: Synchronize release version
+      shell: bash
+      run: |
+        VERSION="${{ github.event.release.tag_name }}"
+        VERSION="${VERSION#vscode-v}"
+        python3 scripts/set_release_versions.py --vscode-version "$VERSION"
     
     - name: Install dependencies
       working-directory: editors/vscode

@@ -6,8 +6,7 @@ on:
       - published
 
 jobs:
-  update-changelog:
-    if: ${{ !startsWith(github.event.release.tag_name, 'vscode-v') }}
+  sync-release-metadata:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -17,7 +16,20 @@ jobs:
           ref: main
           token: ${{ secrets.PAT }}
 
+      - name: Synchronize version files
+        shell: bash
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if [[ "$TAG" == vscode-v* ]]; then
+            VERSION="${TAG#vscode-v}"
+            python3 scripts/set_release_versions.py --vscode-version "$VERSION"
+          else
+            VERSION="${TAG#v}"
+            python3 scripts/set_release_versions.py --python-version "$VERSION"
+          fi
+
       - name: Get release info and update CHANGELOG
+        if: ${{ !startsWith(github.event.release.tag_name, 'vscode-v') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -59,6 +71,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add CHANGELOG.md
-          git diff --cached --quiet || git commit -m "docs: update CHANGELOG.md for ${{ github.event.release.tag_name }}"
+          git add pyproject.toml Cargo.toml editors/vscode/package.json editors/vscode/package-lock.json CHANGELOG.md
+          git diff --cached --quiet || git commit -m "chore: sync release metadata for ${{ github.event.release.tag_name }}"
           git push

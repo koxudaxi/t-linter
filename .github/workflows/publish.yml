@@ -48,6 +48,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Synchronize release version
+        shell: bash
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          python3 scripts/set_release_versions.py --python-version "$VERSION"
+
       - name: Build wheel (Linux manylinux)
         if: ${{ matrix.os == 'linux' }}
         uses: PyO3/maturin-action@v1
@@ -93,6 +100,13 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@1.94.0
+
+      - name: Synchronize release version
+        shell: bash
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          python3 scripts/set_release_versions.py --python-version "$VERSION"
 
       - name: Build source distribution
         run: uvx maturin sdist --out dist
