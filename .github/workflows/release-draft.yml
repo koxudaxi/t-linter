@@ -49,13 +49,55 @@ jobs:
           PY
           )
 
-          LATEST_TAG_RAW=$(gh release list --limit 100 --exclude-drafts --json tagName --jq '.[0].tagName // "v0.0.0"')
-          LATEST_TAG="${LATEST_TAG_RAW#v}"
-          LATEST_TAG="${LATEST_TAG#V}"
+          RELEASES_JSON=$(gh release list --limit 100 --json tagName,isDraft)
+          export PROJECT_VERSION RELEASES_JSON HAS_BREAKING_CHANGE
 
-          DRAFT_TAG_RAW=$(gh release list --limit 100 --json tagName,isDraft --jq '[.[] | select(.isDraft == true)] | .[0].tagName // ""')
-          DRAFT_TAG="${DRAFT_TAG_RAW#v}"
-          DRAFT_TAG="${DRAFT_TAG#V}"
+          VERSION_INFO=$(python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          semver_pattern = re.compile(r"(\d+\.\d+\.\d+)$")
+          releases = json.loads(os.environ["RELEASES_JSON"])
+
+          latest_published_tag = "v0.0.0"
+          latest_published_version = "0.0.0"
+          draft_tag = ""
+          draft_version = ""
+
+          def version_tuple(value: str) -> tuple[int, int, int]:
+              major, minor, patch = value.split(".", 2)
+              return int(major), int(minor), int(patch)
+
+          published_versions: list[tuple[tuple[int, int, int], str, str]] = []
+          for release in releases:
+              match = semver_pattern.search(release["tagName"])
+              if not match:
+                  continue
+              parsed_version = match.group(1)
+              parsed_tuple = version_tuple(parsed_version)
+              if release.get("isDraft"):
+                  if not draft_version or parsed_tuple > version_tuple(draft_version):
+                      draft_version = parsed_version
+                      draft_tag = release["tagName"]
+              else:
+                  published_versions.append((parsed_tuple, parsed_version, release["tagName"]))
+
+          if published_versions:
+              published_versions.sort()
+              _, latest_published_version, latest_published_tag = published_versions[-1]
+
+          print(latest_published_tag)
+          print(latest_published_version)
+          print(draft_tag)
+          print(draft_version)
+          PY
+          )
+
+          LATEST_TAG_RAW=$(printf '%s\n' "$VERSION_INFO" | sed -n '1p')
+          LATEST_TAG=$(printf '%s\n' "$VERSION_INFO" | sed -n '2p')
+          DRAFT_TAG_RAW=$(printf '%s\n' "$VERSION_INFO" | sed -n '3p')
+          DRAFT_TAG=$(printf '%s\n' "$VERSION_INFO" | sed -n '4p')
           export PROJECT_VERSION LATEST_TAG DRAFT_TAG HAS_BREAKING_CHANGE
 
           NEXT_VERSION=$(python3 - <<'PY'
