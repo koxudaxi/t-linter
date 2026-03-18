@@ -130,7 +130,7 @@ impl DiscoveryCollector {
 
         if resolved_metadata.is_dir() {
             let discovery_root = self.discovery_root_for_dir(&resolved)?;
-            self.collect_directory(&resolved, &resolved, operand, &discovery_root);
+            self.collect_directory(&resolved, operand, &discovery_root);
             return Ok(());
         }
 
@@ -160,9 +160,8 @@ impl DiscoveryCollector {
 
     fn collect_directory(
         &mut self,
-        canonical_root: &Path,
         current_dir: &Path,
-        display_root: &Path,
+        current_display_dir: &Path,
         discovery_root: &Path,
     ) {
         if self.should_ignore_path(current_dir, true, discovery_root) {
@@ -170,10 +169,24 @@ impl DiscoveryCollector {
         }
 
         let mut entries = match fs::read_dir(current_dir) {
-            Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
+            Ok(entries) => {
+                let mut collected = Vec::new();
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => collected.push(entry),
+                        Err(error) => {
+                            self.push_failure(
+                                current_display_dir.to_path_buf(),
+                                format!("Failed to read directory entry: {error}"),
+                            );
+                        }
+                    }
+                }
+                collected
+            }
             Err(error) => {
                 self.push_failure(
-                    display_root.to_path_buf(),
+                    current_display_dir.to_path_buf(),
                     format!("Failed to read directory: {error}"),
                 );
                 return;
@@ -183,7 +196,7 @@ impl DiscoveryCollector {
 
         for entry in entries {
             let path = entry.path();
-            let display_path = display_path_for_descendant(canonical_root, display_root, &path);
+            let display_path = display_path_for_child(current_dir, current_display_dir, &path);
 
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
@@ -205,7 +218,7 @@ impl DiscoveryCollector {
             }
 
             if metadata.is_dir() {
-                self.collect_directory(canonical_root, &path, display_root, discovery_root);
+                self.collect_directory(&path, &display_path, discovery_root);
                 continue;
             }
 
@@ -257,18 +270,18 @@ impl DiscoveryCollector {
     }
 }
 
-fn display_path_for_descendant(
-    canonical_root: &Path,
-    display_root: &Path,
+fn display_path_for_child(
+    current_dir: &Path,
+    current_display_dir: &Path,
     canonical_path: &Path,
 ) -> PathBuf {
     canonical_path
-        .strip_prefix(canonical_root)
+        .strip_prefix(current_dir)
         .map(|relative| {
             if relative.as_os_str().is_empty() {
-                display_root.to_path_buf()
+                current_display_dir.to_path_buf()
             } else {
-                display_root.join(relative)
+                current_display_dir.join(relative)
             }
         })
         .unwrap_or_else(|_| canonical_path.to_path_buf())

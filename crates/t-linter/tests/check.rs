@@ -4,7 +4,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-use std::os::unix::fs as unix_fs;
+use std::os::unix::fs::{self as unix_fs, PermissionsExt};
 
 fn test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -338,6 +338,38 @@ template: Annotated[Template, "html"] = t"<div><"
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(json["summary"]["files_scanned"], 1);
     assert_eq!(json["diagnostics"][0]["file"], "link.py");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn check_reports_unreadable_nested_directory_with_nested_display_path() {
+    let dir = test_dir("nested-read-error");
+    let real_dir = dir.join("real");
+    let link_dir = dir.join("linkdir");
+    let unreadable = real_dir.join("sub");
+    fs::create_dir_all(&unreadable).unwrap();
+    write_file(
+        &real_dir.join("ok.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "yaml"] = t"name: {value}"
+"#,
+    );
+    unix_fs::symlink(&real_dir, &link_dir).unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = run_check(&dir, &["check", "linkdir", "--format", "json"]);
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(json["summary"]["failed_files"], 1);
+    assert_eq!(json["diagnostics"][0]["file"], "linkdir/sub");
 
     let _ = fs::remove_dir_all(dir);
 }

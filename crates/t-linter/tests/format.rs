@@ -367,6 +367,35 @@ payload: Annotated[Template, "toml"] = t'title={title}'
 
 #[cfg(unix)]
 #[test]
+fn format_reports_unreadable_nested_directory_with_nested_display_path() {
+    let dir = test_dir("nested-read-error");
+    let real_dir = dir.join("real");
+    let link_dir = dir.join("linkdir");
+    let unreadable = real_dir.join("sub");
+    fs::create_dir_all(&unreadable).unwrap();
+    write_file(
+        &real_dir.join("ok.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "toml"] = t'title={title}'
+"#,
+    );
+    unix_fs::symlink(&real_dir, &link_dir).unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = run_t_linter(&dir, &["format", "linkdir"], None);
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr.contains("linkdir/sub: Failed to read directory"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
 fn format_reports_broken_symlink_operands_as_failures() {
     let dir = test_dir("broken-symlink");
     unix_fs::symlink(dir.join("missing.py"), dir.join("broken.py")).unwrap();
