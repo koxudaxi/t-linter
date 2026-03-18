@@ -73,6 +73,39 @@ template: Annotated[Template, "json"] = t"""[1,,2]"""
 }
 
 #[test]
+fn check_reports_yaml_plain_scalars_with_whitespace_interpolation() {
+    let dir = test_dir("yaml-plain-scalar");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+name = "api"
+replicas = 3
+
+template: Annotated[Template, "yaml"] = t"""
+service:
+  name: {name}
+  replicas: fdsa fff fds{replicas}
+"""
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(
+        json["diagnostics"][0]["message"],
+        "Quote YAML plain scalars that mix whitespace and interpolations."
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_json_recurses_and_skips_default_excludes() {
     let dir = test_dir("json");
     write_file(
