@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use tracing::info;
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
+use tstring_syntax::{
+    SourcePosition, SourceSpan, TemplateInput, TemplateInterpolation, TemplateSegment,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct ModuleContext {
@@ -346,16 +349,18 @@ impl TemplateStringParser {
             .child(0)
             .ok_or_else(|| anyhow::anyhow!("No string_start node"))?;
         let last_child_index = u32::try_from(node.child_count() - 1)?;
-        let _string_end = node
+        let string_end = node
             .child(last_child_index)
             .ok_or_else(|| anyhow::anyhow!("No string_end node"))?;
 
         let start_text = string_start.utf8_text(source.as_bytes())?;
+        let end_text = string_end.utf8_text(source.as_bytes())?;
         let raw_content = node.utf8_text(source.as_bytes())?;
 
         let flags = self.parse_string_flags(start_text);
 
-        let (content, expressions) = self.extract_content_and_interpolations(&node, source)?;
+        let (content, expressions, parts) =
+            self.extract_content_and_interpolations(&node, source)?;
 
         let language = if let Some(type_node) = type_annotation {
             if let Some(lang) = self.extract_language_from_annotation(type_node, source, context)? {
@@ -391,6 +396,8 @@ impl TemplateStringParser {
             variable_name: var_name.map(String::from),
             function_name: func_name.map(String::from),
             language,
+            string_start: start_text.to_string(),
+            string_end: end_text.to_string(),
             location: Location {
                 start_line: start_position.row + 1,
                 start_column: start_position.column + 1,
@@ -398,6 +405,7 @@ impl TemplateStringParser {
                 end_column: end_position.column + 1,
             },
             expressions,
+            parts,
             flags,
         })
     }
@@ -419,11 +427,13 @@ impl TemplateStringParser {
         &self,
         string_node: &Node,
         source: &str,
-    ) -> Result<(String, Vec<Expression>)> {
+    ) -> Result<(String, Vec<Expression>, Vec<TemplatePart>)> {
         let mut content_parts = Vec::new();
         let mut expressions = Vec::new();
+        let mut parts = Vec::new();
         let mut cursor = string_node.walk();
         let mut last_end_byte = 0;
+        let mut interpolation_index = 0;
 
         for child in string_node.children(&mut cursor) {
             match child.kind() {
@@ -433,35 +443,12 @@ impl TemplateStringParser {
 
                     if last_end_byte > 0 && start_byte > last_end_byte {
                         let between = &source[last_end_byte..start_byte];
-                        content_parts.push(between.to_string());
+                        push_static_part(&mut content_parts, &mut parts, between);
                     }
 
                     let text = child.utf8_text(source.as_bytes())?;
-                    let mut processed_content = String::new();
-                    let mut chars = text.chars();
-
-                    while let Some(ch) = chars.next() {
-                        if ch == '{' {
-                            if let Some(next_ch) = chars.clone().next() {
-                                if next_ch == '{' {
-                                    processed_content.push('{');
-                                    chars.next();
-                                    continue;
-                                }
-                            }
-                        } else if ch == '}' {
-                            if let Some(next_ch) = chars.clone().next() {
-                                if next_ch == '}' {
-                                    processed_content.push('}');
-                                    chars.next();
-                                    continue;
-                                }
-                            }
-                        }
-                        processed_content.push(ch);
-                    }
-
-                    content_parts.push(processed_content);
+                    let processed_content = unescape_template_text(text);
+                    push_static_part(&mut content_parts, &mut parts, &processed_content);
                     last_end_byte = end_byte;
                 }
                 "interpolation" => {
@@ -469,13 +456,21 @@ impl TemplateStringParser {
 
                     if last_end_byte > 0 && start_byte > last_end_byte {
                         let between = &source[last_end_byte..start_byte];
-                        content_parts.push(between.to_string());
+                        push_static_part(&mut content_parts, &mut parts, between);
                     }
 
                     content_parts.push("{}".to_string());
 
-                    if let Some(expr) = self.extract_interpolation_expression(&child, source)? {
+                    if let Some(interpolation) =
+                        self.extract_interpolation_expression(&child, source, interpolation_index)?
+                    {
+                        let expr = Expression {
+                            content: interpolation.expression.clone(),
+                            location: interpolation.location.clone(),
+                        };
                         expressions.push(expr);
+                        parts.push(TemplatePart::Interpolation(interpolation));
+                        interpolation_index += 1;
                     }
 
                     last_end_byte = child.end_byte();
@@ -485,14 +480,14 @@ impl TemplateStringParser {
 
                     if last_end_byte > 0 && start_byte > last_end_byte {
                         let between = &source[last_end_byte..start_byte];
-                        content_parts.push(between.to_string());
+                        push_static_part(&mut content_parts, &mut parts, between);
                     }
 
                     let text = child.utf8_text(source.as_bytes())?;
                     if text == "{{" {
-                        content_parts.push("{".to_string());
+                        push_static_part(&mut content_parts, &mut parts, "{");
                     } else if text == "}}" {
-                        content_parts.push("}".to_string());
+                        push_static_part(&mut content_parts, &mut parts, "}");
                     }
 
                     last_end_byte = child.end_byte();
@@ -504,7 +499,7 @@ impl TemplateStringParser {
                     let start_byte = child.start_byte();
                     if last_end_byte > 0 && start_byte > last_end_byte {
                         let between = &source[last_end_byte..start_byte];
-                        content_parts.push(between.to_string());
+                        push_static_part(&mut content_parts, &mut parts, between);
                     }
                     last_end_byte = child.end_byte();
                 }
@@ -512,39 +507,60 @@ impl TemplateStringParser {
         }
 
         let full_content = content_parts.join("");
-        Ok((full_content, expressions))
+        Ok((full_content, expressions, parts))
     }
+
     fn extract_interpolation_expression(
         &self,
         interpolation_node: &Node,
         source: &str,
-    ) -> Result<Option<Expression>> {
+        interpolation_index: usize,
+    ) -> Result<Option<InterpolationInfo>> {
         let mut cursor = interpolation_node.walk();
+        let mut expression = None;
+        let mut location = None;
+        let mut conversion = None;
+        let mut format_spec = String::new();
 
         for child in interpolation_node.children(&mut cursor) {
-            if child.kind() != "{"
-                && child.kind() != "}"
-                && child.kind() != "="
-                && child.kind() != "format_specifier"
-                && child.kind() != "type_conversion"
-            {
-                let expr_content = child.utf8_text(source.as_bytes())?;
-                let start = child.start_position();
-                let end = child.end_position();
-
-                return Ok(Some(Expression {
-                    content: expr_content.to_string(),
-                    location: Location {
-                        start_line: start.row + 1,
-                        start_column: start.column + 1,
-                        end_line: end.row + 1,
-                        end_column: end.column + 1,
-                    },
-                }));
+            match child.kind() {
+                "{" | "}" | "=" => {}
+                "type_conversion" => {
+                    let value = child.utf8_text(source.as_bytes())?;
+                    conversion = value.strip_prefix('!').map(str::to_string);
+                }
+                "format_specifier" => {
+                    let value = child.utf8_text(source.as_bytes())?;
+                    format_spec = value.strip_prefix(':').unwrap_or(value).to_string();
+                }
+                _ => {
+                    if expression.is_none() {
+                        let expr_content = child.utf8_text(source.as_bytes())?;
+                        let start = child.start_position();
+                        let end = child.end_position();
+                        expression = Some(expr_content.to_string());
+                        location = Some(Location {
+                            start_line: start.row + 1,
+                            start_column: start.column + 1,
+                            end_line: end.row + 1,
+                            end_column: end.column + 1,
+                        });
+                    }
+                }
             }
         }
 
-        Ok(None)
+        Ok(expression
+            .zip(location)
+            .map(|(expression, location)| InterpolationInfo {
+                expression,
+                conversion,
+                format_spec,
+                raw_source: source[interpolation_node.start_byte()..interpolation_node.end_byte()]
+                    .to_string(),
+                location,
+                interpolation_index,
+            }))
     }
 
     fn extract_language_from_annotation(
@@ -750,12 +766,15 @@ pub struct TemplateStringInfo {
     pub variable_name: Option<String>,
     pub function_name: Option<String>,
     pub language: Option<String>,
+    pub string_start: String,
+    pub string_end: String,
     pub location: Location,
     pub expressions: Vec<Expression>,
+    pub parts: Vec<TemplatePart>,
     pub flags: TemplateStringFlags,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
     pub start_line: usize,
     pub start_column: usize,
@@ -767,6 +786,356 @@ pub struct Location {
 pub struct Expression {
     pub content: String,
     pub location: Location,
+}
+
+#[derive(Debug, Clone)]
+pub enum TemplatePart {
+    Static(StaticTextSegment),
+    Interpolation(InterpolationInfo),
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticTextSegment {
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct InterpolationInfo {
+    pub expression: String,
+    pub conversion: Option<String>,
+    pub format_spec: String,
+    pub raw_source: String,
+    pub location: Location,
+    pub interpolation_index: usize,
+}
+
+impl TemplateStringInfo {
+    pub fn to_template_input(&self) -> TemplateInput {
+        let mut segments = Vec::with_capacity(self.parts.len().max(1));
+
+        for part in &self.parts {
+            match part {
+                TemplatePart::Static(part) => {
+                    if !part.text.is_empty() {
+                        segments.push(TemplateSegment::StaticText(part.text.clone()));
+                    }
+                }
+                TemplatePart::Interpolation(part) => {
+                    segments.push(TemplateSegment::Interpolation(TemplateInterpolation {
+                        expression: part.expression.clone(),
+                        conversion: part.conversion.clone(),
+                        format_spec: part.format_spec.clone(),
+                        interpolation_index: part.interpolation_index,
+                        raw_source: Some(part.raw_source.clone()),
+                    }));
+                }
+            }
+        }
+
+        if segments.is_empty() {
+            segments.push(TemplateSegment::StaticText(String::new()));
+        }
+
+        TemplateInput::from_segments(segments)
+    }
+
+    pub fn backend_span_to_location(&self, span: &SourceSpan) -> Location {
+        let start_offset = self.token_position_to_content_offset(&span.start);
+        let end_offset = self.token_position_to_content_offset(&span.end);
+        let ((start_line, start_column), (end_line, end_column)) =
+            self.map_content_range_to_document(start_offset, end_offset);
+        Location {
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+        }
+    }
+
+    pub fn formatted_literal(&self, content: &str) -> String {
+        let preferred_quote = if self.string_start.contains('\'') {
+            '\''
+        } else {
+            '"'
+        };
+        let prefix = self.literal_prefix();
+
+        if self.flags.is_raw
+            && let Some((string_start, string_end)) =
+                choose_raw_delimiters(content, preferred_quote, self.flags.is_triple)
+        {
+            return format!("{prefix}{string_start}{content}{string_end}");
+        }
+
+        let normalized_prefix = normalize_literal_prefix(prefix, self.flags.is_raw);
+        let use_triple = self.flags.is_triple || content.contains('\n');
+        let quote = choose_non_raw_quote(content, preferred_quote, use_triple);
+        let delimiter = if use_triple {
+            std::iter::repeat_n(quote, 3).collect::<String>()
+        } else {
+            quote.to_string()
+        };
+        let escaped_content = escape_python_literal_content(content, quote, use_triple);
+
+        format!("{normalized_prefix}{delimiter}{escaped_content}{delimiter}")
+    }
+
+    fn token_position_to_content_offset(&self, position: &SourcePosition) -> usize {
+        let mut offset = 0;
+
+        for (token_index, part) in self.parts.iter().enumerate() {
+            if token_index == position.token_index {
+                return match part {
+                    TemplatePart::Static(part) => offset + position.offset.min(part.text.len()),
+                    TemplatePart::Interpolation(_) => offset + position.offset.min(2),
+                };
+            }
+
+            offset += match part {
+                TemplatePart::Static(part) => part.text.len(),
+                TemplatePart::Interpolation(_) => 2,
+            };
+        }
+
+        offset
+    }
+
+    fn map_content_range_to_document(
+        &self,
+        start_offset: usize,
+        end_offset: usize,
+    ) -> ((usize, usize), (usize, usize)) {
+        let prefix_len = self.string_start.len();
+        let actual_content =
+            &self.raw_content[prefix_len..self.raw_content.len() - self.string_end.len()];
+        let template_start_line = self.location.start_line - 1;
+        let template_start_col = self.location.start_column - 1;
+
+        let (start_line, start_col) = map_template_position_to_document(
+            &self.content,
+            actual_content,
+            start_offset,
+            template_start_line,
+            template_start_col,
+            prefix_len,
+        );
+        let (end_line, end_col) = map_template_position_to_document(
+            &self.content,
+            actual_content,
+            end_offset,
+            template_start_line,
+            template_start_col,
+            prefix_len,
+        );
+
+        ((start_line + 1, start_col + 1), (end_line + 1, end_col + 1))
+    }
+
+    fn literal_prefix(&self) -> &str {
+        self.string_start
+            .trim_end_matches(['\'', '"'])
+            .trim_end_matches(['\'', '"'])
+            .trim_end_matches(['\'', '"'])
+    }
+}
+
+fn push_static_part(content_parts: &mut Vec<String>, parts: &mut Vec<TemplatePart>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+
+    let text = text.to_string();
+    content_parts.push(text.clone());
+    parts.push(TemplatePart::Static(StaticTextSegment { text }));
+}
+
+fn unescape_template_text(text: &str) -> String {
+    let mut processed_content = String::new();
+    let mut chars = text.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            if let Some(next_ch) = chars.clone().next()
+                && next_ch == '{'
+            {
+                processed_content.push('{');
+                chars.next();
+                continue;
+            }
+        } else if ch == '}'
+            && let Some(next_ch) = chars.clone().next()
+            && next_ch == '}'
+        {
+            processed_content.push('}');
+            chars.next();
+            continue;
+        }
+        processed_content.push(ch);
+    }
+
+    processed_content
+}
+
+fn map_template_position_to_document(
+    template_content: &str,
+    actual_content: &str,
+    position_in_template: usize,
+    template_start_line: usize,
+    template_start_col: usize,
+    prefix_len: usize,
+) -> (usize, usize) {
+    let mut template_idx = 0;
+    let mut actual_idx = 0;
+    let template_bytes = template_content.as_bytes();
+    let actual_bytes = actual_content.as_bytes();
+
+    while template_idx < position_in_template && actual_idx < actual_bytes.len() {
+        if template_idx + 1 < template_bytes.len()
+            && template_bytes[template_idx] == b'{'
+            && template_bytes[template_idx + 1] == b'}'
+        {
+            if actual_idx < actual_bytes.len() && actual_bytes[actual_idx] == b'{' {
+                let mut expr_end = actual_idx + 1;
+                while expr_end < actual_bytes.len() && actual_bytes[expr_end] != b'}' {
+                    expr_end += 1;
+                }
+                if expr_end < actual_bytes.len() {
+                    expr_end += 1;
+                }
+                actual_idx = expr_end;
+            }
+            template_idx += 2;
+        } else {
+            template_idx += 1;
+            actual_idx += 1;
+        }
+    }
+
+    let mut line = template_start_line;
+    let mut col = template_start_col + prefix_len;
+
+    for byte in actual_bytes.iter().take(actual_idx) {
+        if *byte == b'\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+
+    (line, col)
+}
+
+fn choose_raw_delimiters(
+    content: &str,
+    preferred_quote: char,
+    prefer_triple: bool,
+) -> Option<(String, String)> {
+    let trailing_backslashes = content.chars().rev().take_while(|&ch| ch == '\\').count();
+    if trailing_backslashes % 2 != 0 {
+        return None;
+    }
+
+    let quote_candidates = if preferred_quote == '\'' {
+        ['\'', '"']
+    } else {
+        ['"', '\'']
+    };
+
+    let triple_modes = if prefer_triple || content.contains('\n') {
+        [true, false]
+    } else {
+        [false, true]
+    };
+
+    for use_triple in triple_modes {
+        if !use_triple && content.contains('\n') {
+            continue;
+        }
+
+        for quote in quote_candidates {
+            let delimiter = if use_triple {
+                std::iter::repeat_n(quote, 3).collect::<String>()
+            } else {
+                quote.to_string()
+            };
+            if !content.contains(&delimiter) {
+                return Some((delimiter.clone(), delimiter));
+            }
+        }
+    }
+
+    None
+}
+
+fn normalize_literal_prefix(prefix: &str, was_raw: bool) -> String {
+    if !was_raw {
+        return prefix.to_string();
+    }
+
+    let normalized = prefix
+        .chars()
+        .filter(|ch| !matches!(ch, 'r' | 'R'))
+        .collect::<String>();
+    if normalized.is_empty() {
+        "t".to_owned()
+    } else {
+        normalized
+    }
+}
+
+fn choose_non_raw_quote(content: &str, preferred_quote: char, use_triple: bool) -> char {
+    let alternate_quote = if preferred_quote == '\'' { '"' } else { '\'' };
+    let preferred_cost = quote_escape_cost(content, preferred_quote, use_triple);
+    let alternate_cost = quote_escape_cost(content, alternate_quote, use_triple);
+
+    if alternate_cost < preferred_cost {
+        alternate_quote
+    } else {
+        preferred_quote
+    }
+}
+
+fn quote_escape_cost(content: &str, quote: char, use_triple: bool) -> usize {
+    if use_triple {
+        let delimiter = std::iter::repeat_n(quote, 3).collect::<String>();
+        content.matches(&delimiter).count() * 3
+    } else {
+        content.matches(quote).count()
+    }
+}
+
+fn escape_python_literal_content(content: &str, quote: char, use_triple: bool) -> String {
+    let mut escaped = String::new();
+
+    for ch in content.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' if use_triple => escaped.push('\n'),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\0' => escaped.push_str("\\0"),
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\u{000C}' => escaped.push_str("\\f"),
+            '\'' if quote == '\'' => escaped.push_str("\\'"),
+            '"' if quote == '"' => escaped.push_str("\\\""),
+            ch if ch.is_control() => escaped.push_str(&format!("\\x{:02x}", ch as u32)),
+            _ => escaped.push(ch),
+        }
+    }
+
+    if use_triple {
+        let delimiter = std::iter::repeat_n(quote, 3).collect::<String>();
+        let escaped_delimiter = if quote == '\'' {
+            "\\'\\'\\'"
+        } else {
+            "\\\"\\\"\\\""
+        };
+        escaped.replace(&delimiter, escaped_delimiter)
+    } else {
+        escaped
+    }
 }
 
 #[cfg(test)]
@@ -796,6 +1165,11 @@ mod tests {
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].expressions[0].content, "price");
+        let TemplatePart::Interpolation(interpolation) = &templates[0].parts[1] else {
+            panic!("expected interpolation part");
+        };
+        assert_eq!(interpolation.format_spec, ".2f");
+        assert_eq!(interpolation.raw_source, "{price:.2f}");
     }
 
     #[test]
@@ -839,6 +1213,34 @@ html = t"""
         assert_eq!(templates[0].content, "Use {braces} in {}");
         assert_eq!(templates[0].expressions.len(), 1);
         assert_eq!(templates[0].expressions[0].content, "var");
+    }
+
+    #[test]
+    fn test_template_input_preserves_raw_interpolations() {
+        let source = r#"payload = t"Hello {name!r:>5}!""#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        let input = templates[0].to_template_input();
+        let interpolation = input.interpolation(0).expect("expected interpolation");
+        assert_eq!(interpolation.expression, "name");
+        assert_eq!(interpolation.conversion.as_deref(), Some("r"));
+        assert_eq!(interpolation.format_spec, ">5");
+        assert_eq!(interpolation.raw_source.as_deref(), Some("{name!r:>5}"));
+    }
+
+    #[test]
+    fn test_formatted_literal_requotes_json_content() {
+        let source = r#"payload = t"placeholder""#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(
+            templates[0].formatted_literal(r#"{"name": {name}, "message": "Hello"}"#),
+            r#"t'{"name": {name}, "message": "Hello"}'"#
+        );
     }
 
     #[test]

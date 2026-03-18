@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use tree_sitter::{Node, Parser, Tree};
+use tstring_json as backend_json;
+use tstring_syntax::Diagnostic;
+use tstring_toml as backend_toml;
+use tstring_yaml as backend_yaml;
 
 use crate::{TemplateStringInfo, TemplateStringParser};
 
@@ -135,6 +139,10 @@ fn lint_template(path: &Path, template: &TemplateStringInfo) -> Result<Vec<LintD
         return Ok(Vec::new());
     };
 
+    if matches!(language.as_str(), "json" | "yaml" | "yml" | "toml") {
+        return lint_backend_template(path, template, &language);
+    }
+
     let processed = prepare_template_for_lint(template, &language);
     let tree = parse_embedded(&language, &processed.content)?;
 
@@ -151,8 +159,10 @@ fn lint_template(path: &Path, template: &TemplateStringInfo) -> Result<Vec<LintD
     };
 
     for node in nodes {
-        let start_offset = map_processed_offset(&processed.processed_to_original, node.start_byte());
-        let mut end_offset = map_processed_offset(&processed.processed_to_original, node.end_byte());
+        let start_offset =
+            map_processed_offset(&processed.processed_to_original, node.start_byte());
+        let mut end_offset =
+            map_processed_offset(&processed.processed_to_original, node.end_byte());
 
         if end_offset <= start_offset {
             end_offset = next_char_boundary(&template.content, start_offset);
@@ -173,6 +183,60 @@ fn lint_template(path: &Path, template: &TemplateStringInfo) -> Result<Vec<LintD
             end_column,
         });
     }
+
+    sort_and_dedup_diagnostics(&mut diagnostics);
+    Ok(diagnostics)
+}
+
+fn lint_backend_template(
+    path: &Path,
+    template: &TemplateStringInfo,
+    language: &str,
+) -> Result<Vec<LintDiagnostic>> {
+    let input = template.to_template_input();
+    let result = match language {
+        "json" => backend_json::check_template(&input),
+        "yaml" | "yml" => backend_yaml::check_template(&input),
+        "toml" => backend_toml::check_template(&input),
+        other => return Err(anyhow::anyhow!("Unsupported backend language: {other}")),
+    };
+
+    let Err(error) = result else {
+        return Ok(Vec::new());
+    };
+
+    let backend_diagnostics = if error.diagnostics.is_empty() {
+        vec![Diagnostic::error(
+            format!("{language}.parse"),
+            error.message,
+            None,
+        )]
+    } else {
+        error.diagnostics
+    };
+
+    let mut diagnostics = backend_diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            let display_language = if language == "yml" { "yaml" } else { language };
+            let location = diagnostic.span.as_ref().map_or_else(
+                || template.location.clone(),
+                |span| template.backend_span_to_location(span),
+            );
+
+            LintDiagnostic {
+                rule: RULE_EMBEDDED_PARSE_ERROR.to_string(),
+                severity: LintSeverity::Error,
+                language: Some(display_language.to_string()),
+                message: diagnostic.message,
+                file: path.to_path_buf(),
+                start_line: location.start_line,
+                start_column: location.start_column,
+                end_line: location.end_line,
+                end_column: location.end_column,
+            }
+        })
+        .collect::<Vec<_>>();
 
     sort_and_dedup_diagnostics(&mut diagnostics);
     Ok(diagnostics)

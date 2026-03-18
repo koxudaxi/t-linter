@@ -35,3 +35,7 @@ tower-lsp = "0.20"
 clap = { version = "4.6.0", features = ["derive"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+tstring-json = "0.1.1"
+tstring-toml = "0.1.1"
+tstring-yaml = "0.1.1"
+tstring-syntax = "0.1.1"

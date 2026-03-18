@@ -1,8 +1,13 @@
 use anyhow::Result;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
-use t_linter_core::{TemplateHighlighter, TemplateStringInfo, TemplateStringParser};
+use std::time::Duration;
+use t_linter_core::{
+    LintDiagnostic, TemplateHighlighter, TemplateStringInfo, TemplateStringParser, format_document,
+    format_document_range, lint_source,
+};
 use tower_lsp::jsonrpc::Result as JsonRpcResult;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -10,10 +15,12 @@ use tracing::{debug, info};
 
 const TOKEN_TYPE_MACRO: u32 = 14;
 const TOKEN_MODIFIER_NONE: u32 = 0;
+const DIAGNOSTIC_DEBOUNCE_MS: u64 = 250;
 
 pub struct TLinterLanguageServer {
     client: Client,
     document_cache: Arc<DashMap<Url, String>>,
+    diagnostic_tasks: Arc<DashMap<Url, tokio::task::JoinHandle<()>>>,
     parser: Arc<tokio::sync::Mutex<TemplateStringParser>>,
     highlighter: Arc<tokio::sync::Mutex<TemplateHighlighter>>,
 }
@@ -23,6 +30,7 @@ impl TLinterLanguageServer {
         Ok(Self {
             client,
             document_cache: Arc::new(DashMap::new()),
+            diagnostic_tasks: Arc::new(DashMap::new()),
             parser: Arc::new(tokio::sync::Mutex::new(TemplateStringParser::new()?)),
             highlighter: Arc::new(tokio::sync::Mutex::new(TemplateHighlighter::new()?)),
         })
@@ -138,6 +146,8 @@ impl LanguageServer for TLinterLanguageServer {
                         },
                     ),
                 ),
+                document_formatting_provider: Some(OneOf::Left(true)),
+                document_range_formatting_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -158,12 +168,7 @@ impl LanguageServer for TLinterLanguageServer {
         let text = params.text_document.text;
 
         self.document_cache.insert(uri.clone(), text);
-
-        if let Err(e) = self.analyze_document(&uri).await {
-            self.client
-                .log_message(MessageType::ERROR, format!("Analysis failed: {}", e))
-                .await;
-        }
+        self.schedule_diagnostics(uri);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -171,12 +176,7 @@ impl LanguageServer for TLinterLanguageServer {
 
         if let Some(change) = params.content_changes.into_iter().next() {
             self.document_cache.insert(uri.clone(), change.text);
-
-            if let Err(e) = self.analyze_document(&uri).await {
-                self.client
-                    .log_message(MessageType::ERROR, format!("Analysis failed: {}", e))
-                    .await;
-            }
+            self.schedule_diagnostics(uri);
         }
     }
 
@@ -185,6 +185,12 @@ impl LanguageServer for TLinterLanguageServer {
     }
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.document_cache.remove(&params.text_document.uri);
+        if let Some((_, handle)) = self.diagnostic_tasks.remove(&params.text_document.uri) {
+            handle.abort();
+        }
+        self.client
+            .publish_diagnostics(params.text_document.uri, Vec::new(), None)
+            .await;
     }
 
     async fn semantic_tokens_full(
@@ -205,6 +211,24 @@ impl LanguageServer for TLinterLanguageServer {
                 Ok(None)
             }
         }
+    }
+
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> JsonRpcResult<Option<Vec<TextEdit>>> {
+        self.format_uri(&params.text_document.uri, None)
+            .await
+            .map(Some)
+    }
+
+    async fn range_formatting(
+        &self,
+        params: DocumentRangeFormattingParams,
+    ) -> JsonRpcResult<Option<Vec<TextEdit>>> {
+        self.format_uri(&params.text_document.uri, Some(params.range))
+            .await
+            .map(Some)
     }
 }
 
@@ -269,24 +293,84 @@ impl TLinterLanguageServer {
         info!("=== END POSITION DEBUG ===\n");
         Ok(())
     }
-    async fn analyze_document(&self, uri: &Url) -> Result<()> {
+    fn schedule_diagnostics(&self, uri: Url) {
+        if let Some((_, handle)) = self.diagnostic_tasks.remove(&uri) {
+            handle.abort();
+        }
+
+        let client = self.client.clone();
+        let document_cache = Arc::clone(&self.document_cache);
+        let diagnostic_tasks = Arc::clone(&self.diagnostic_tasks);
+        let task_uri = uri.clone();
+
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(DIAGNOSTIC_DEBOUNCE_MS)).await;
+
+            let Some(text) = document_cache.get(&task_uri).map(|entry| entry.clone()) else {
+                diagnostic_tasks.remove(&task_uri);
+                return;
+            };
+
+            let Some(path) = uri_to_path(&task_uri) else {
+                client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Unable to resolve filesystem path for {}", task_uri),
+                    )
+                    .await;
+                diagnostic_tasks.remove(&task_uri);
+                return;
+            };
+
+            let diagnostics = match lint_source(&path, &text) {
+                Ok(result) => result
+                    .diagnostics
+                    .iter()
+                    .map(lint_diagnostic_to_lsp)
+                    .collect::<Vec<_>>(),
+                Err(err) => {
+                    client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("Diagnostic analysis failed for {}: {}", task_uri, err),
+                        )
+                        .await;
+                    diagnostic_tasks.remove(&task_uri);
+                    return;
+                }
+            };
+
+            client
+                .publish_diagnostics(task_uri.clone(), diagnostics, None)
+                .await;
+            diagnostic_tasks.remove(&task_uri);
+        });
+
+        self.diagnostic_tasks.insert(uri, handle);
+    }
+
+    async fn format_uri(&self, uri: &Url, range: Option<Range>) -> JsonRpcResult<Vec<TextEdit>> {
         let text = self
             .document_cache
             .get(uri)
-            .ok_or_else(|| anyhow::anyhow!("Document not found in cache"))?
+            .ok_or_else(|| tower_lsp::jsonrpc::Error::invalid_params("Document not found"))?
             .clone();
 
-        let mut parser = self.parser.lock().await;
-        let templates = parser.find_template_strings(&text)?;
+        let edits = match range {
+            Some(range) => {
+                let location = lsp_range_to_location(&range);
+                format_document_range(&text, &location).map_err(internal_error)?
+            }
+            None => format_document(&text).map_err(internal_error)?,
+        };
 
-        self.client
-            .log_message(
-                MessageType::INFO,
-                format!("Found {} template strings in {}", templates.len(), uri),
-            )
-            .await;
-
-        Ok(())
+        Ok(edits
+            .into_iter()
+            .map(|edit| TextEdit {
+                range: location_to_lsp_range(&edit.location),
+                new_text: edit.replacement,
+            })
+            .collect())
     }
 
     fn generate_basic_template_tokens(
@@ -435,6 +519,60 @@ impl TLinterLanguageServer {
         }
 
         semantic_tokens
+    }
+}
+
+fn lint_diagnostic_to_lsp(diagnostic: &LintDiagnostic) -> Diagnostic {
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line: diagnostic.start_line.saturating_sub(1) as u32,
+                character: diagnostic.start_column.saturating_sub(1) as u32,
+            },
+            end: Position {
+                line: diagnostic.end_line.saturating_sub(1) as u32,
+                character: diagnostic.end_column.saturating_sub(1) as u32,
+            },
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String(diagnostic.rule.clone())),
+        source: Some("t-linter".to_string()),
+        message: diagnostic.message.clone(),
+        ..Default::default()
+    }
+}
+
+fn location_to_lsp_range(location: &t_linter_core::Location) -> Range {
+    Range {
+        start: Position {
+            line: location.start_line.saturating_sub(1) as u32,
+            character: location.start_column.saturating_sub(1) as u32,
+        },
+        end: Position {
+            line: location.end_line.saturating_sub(1) as u32,
+            character: location.end_column.saturating_sub(1) as u32,
+        },
+    }
+}
+
+fn lsp_range_to_location(range: &Range) -> t_linter_core::Location {
+    t_linter_core::Location {
+        start_line: range.start.line as usize + 1,
+        start_column: range.start.character as usize + 1,
+        end_line: range.end.line as usize + 1,
+        end_column: range.end.character as usize + 1,
+    }
+}
+
+fn uri_to_path(uri: &Url) -> Option<PathBuf> {
+    uri.to_file_path().ok()
+}
+
+fn internal_error(err: anyhow::Error) -> tower_lsp::jsonrpc::Error {
+    tower_lsp::jsonrpc::Error {
+        code: tower_lsp::jsonrpc::ErrorCode::InternalError,
+        message: err.to_string().into(),
+        data: None,
     }
 }
 
