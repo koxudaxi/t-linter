@@ -79,7 +79,7 @@
         "t-linter.serverPath": {
           "type": "string",
           "default": "",
-          "description": "Path to t-linter executable. Run 'cargo install t-linter' to install."
+          "description": "Path to t-linter executable. Run 'pip install t-linter' to install."
         },
         "t-linter.highlightUntyped": {
           "type": "boolean",
