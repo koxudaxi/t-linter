@@ -49,11 +49,11 @@ jobs:
           PY
           )
 
-          LATEST_TAG_RAW=$(gh release list --limit 100 --exclude-drafts --json tagName --jq '[.[] | select((.tagName | startswith("vscode-v")) | not)] | .[0].tagName // "v0.0.0"')
+          LATEST_TAG_RAW=$(gh release list --limit 100 --exclude-drafts --json tagName --jq '.[0].tagName // "v0.0.0"')
           LATEST_TAG="${LATEST_TAG_RAW#v}"
           LATEST_TAG="${LATEST_TAG#V}"
 
-          DRAFT_TAG_RAW=$(gh release list --limit 100 --json tagName,isDraft --jq '[.[] | select(.isDraft == true and ((.tagName | startswith("vscode-v")) | not))] | .[0].tagName // ""')
+          DRAFT_TAG_RAW=$(gh release list --limit 100 --json tagName,isDraft --jq '[.[] | select(.isDraft == true)] | .[0].tagName // ""')
           DRAFT_TAG="${DRAFT_TAG_RAW#v}"
           DRAFT_TAG="${DRAFT_TAG#V}"
           export PROJECT_VERSION LATEST_TAG DRAFT_TAG HAS_BREAKING_CHANGE

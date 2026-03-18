@@ -20,16 +20,10 @@ jobs:
         shell: bash
         run: |
           TAG="${{ github.event.release.tag_name }}"
-          if [[ "$TAG" == vscode-v* ]]; then
-            VERSION="${TAG#vscode-v}"
-            python3 scripts/set_release_versions.py --vscode-version "$VERSION"
-          else
-            VERSION="${TAG#v}"
-            python3 scripts/set_release_versions.py --python-version "$VERSION"
-          fi
+          VERSION="${TAG#v}"
+          python3 scripts/set_release_versions.py --python-version "$VERSION" --vscode-version "$VERSION"
 
       - name: Get release info and update CHANGELOG
-        if: ${{ !startsWith(github.event.release.tag_name, 'vscode-v') }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

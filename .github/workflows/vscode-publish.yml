@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   publish:
-    if: ${{ startsWith(github.event.release.tag_name, 'vscode-v') }}
+    if: ${{ startsWith(github.event.release.tag_name, 'v') }}
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
@@ -28,7 +28,7 @@ jobs:
       shell: bash
       run: |
         VERSION="${{ github.event.release.tag_name }}"
-        VERSION="${VERSION#vscode-v}"
+        VERSION="${VERSION#v}"
         python3 scripts/set_release_versions.py --vscode-version "$VERSION"
     
     - name: Install dependencies
