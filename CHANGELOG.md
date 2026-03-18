@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 This changelog is automatically generated from GitHub Releases.
 
 ---
+## [0.2.1](https://github.com/koxudaxi/t-linter/releases/tag/0.2.1) - 2026-03-18
+
+## What's Changed
+* Fix serverPath description: cargo -> pip by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/16
+* Fix --version to use Cargo.toml version instead of hardcoded 0.1.0 by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/17
+* Add CLI format subcommand by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/18
+* Use structured-data backend updates for YAML validation by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/19
+
+
+**Full Changelog**: https://github.com/koxudaxi/t-linter/compare/0.2.0...0.2.1
+
+---
+
 ## [0.2.0](https://github.com/koxudaxi/t-linter/releases/tag/0.2.0) - 2026-03-18
 
 ## What's Changed
