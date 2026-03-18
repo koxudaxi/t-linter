@@ -508,25 +508,94 @@ impl TemplateHighlighter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{Location, TemplateStringFlags};
+    use crate::parser::{
+        Expression, InterpolationInfo, Location, StaticTextSegment, TemplatePart,
+        TemplateStringFlags, TemplateStringInfo,
+    };
+
+    fn make_template(
+        content: &str,
+        raw_content: &str,
+        language: &str,
+        location: Location,
+        expressions: Vec<Expression>,
+        flags: TemplateStringFlags,
+    ) -> TemplateStringInfo {
+        let mut parts = Vec::new();
+        let mut search_start = 0;
+        let mut interpolation_index = 0;
+
+        while let Some(pos) = content[search_start..].find("{}") {
+            let absolute_pos = search_start + pos;
+            let before = &content[search_start..absolute_pos];
+            if !before.is_empty() {
+                parts.push(TemplatePart::Static(StaticTextSegment {
+                    text: before.to_string(),
+                }));
+            }
+            let expression = expressions
+                .get(interpolation_index)
+                .map(|expr| expr.content.clone())
+                .unwrap_or_else(|| format!("slot_{interpolation_index}"));
+            parts.push(TemplatePart::Interpolation(InterpolationInfo {
+                expression: expression.clone(),
+                conversion: None,
+                format_spec: String::new(),
+                raw_source: format!("{{{expression}}}"),
+                location: expressions
+                    .get(interpolation_index)
+                    .map(|expr| expr.location.clone())
+                    .unwrap_or_else(|| location.clone()),
+                interpolation_index,
+            }));
+            interpolation_index += 1;
+            search_start = absolute_pos + 2;
+        }
+
+        if search_start < content.len() {
+            parts.push(TemplatePart::Static(StaticTextSegment {
+                text: content[search_start..].to_string(),
+            }));
+        }
+        if parts.is_empty() {
+            parts.push(TemplatePart::Static(StaticTextSegment {
+                text: String::new(),
+            }));
+        }
+
+        let string_start = if flags.is_triple { "t\"\"\"" } else { "t\"" }.to_string();
+        let string_end = if flags.is_triple { "\"\"\"" } else { "\"" }.to_string();
+
+        TemplateStringInfo {
+            content: content.to_string(),
+            raw_content: raw_content.to_string(),
+            variable_name: Some(language.to_string()),
+            function_name: None,
+            language: Some(language.to_string()),
+            string_start,
+            string_end,
+            location,
+            expressions,
+            parts,
+            flags,
+        }
+    }
 
     #[test]
     fn test_html_highlighting() {
         let mut highlighter = TemplateHighlighter::new().unwrap();
 
-        let template = TemplateStringInfo {
-            content: "<div class=\"test\">{}</div>".to_string(),
-            raw_content: r#"t"<div class=\"test\">{value}</div>""#.to_string(),
-            variable_name: Some("html".to_string()),
-            function_name: None,
-            language: Some("html".to_string()),
-            location: Location {
+        let template = make_template(
+            "<div class=\"test\">{}</div>",
+            r#"t"<div class=\"test\">{value}</div>""#,
+            "html",
+            Location {
                 start_line: 1,
                 start_column: 1,
                 end_line: 1,
                 end_column: 40,
             },
-            expressions: vec![Expression {
+            vec![Expression {
                 content: "value".to_string(),
                 location: Location {
                     start_line: 1,
@@ -535,8 +604,8 @@ mod tests {
                     end_column: 25,
                 },
             }],
-            flags: TemplateStringFlags::default(),
-        };
+            TemplateStringFlags::default(),
+        );
 
         let ranges = highlighter.highlight_template(&template).unwrap();
 
@@ -556,23 +625,20 @@ mod tests {
         let mut flags = TemplateStringFlags::default();
         flags.is_triple = true;
 
-        let template = TemplateStringInfo {
-            content: "<div>\n  <span>{}</span>\n  {}\n</div>".to_string(),
-            raw_content: r#"t"""<div>
+        let template = make_template(
+            "<div>\n  <span>{}</span>\n  {}\n</div>",
+            r#"t"""<div>
   <span>{name}</span>
   {123}
-</div>""""#
-                .to_string(),
-            variable_name: Some("html".to_string()),
-            function_name: None,
-            language: Some("html".to_string()),
-            location: Location {
+</div>""""#,
+            "html",
+            Location {
                 start_line: 1,
                 start_column: 1,
                 end_line: 4,
                 end_column: 10,
             },
-            expressions: vec![
+            vec![
                 Expression {
                     content: "name".to_string(),
                     location: Location {
@@ -593,7 +659,7 @@ mod tests {
                 },
             ],
             flags,
-        };
+        );
 
         let ranges = highlighter.highlight_template(&template).unwrap();
 
@@ -617,21 +683,17 @@ mod tests {
     fn test_json_highlighting() {
         let mut highlighter = TemplateHighlighter::new().unwrap();
 
-        let template = TemplateStringInfo {
-            content: r#"{"name": "codex", "count": 3, "value": {}, "enabled": true}"#.to_string(),
-            raw_content:
-                r#"t"{\"name\": \"codex\", \"count\": 3, \"value\": {value}, \"enabled\": true}""#
-                    .to_string(),
-            variable_name: Some("payload".to_string()),
-            function_name: None,
-            language: Some("json".to_string()),
-            location: Location {
+        let template = make_template(
+            r#"{"name": "codex", "count": 3, "value": {}, "enabled": true}"#,
+            r#"t"{\"name\": \"codex\", \"count\": 3, \"value\": {value}, \"enabled\": true}""#,
+            "json",
+            Location {
                 start_line: 1,
                 start_column: 1,
                 end_line: 1,
                 end_column: 52,
             },
-            expressions: vec![Expression {
+            vec![Expression {
                 content: "value".to_string(),
                 location: Location {
                     start_line: 1,
@@ -640,8 +702,8 @@ mod tests {
                     end_column: 35,
                 },
             }],
-            flags: TemplateStringFlags::default(),
-        };
+            TemplateStringFlags::default(),
+        );
 
         let ranges = highlighter.highlight_template(&template).unwrap();
 
@@ -663,19 +725,17 @@ mod tests {
     fn test_yaml_highlighting_with_yml_alias() {
         let mut highlighter = TemplateHighlighter::new().unwrap();
 
-        let template = TemplateStringInfo {
-            content: "name: codex\nenabled: true\nvalue: {}\n".to_string(),
-            raw_content: "t\"name: codex\\nenabled: true\\nvalue: {value}\\n\"".to_string(),
-            variable_name: Some("config".to_string()),
-            function_name: None,
-            language: Some("yml".to_string()),
-            location: Location {
+        let template = make_template(
+            "name: codex\nenabled: true\nvalue: {}\n",
+            "t\"name: codex\\nenabled: true\\nvalue: {value}\\n\"",
+            "yml",
+            Location {
                 start_line: 1,
                 start_column: 1,
                 end_line: 3,
                 end_column: 10,
             },
-            expressions: vec![Expression {
+            vec![Expression {
                 content: "value".to_string(),
                 location: Location {
                     start_line: 3,
@@ -684,8 +744,8 @@ mod tests {
                     end_column: 13,
                 },
             }],
-            flags: TemplateStringFlags::default(),
-        };
+            TemplateStringFlags::default(),
+        );
 
         let ranges = highlighter.highlight_template(&template).unwrap();
 
@@ -702,20 +762,17 @@ mod tests {
     fn test_toml_highlighting() {
         let mut highlighter = TemplateHighlighter::new().unwrap();
 
-        let template = TemplateStringInfo {
-            content: "title = \"T-Linter\"\nenabled = true\nvalue = {}\n".to_string(),
-            raw_content: "t\"title = \\\"T-Linter\\\"\\nenabled = true\\nvalue = {value}\\n\""
-                .to_string(),
-            variable_name: Some("config".to_string()),
-            function_name: None,
-            language: Some("toml".to_string()),
-            location: Location {
+        let template = make_template(
+            "title = \"T-Linter\"\nenabled = true\nvalue = {}\n",
+            "t\"title = \\\"T-Linter\\\"\\nenabled = true\\nvalue = {value}\\n\"",
+            "toml",
+            Location {
                 start_line: 1,
                 start_column: 1,
                 end_line: 3,
                 end_column: 11,
             },
-            expressions: vec![Expression {
+            vec![Expression {
                 content: "value".to_string(),
                 location: Location {
                     start_line: 3,
@@ -724,8 +781,8 @@ mod tests {
                     end_column: 14,
                 },
             }],
-            flags: TemplateStringFlags::default(),
-        };
+            TemplateStringFlags::default(),
+        );
 
         let ranges = highlighter.highlight_template(&template).unwrap();
 

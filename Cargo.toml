@@ -35,3 +35,7 @@ tower-lsp = "0.20"
 clap = { version = "4.6.0", features = ["derive"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+tstring-json = { path = "../tstring-structured-data/rust/json-tstring-rs" }
+tstring-toml = { path = "../tstring-structured-data/rust/toml-tstring-rs" }
+tstring-yaml = { path = "../tstring-structured-data/rust/yaml-tstring-rs" }
+tstring-syntax = { path = "../tstring-structured-data/rust/tstring-core-rs" }

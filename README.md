@@ -22,6 +22,12 @@ t-linter provides intelligent syntax highlighting and linting for Python templat
 - 🚀 **Fast** - Built with Rust and Tree-sitter for optimal performance
 - 🔧 **Extensible** - Support for HTML, SQL, JavaScript, CSS, JSON, YAML, TOML, and more
 
+For JSON, YAML, and TOML, `t-linter` now splits responsibilities:
+
+- `semanticTokens`: Tree-sitter only, for low-latency highlighting
+- `check`: strict parsing through the `tstring-json`, `tstring-yaml`, and `tstring-toml` backends
+- `formatting`: canonical formatting through the same Rust backends
+
 ## Installation
 
 ### Option 1: VSCode Extension (Recommended for VSCode users)
@@ -138,6 +144,11 @@ If you installed via PyPI, you can use t-linter from the command line:
 ```bash
 t-linter lsp
 ```
+
+In the LSP, diagnostics are debounced and published from the structured-data
+backend for JSON/YAML/TOML templates. Formatting requests rewrite the whole
+template literal using the backend formatter while keeping interpolation source
+such as `{name!r:>5}` intact.
 
 **Check files for issues**:
 ```bash

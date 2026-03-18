@@ -19,6 +19,10 @@ tree-sitter-yaml = "0.7.2"
 tree-sitter-toml-ng = "0.7.0"
 tracing.workspace = true
 regex = "1.12.3"
+tstring-json.workspace = true
+tstring-toml.workspace = true
+tstring-yaml.workspace = true
+tstring-syntax.workspace = true
 
 [features]
 default = ["sql"]
