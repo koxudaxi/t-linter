@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   build-wheels:
-    if: ${{ startsWith(github.event.release.tag_name, 'v') }}
+
     name: Build wheels
     strategy:
       matrix:
@@ -86,7 +86,7 @@ jobs:
           path: dist/*
 
   build-sdist:
-    if: ${{ startsWith(github.event.release.tag_name, 'v') }}
+
     name: Build source distribution
     runs-on: ubuntu-latest
     steps:
@@ -121,7 +121,7 @@ jobs:
           path: dist/*
 
   publish:
-    if: ${{ startsWith(github.event.release.tag_name, 'v') }}
+
     name: Publish to PyPI
     runs-on: ubuntu-latest
     needs:
