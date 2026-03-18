@@ -6,6 +6,18 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 [![VSCode Marketplace](https://img.shields.io/visual-studio-marketplace/v/koxudaxi.t-linter.svg)](https://marketplace.visualstudio.com/items?itemName=koxudaxi.t-linter)
 [![PyPI](https://img.shields.io/pypi/v/t-linter.svg)](https://pypi.org/project/t-linter/)
 
+## 📖 Documentation
+
+**👉 [t-linter.koxudaxi.dev](https://t-linter.koxudaxi.dev)**
+
+- 📦 [Installation](https://t-linter.koxudaxi.dev/installation/) - VSCode Extension, PyPI, Build from source
+- 🎨 [VSCode Extension](https://t-linter.koxudaxi.dev/usage/vscode/) - Editor integration & setup
+- 🔍 [Check Command](https://t-linter.koxudaxi.dev/usage/cli/check/) - CLI validation & output formats
+- ⚙️ [Configuration](https://t-linter.koxudaxi.dev/usage/configuration/) - pyproject.toml & ignore files
+- 🌐 [Supported Languages](https://t-linter.koxudaxi.dev/supported-languages/) - HTML, SQL, JS, CSS, JSON, YAML, TOML
+
+---
+
 ## Overview
 
 t-linter provides intelligent syntax highlighting and linting for Python template strings (PEP 750) through multiple distribution channels:
