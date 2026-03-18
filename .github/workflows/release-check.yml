@@ -1,0 +1,108 @@
+name: Release Check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: release-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-package-distributions:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.14"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.94.0
+
+      - name: Build source distribution
+        run: uvx maturin sdist --out dist
+
+      - name: Check distribution metadata
+        run: uvx twine check dist/*
+
+  verify-wheels:
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            maturin_args: --release --out dist --compatibility pypi -i python3.14
+          - os: macos
+            runner: macos-14
+            target: aarch64-apple-darwin
+            maturin_args: --release --out dist --compatibility pypi
+          - os: windows
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            maturin_args: --release --out dist --compatibility pypi
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.14"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build wheel (Linux manylinux)
+        if: ${{ matrix.os == 'linux' }}
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: ${{ matrix.maturin_args }}
+          manylinux: "2_28"
+          sccache: "true"
+
+      - name: Build wheel (host)
+        if: ${{ matrix.os != 'linux' }}
+        shell: bash
+        run: |
+          PYTHON_BIN="$(uv run --python 3.14 python - <<'PY'
+          import sys
+          print(sys.executable)
+          PY
+          )"
+          uvx maturin build --target "${{ matrix.target }}" ${{ matrix.maturin_args }} -i "$PYTHON_BIN"
+
+      - name: Check distribution metadata
+        shell: bash
+        run: uvx twine check dist/*
+
+      - name: Smoke test installed wheel
+        shell: bash
+        run: |
+          uv venv --python 3.14 .smoke-venv
+          if [ -x .smoke-venv/bin/python ]; then
+            PYTHON_BIN=.smoke-venv/bin/python
+            T_LINTER_BIN=.smoke-venv/bin/t-linter
+          else
+            PYTHON_BIN=.smoke-venv/Scripts/python.exe
+            T_LINTER_BIN=.smoke-venv/Scripts/t-linter.exe
+          fi
+          uv pip install --python "$PYTHON_BIN" --force-reinstall dist/*.whl
+          "$T_LINTER_BIN" --version

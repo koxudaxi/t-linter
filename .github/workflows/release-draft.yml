@@ -1,0 +1,133 @@
+name: Release Draft
+
+on:
+  pull_request_target:
+    types:
+      - closed
+    branches:
+      - main
+
+concurrency:
+  group: release-draft
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-draft:
+    if: ${{ github.event.pull_request.merged == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Ensure breaking-change label exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create "breaking-change" --color "D93F0B" --description "PR contains breaking changes" 2>/dev/null || true
+
+      - name: Calculate next version and update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HAS_BREAKING_CHANGE: ${{ contains(github.event.pull_request.labels.*.name, 'breaking-change') }}
+        run: |
+          set -euo pipefail
+
+          PROJECT_VERSION=$(python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          with Path("pyproject.toml").open("rb") as f:
+              data = tomllib.load(f)
+
+          print(data["project"]["version"])
+          PY
+          )
+
+          LATEST_TAG_RAW=$(gh release list --limit 100 --exclude-drafts --json tagName --jq '[.[] | select((.tagName | startswith("vscode-v")) | not)] | .[0].tagName // "v0.0.0"')
+          LATEST_TAG="${LATEST_TAG_RAW#v}"
+          LATEST_TAG="${LATEST_TAG#V}"
+
+          DRAFT_TAG_RAW=$(gh release list --limit 100 --json tagName,isDraft --jq '[.[] | select(.isDraft == true and ((.tagName | startswith("vscode-v")) | not))] | .[0].tagName // ""')
+          DRAFT_TAG="${DRAFT_TAG_RAW#v}"
+          DRAFT_TAG="${DRAFT_TAG#V}"
+          export PROJECT_VERSION LATEST_TAG DRAFT_TAG HAS_BREAKING_CHANGE
+
+          NEXT_VERSION=$(python3 - <<'PY'
+          import os
+
+          def parse_version(value: str) -> tuple[int, int, int]:
+              try:
+                  major, minor, patch = value.split(".", 2)
+                  return int(major), int(minor), int(patch)
+              except Exception:
+                  return (0, 0, 0)
+
+          project_version = os.environ["PROJECT_VERSION"]
+          latest_tag = os.environ["LATEST_TAG"]
+          draft_tag = os.environ["DRAFT_TAG"]
+          has_breaking_change = os.environ["HAS_BREAKING_CHANGE"] == "true"
+
+          if parse_version(latest_tag) == (0, 0, 0):
+              candidate = project_version
+          elif draft_tag:
+              candidate = draft_tag
+          else:
+              major, minor, patch = parse_version(latest_tag)
+              if has_breaking_change:
+                  candidate = f"{major}.{minor + 1}.0"
+              else:
+                  candidate = f"{major}.{minor}.{patch + 1}"
+
+          if parse_version(candidate) < parse_version(project_version):
+              candidate = project_version
+
+          print(candidate)
+          PY
+          )
+
+          NEXT_TAG="v$NEXT_VERSION"
+
+          if [ -n "$LATEST_TAG" ] && [ "$LATEST_TAG" != "0.0.0" ]; then
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              /repos/${{ github.repository }}/releases/generate-notes \
+              -f tag_name="$NEXT_TAG" \
+              -f previous_tag_name="$LATEST_TAG_RAW" \
+              --jq '.body' > generated_notes.md
+          else
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              /repos/${{ github.repository }}/releases/generate-notes \
+              -f tag_name="$NEXT_TAG" \
+              --jq '.body' > generated_notes.md
+          fi
+
+          if [ "$HAS_BREAKING_CHANGE" = "true" ]; then
+            python3 scripts/compose_release_notes.py \
+              --generated-notes-file generated_notes.md \
+              --breaking-pr-number "${{ github.event.pull_request.number }}" > release_body.md
+          else
+            python3 scripts/compose_release_notes.py \
+              --generated-notes-file generated_notes.md > release_body.md
+          fi
+
+          python3 scripts/validate_release_notes.py release_body.md
+
+          if [ -n "$DRAFT_TAG_RAW" ]; then
+            gh release edit "$DRAFT_TAG_RAW" \
+              --title "$NEXT_VERSION" \
+              --notes-file release_body.md
+          else
+            gh release create "$NEXT_TAG" \
+              --title "$NEXT_VERSION" \
+              --notes-file release_body.md \
+              --draft
+          fi
