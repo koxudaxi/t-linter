@@ -6,7 +6,7 @@ static INIT: Once = Once::new();
 #[derive(Parser)]
 #[command(name = "t-linter")]
 #[command(author = "Koudai Aono <koxudaxi@gmail.com>")]
-#[command(version = "0.1.0")]
+#[command(version)]
 #[command(about = "Python template string linter for PEP 750", long_about = None)]
 struct Cli {
     #[command(subcommand)]
