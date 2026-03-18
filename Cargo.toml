@@ -35,7 +35,7 @@ tower-lsp = "0.20"
 clap = { version = "4.6.0", features = ["derive"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
-tstring-json = { git = "https://github.com/koxudaxi/tstring-structured-data.git", rev = "07071163c8cb79fbc862f229a4825481fa6de5b1" }
-tstring-toml = { git = "https://github.com/koxudaxi/tstring-structured-data.git", rev = "07071163c8cb79fbc862f229a4825481fa6de5b1" }
-tstring-yaml = { git = "https://github.com/koxudaxi/tstring-structured-data.git", rev = "07071163c8cb79fbc862f229a4825481fa6de5b1" }
-tstring-syntax = { git = "https://github.com/koxudaxi/tstring-structured-data.git", rev = "07071163c8cb79fbc862f229a4825481fa6de5b1" }
+tstring-json = { git = "https://github.com/koxudaxi/tstring-structured-data.git", rev = "5e61cb52f7b841fef40317667974442623fb7b54" }
+tstring-toml = { git = "https://github.com/koxudaxi/tstring-structured-data.git", rev = "5e61cb52f7b841fef40317667974442623fb7b54" }
+tstring-yaml = { git = "https://github.com/koxudaxi/tstring-structured-data.git", rev = "5e61cb52f7b841fef40317667974442623fb7b54" }
+tstring-syntax = { git = "https://github.com/koxudaxi/tstring-structured-data.git", rev = "5e61cb52f7b841fef40317667974442623fb7b54" }
