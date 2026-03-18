@@ -15,6 +15,7 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 - 📦 [Installation](https://t-linter.koxudaxi.dev/installation/) - VSCode Extension, PyPI, Build from source
 - 🎨 [VSCode Extension](https://t-linter.koxudaxi.dev/usage/vscode/) - Editor integration & setup
 - 🔍 [Check Command](https://t-linter.koxudaxi.dev/usage/cli/check/) - CLI validation & output formats
+- 🧹 [Format Command](https://t-linter.koxudaxi.dev/usage/cli/format/) - Canonical formatting for supported templates
 - ⚙️ [Configuration](https://t-linter.koxudaxi.dev/usage/configuration/) - pyproject.toml & ignore files
 - 🌐 [Supported Languages](https://t-linter.koxudaxi.dev/supported-languages/) - HTML, SQL, JS, CSS, JSON, YAML, TOML
 
@@ -177,6 +178,21 @@ t-linter check file.py --error-on-issues  # Exit with error code if issues found
 ```
 
 `check` supports `human`, `json`, and `github` output formats.
+
+`check --format` controls report output formatting only. Use the `format`
+subcommand to rewrite supported template literals in place:
+
+```bash
+# Format Python files containing JSON/YAML/TOML templates
+t-linter format file.py
+t-linter format src/
+
+# Check whether formatting would change any files
+t-linter format --check file.py
+
+# Format stdin
+cat file.py | t-linter format --stdin-filename file.py -
+```
 
 Configuration can be provided via `pyproject.toml`:
 

@@ -42,6 +42,12 @@ Check your Python files for template string issues:
 t-linter check src/
 ```
 
+Or rewrite supported template literals in place:
+
+```bash
+t-linter format src/
+```
+
 Or start the LSP server for editor integration:
 
 ```bash
@@ -257,6 +263,9 @@ Source: https://t-linter.koxudaxi.dev/usage/cli/check/
 
 The `check` command validates Python template strings for syntax errors in embedded languages.
 
+`check --format` controls the report output format only. To rewrite supported
+JSON, YAML, and TOML template literals, use [`t-linter format`](./format.md).
+
 ## Basic Usage
 
 ```bash
@@ -376,6 +385,69 @@ t-linter will report the invalid JSON syntax:
 example.py:4:46: error[embedded-parse-error] Invalid json syntax in template string (language=json)
 1 files scanned, 1 templates scanned, 1 diagnostics, 0 failed files
 ```
+
+---
+
+# Format Command
+
+Source: https://t-linter.koxudaxi.dev/usage/cli/format/
+
+The `format` command rewrites supported Python template strings in place.
+
+Supported formatter backends:
+
+- JSON
+- YAML / YML
+- TOML
+
+Unsupported embedded languages are left unchanged.
+
+## Basic Usage
+
+```bash
+# Format a single file
+t-linter format file.py
+
+# Format a directory recursively
+t-linter format src/
+
+# Default target is the current directory
+t-linter format
+```
+
+## Check Mode
+
+Use `--check` to report files that would change without rewriting them:
+
+```bash
+t-linter format --check file.py
+```
+
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Formatting check succeeded with no changes needed |
+| `1` | `--check` found at least one file that would be reformatted |
+| `2` | Operational failure such as an unreadable file or invalid input |
+
+## Stdin
+
+Use `-` to read a Python document from stdin:
+
+```bash
+cat file.py | t-linter format -
+cat file.py | t-linter format --check --stdin-filename file.py -
+```
+
+`--stdin-filename` only affects display labels in v1. It does not change config
+resolution or formatter behavior.
+
+## Notes
+
+- `format` respects `pyproject.toml` excludes and `.t-linterignore`
+- explicit file operands must use the `.py` extension
+- formatting is atomic per file: on failure, the original file is left untouched
 
 ---
 

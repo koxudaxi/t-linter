@@ -40,6 +40,12 @@ Check your Python files for template string issues:
 t-linter check src/
 ```
 
+Or rewrite supported template literals in place:
+
+```bash
+t-linter format src/
+```
+
 Or start the LSP server for editor integration:
 
 ```bash

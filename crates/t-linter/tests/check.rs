@@ -3,15 +3,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::{self as unix_fs, PermissionsExt};
+
 fn test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "t-linter-{name}-{}-{nanos}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("t-linter-{name}-{}-{nanos}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -118,7 +118,13 @@ template: Annotated[Template, "toml"] = t"title ="
 
     let output = run_check(
         &dir,
-        &["check", "broken.py", "--format", "github", "--error-on-issues"],
+        &[
+            "check",
+            "broken.py",
+            "--format",
+            "github",
+            "--error-on-issues",
+        ],
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
@@ -212,6 +218,158 @@ template: Annotated[Template, "yaml"] = t"name: {value}"
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(json["summary"]["files_scanned"], 1);
     assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_uses_operand_root_config_outside_cwd() {
+    let dir = test_dir("operand-root");
+    let project = dir.join("project");
+    let runner = dir.join("runner");
+    fs::create_dir_all(&runner).unwrap();
+
+    write_file(
+        &project.join("pyproject.toml"),
+        r#"[tool.t-linter]
+extend-exclude = ["generated"]
+"#,
+    );
+    write_file(
+        &project.join("generated/broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "html"] = t"<div><"
+"#,
+    );
+
+    let output = run_check(
+        &runner,
+        &["check", project.to_str().unwrap(), "--format", "json"],
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["files_scanned"], 0);
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn check_follows_explicit_symlink_file_operands() {
+    let dir = test_dir("symlink-file");
+    let real = dir.join("real.py");
+    let link = dir.join("link.py");
+
+    write_file(
+        &real,
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "html"] = t"<div><"
+"#,
+    );
+    unix_fs::symlink(&real, &link).unwrap();
+
+    let output = run_check(&dir, &["check", "link.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["files_scanned"], 1);
+    assert_eq!(json["diagnostics"][0]["file"], "link.py");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn check_reports_descendants_under_symlink_directory_operand() {
+    let dir = test_dir("symlink-dir");
+    let real_dir = dir.join("real");
+    let link_dir = dir.join("linkdir");
+
+    write_file(
+        &real_dir.join("sub/broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "html"] = t"<div><"
+"#,
+    );
+    unix_fs::symlink(&real_dir, &link_dir).unwrap();
+
+    let output = run_check(&dir, &["check", "linkdir", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["files_scanned"], 1);
+    assert_eq!(json["diagnostics"][0]["file"], "linkdir/sub/broken.py");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn check_uses_first_explicit_operand_for_duplicate_targets() {
+    let dir = test_dir("duplicate-target");
+    let real = dir.join("real.py");
+    let link = dir.join("link.py");
+
+    write_file(
+        &real,
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "html"] = t"<div><"
+"#,
+    );
+    unix_fs::symlink(&real, &link).unwrap();
+
+    let output = run_check(&dir, &["check", "link.py", "real.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["files_scanned"], 1);
+    assert_eq!(json["diagnostics"][0]["file"], "link.py");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn check_reports_unreadable_nested_directory_with_nested_display_path() {
+    let dir = test_dir("nested-read-error");
+    let real_dir = dir.join("real");
+    let link_dir = dir.join("linkdir");
+    let unreadable = real_dir.join("sub");
+    fs::create_dir_all(&unreadable).unwrap();
+    write_file(
+        &real_dir.join("ok.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "yaml"] = t"name: {value}"
+"#,
+    );
+    unix_fs::symlink(&real_dir, &link_dir).unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = run_check(&dir, &["check", "linkdir", "--format", "json"]);
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(json["summary"]["failed_files"], 1);
+    assert_eq!(json["diagnostics"][0]["file"], "linkdir/sub");
 
     let _ = fs::remove_dir_all(dir);
 }

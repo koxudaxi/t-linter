@@ -5,7 +5,7 @@ pub mod highlighter;
 pub mod lint;
 pub mod parser;
 
-pub use formatting::{TemplateEdit, format_document, format_document_range};
+pub use formatting::{TemplateEdit, apply_template_edits, format_document, format_document_range};
 pub use highlighter::{HighlightedRange, TemplateHighlighter};
 pub use lint::{
     LintDiagnostic, LintFileResult, LintRunSummary, LintSeverity, file_read_error, lint_source,
