@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::{Location, TemplateStringInfo, TemplateStringParser};
 
@@ -16,6 +16,70 @@ pub fn format_document(source: &str) -> Result<Vec<TemplateEdit>> {
         .iter()
         .filter_map(format_template_edit)
         .collect::<Result<Vec<_>>>()
+}
+
+pub fn apply_template_edits(source: &str, edits: &[TemplateEdit]) -> Result<String> {
+    if edits.is_empty() {
+        return Ok(source.to_string());
+    }
+
+    let line_starts = line_start_offsets(source.as_bytes());
+    let mut byte_edits = edits
+        .iter()
+        .map(|edit| {
+            let start = location_to_byte_offset(
+                source,
+                &line_starts,
+                edit.location.start_line,
+                edit.location.start_column,
+            )
+            .with_context(|| "Failed to compute edit start offset")?;
+            let end = location_to_byte_offset(
+                source,
+                &line_starts,
+                edit.location.end_line,
+                edit.location.end_column,
+            )
+            .with_context(|| "Failed to compute edit end offset")?;
+
+            if end < start {
+                return Err(anyhow::anyhow!(
+                    "Edit end offset precedes start offset for {}:{}-{}:{}",
+                    edit.location.start_line,
+                    edit.location.start_column,
+                    edit.location.end_line,
+                    edit.location.end_column
+                ));
+            }
+
+            Ok((start, end, &edit.replacement))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    byte_edits.sort_by(|left, right| right.0.cmp(&left.0).then(right.1.cmp(&left.1)));
+
+    for window in byte_edits.windows(2) {
+        let previous = &window[0];
+        let current = &window[1];
+        // Formatter edits replace whole template literals, so overlap is unexpected.
+        // Keep the check anyway so a malformed edit list can't corrupt the buffer.
+        if current.1 > previous.0 {
+            return Err(anyhow::anyhow!(
+                "Overlapping template edits detected at byte ranges {}..{} and {}..{}",
+                current.0,
+                current.1,
+                previous.0,
+                previous.1
+            ));
+        }
+    }
+
+    let mut output = source.as_bytes().to_vec();
+    for (start, end, replacement) in byte_edits {
+        output.splice(start..end, replacement.as_bytes().iter().copied());
+    }
+
+    String::from_utf8(output).context("Formatted output is not valid UTF-8")
 }
 
 pub fn format_document_range(source: &str, range: &Location) -> Result<Vec<TemplateEdit>> {
@@ -71,6 +135,56 @@ fn ranges_overlap(left: &Location, right: &Location) -> bool {
     left_start <= right_end && right_start <= left_end
 }
 
+fn line_start_offsets(source: &[u8]) -> Vec<usize> {
+    let mut starts = vec![0];
+    let mut index = 0;
+
+    while index < source.len() {
+        match source[index] {
+            b'\n' => {
+                index += 1;
+                starts.push(index);
+            }
+            b'\r' => {
+                index += 1;
+                if index < source.len() && source[index] == b'\n' {
+                    index += 1;
+                }
+                starts.push(index);
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+
+    starts
+}
+
+fn location_to_byte_offset(
+    source: &str,
+    line_starts: &[usize],
+    line: usize,
+    column: usize,
+) -> Result<usize> {
+    if line == 0 || column == 0 {
+        return Err(anyhow::anyhow!("Locations must be 1-based"));
+    }
+
+    let Some(&line_start) = line_starts.get(line - 1) else {
+        return Err(anyhow::anyhow!("Line {line} is out of bounds"));
+    };
+
+    let offset = line_start + (column - 1);
+    if offset > source.len() {
+        return Err(anyhow::anyhow!(
+            "Column {column} on line {line} is out of bounds"
+        ));
+    }
+
+    Ok(offset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +229,26 @@ config: Annotated[Template, "json"] = t'{"name": {name}}'
 
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].replacement, "t'{\"name\": {name}}'");
+    }
+
+    #[test]
+    fn apply_template_edits_preserves_multibyte_prefix_and_crlf() {
+        let source = "title = \"こんにちは\"\r\npayload = t'{\"b\": 2, \"a\": 1}'\r\n";
+        let edits = vec![TemplateEdit {
+            location: Location {
+                start_line: 2,
+                start_column: 11,
+                end_line: 2,
+                end_column: 30,
+            },
+            replacement: "t'{\"a\": 1, \"b\": 2}'".to_string(),
+        }];
+
+        let output = apply_template_edits(source, &edits).expect("expected apply success");
+
+        assert_eq!(
+            output,
+            "title = \"こんにちは\"\r\npayload = t'{\"a\": 1, \"b\": 2}'\r\n"
+        );
     }
 }

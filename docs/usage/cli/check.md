@@ -2,6 +2,9 @@
 
 The `check` command validates Python template strings for syntax errors in embedded languages.
 
+`check --format` controls the report output format only. To rewrite supported
+JSON, YAML, and TOML template literals, use [`t-linter format`](./format.md).
+
 ## Basic Usage
 
 ```bash

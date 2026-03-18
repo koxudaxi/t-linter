@@ -11,5 +11,6 @@ clap.workspace = true
 ignore.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 toml.workspace = true
 t-linter-core = { path = "../t-linter-core" }

@@ -12,6 +12,7 @@ nav = [
     { "VSCode Extension" = "usage/vscode.md" },
     { "CLI" = [
       { "Check Command" = "usage/cli/check.md" },
+      { "Format Command" = "usage/cli/format.md" },
       { "LSP Server" = "usage/cli/lsp.md" },
     ]},
     { "Configuration" = "usage/configuration.md" },
