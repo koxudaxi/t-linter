@@ -1566,7 +1566,7 @@ dependencies = [
 [[package]]
 name = "tstring-json"
 version = "0.1.0"
-source = "git+https://github.com/koxudaxi/tstring-structured-data.git?rev=d1d027d#d1d027d9566aa6b81af2a1982fec9c0d42013772"
+source = "git+https://github.com/koxudaxi/tstring-structured-data.git?rev=7a033cb#7a033cbcede2c1b2d2d9fd1eacf77055ef220aa0"
 dependencies = [
  "serde_json",
  "tstring-syntax",
@@ -1575,7 +1575,7 @@ dependencies = [
 [[package]]
 name = "tstring-syntax"
 version = "0.1.0"
-source = "git+https://github.com/koxudaxi/tstring-structured-data.git?rev=d1d027d#d1d027d9566aa6b81af2a1982fec9c0d42013772"
+source = "git+https://github.com/koxudaxi/tstring-structured-data.git?rev=7a033cb#7a033cbcede2c1b2d2d9fd1eacf77055ef220aa0"
 dependencies = [
  "num-bigint",
 ]
@@ -1583,7 +1583,7 @@ dependencies = [
 [[package]]
 name = "tstring-toml"
 version = "0.1.0"
-source = "git+https://github.com/koxudaxi/tstring-structured-data.git?rev=d1d027d#d1d027d9566aa6b81af2a1982fec9c0d42013772"
+source = "git+https://github.com/koxudaxi/tstring-structured-data.git?rev=7a033cb#7a033cbcede2c1b2d2d9fd1eacf77055ef220aa0"
 dependencies = [
  "serde_json",
  "toml 0.9.12+spec-1.1.0",
@@ -1593,7 +1593,7 @@ dependencies = [
 [[package]]
 name = "tstring-yaml"
 version = "0.1.0"
-source = "git+https://github.com/koxudaxi/tstring-structured-data.git?rev=d1d027d#d1d027d9566aa6b81af2a1982fec9c0d42013772"
+source = "git+https://github.com/koxudaxi/tstring-structured-data.git?rev=7a033cb#7a033cbcede2c1b2d2d9fd1eacf77055ef220aa0"
 dependencies = [
  "saphyr",
  "saphyr-parser",
