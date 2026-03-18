@@ -34,6 +34,11 @@ Homepage = "https://github.com/koxudaxi/t-linter"
 Repository = "https://github.com/koxudaxi/t-linter"
 Issues = "https://github.com/koxudaxi/t-linter/issues"
 
+[dependency-groups]
+docs = [
+  "zensical>=0.0.15; python_version>='3.10'",
+]
+
 [tool.maturin]
 bindings = "bin"
 manifest-path = "crates/t-linter/Cargo.toml"

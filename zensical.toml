@@ -1,0 +1,87 @@
+[project]
+site_name = "t-linter"
+site_description = "Intelligent syntax highlighting and validation for Python template strings (PEP 750)"
+site_url = "https://t-linter.koxudaxi.dev"
+repo_name = "koxudaxi/t-linter"
+repo_url = "https://github.com/koxudaxi/t-linter"
+
+nav = [
+  { "Overview" = "index.md" },
+  { "Installation" = "installation.md" },
+  { "Usage" = [
+    { "VSCode Extension" = "usage/vscode.md" },
+    { "CLI" = [
+      { "Check Command" = "usage/cli/check.md" },
+      { "LSP Server" = "usage/cli/lsp.md" },
+    ]},
+    { "Configuration" = "usage/configuration.md" },
+  ]},
+  { "Supported Languages" = "supported-languages.md" },
+  { "Roadmap" = "roadmap.md" },
+  { "Changelog" = "changelog.md" },
+]
+
+[project.theme]
+custom_dir = "overrides"
+features = [
+  "content.code.copy",
+  "content.code.annotate",
+  "content.tabs.link",
+  "navigation.instant",
+  "navigation.tracking",
+  "navigation.sections",
+  "navigation.expand",
+  "search.highlight",
+  "search.share",
+  "toc.follow",
+  "announce.dismiss",
+]
+
+[project.theme.icon]
+annotation = "material/arrow-right-circle"
+
+[[project.theme.palette]]
+scheme = "slate"
+primary = "light blue"
+accent = "light blue"
+toggle.icon = "material/brightness-4"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+scheme = "default"
+primary = "light blue"
+accent = "light blue"
+toggle.icon = "material/brightness-7"
+toggle.name = "Switch to dark mode"
+
+[project.markdown_extensions.pymdownx.highlight]
+anchor_linenums = true
+line_spans = "__span"
+pygments_lang_class = true
+
+[project.markdown_extensions.pymdownx.inlinehilite]
+
+[project.markdown_extensions.pymdownx.snippets]
+base_path = "."
+
+[project.markdown_extensions.pymdownx.superfences]
+
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+
+[project.markdown_extensions.pymdownx.details]
+
+[project.markdown_extensions.pymdownx.emoji]
+emoji_index = "zensical.extensions.emoji.twemoji"
+emoji_generator = "zensical.extensions.emoji.to_svg"
+
+[project.markdown_extensions.admonition]
+
+[project.markdown_extensions.attr_list]
+
+[project.markdown_extensions.md_in_html]
+
+[project.markdown_extensions.toc]
+permalink = true
+
+[project.plugins.search]
