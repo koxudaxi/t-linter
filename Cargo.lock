@@ -1565,8 +1565,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-json"
-version = "0.1.0"
-source = "git+https://github.com/koxudaxi/tstring-structured-data.git?rev=7a033cb#7a033cbcede2c1b2d2d9fd1eacf77055ef220aa0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e89b2e027c7f15e1af77378f205d10a5c1c2b61721f629c79c367a89b2865a1"
 dependencies = [
  "serde_json",
  "tstring-syntax",
@@ -1574,16 +1575,18 @@ dependencies = [
 
 [[package]]
 name = "tstring-syntax"
-version = "0.1.0"
-source = "git+https://github.com/koxudaxi/tstring-structured-data.git?rev=7a033cb#7a033cbcede2c1b2d2d9fd1eacf77055ef220aa0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a66e49894f5898fe0c220f41a562b3f56e80555c4191a87e2c8d02989dc0a365"
 dependencies = [
  "num-bigint",
 ]
 
 [[package]]
 name = "tstring-toml"
-version = "0.1.0"
-source = "git+https://github.com/koxudaxi/tstring-structured-data.git?rev=7a033cb#7a033cbcede2c1b2d2d9fd1eacf77055ef220aa0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4644788a021d3586f1e0ec83a97a0a3658771be5a30f620f6c2121f7c33d6fb1"
 dependencies = [
  "serde_json",
  "toml 0.9.12+spec-1.1.0",
@@ -1592,8 +1595,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-yaml"
-version = "0.1.0"
-source = "git+https://github.com/koxudaxi/tstring-structured-data.git?rev=7a033cb#7a033cbcede2c1b2d2d9fd1eacf77055ef220aa0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0533e37227551d5777ac7c0483f4485a5939d419afb64058fd2c67c5077f68cf"
 dependencies = [
  "saphyr",
  "saphyr-parser",
