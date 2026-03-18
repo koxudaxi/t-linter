@@ -1,0 +1,20 @@
+# t-linter
+
+> Intelligent syntax highlighting and validation for Python template strings (PEP 750)
+
+- [t-linter](https://t-linter.koxudaxi.dev/): Intelligent syntax highlighting and validation for Python template strings ([PEP 750](https://peps.python.org/pep-0750/)).
+- [Installation](https://t-linter.koxudaxi.dev/installation/): t-linter can be installed in three ways depending on your use case.
+## Usage
+
+- [VSCode Extension](https://t-linter.koxudaxi.dev/usage/vscode/): After installing both the PyPI package and VSCode extension, t-linter will automatically provide syntax highlighting for Python template strings.
+### CLI
+
+- [Check Command](https://t-linter.koxudaxi.dev/usage/cli/check/): The `check` command validates Python template strings for syntax errors in embedded languages.
+- [LSP Server](https://t-linter.koxudaxi.dev/usage/cli/lsp/): t-linter includes a built-in Language Server Protocol (LSP) server for editor integration.
+
+- [Configuration](https://t-linter.koxudaxi.dev/usage/configuration/): t-linter can be configured via `pyproject.toml` and ignore files.
+
+- [Supported Languages](https://t-linter.koxudaxi.dev/supported-languages/): t-linter supports syntax highlighting and validation for the following embedded languages in Python template strings.
+## Optional
+
+- [Roadmap](https://t-linter.koxudaxi.dev/roadmap/)
