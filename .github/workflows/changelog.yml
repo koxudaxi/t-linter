@@ -1,0 +1,76 @@
+name: Update CHANGELOG
+
+on:
+  release:
+    types:
+      - published
+
+jobs:
+  sync-release-metadata:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          token: ${{ secrets.PAT }}
+
+      - name: Synchronize version files
+        shell: bash
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if [[ "$TAG" == vscode-v* ]]; then
+            VERSION="${TAG#vscode-v}"
+            python3 scripts/set_release_versions.py --vscode-version "$VERSION"
+          else
+            VERSION="${TAG#v}"
+            python3 scripts/set_release_versions.py --python-version "$VERSION"
+          fi
+
+      - name: Get release info and update CHANGELOG
+        if: ${{ !startsWith(github.event.release.tag_name, 'vscode-v') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          TAG="${{ github.event.release.tag_name }}"
+          DATE=$(gh release view "$TAG" --json publishedAt --jq '.publishedAt | split("T")[0]')
+          BODY=$(gh release view "$TAG" --json body --jq '.body // ""')
+          printf '%s\n' "$BODY" > release_body.md
+          python3 scripts/validate_release_notes.py release_body.md
+
+          {
+            echo "## [$TAG](https://github.com/${{ github.repository }}/releases/tag/$TAG) - $DATE"
+            echo ""
+            printf '%s\n' "$BODY"
+            echo ""
+            echo "---"
+            echo ""
+          } > new_entry.md
+
+          if [ ! -f CHANGELOG.md ]; then
+            {
+              echo "# Changelog"
+              echo ""
+              echo "All notable changes to this project are documented in this file."
+              echo "This changelog is automatically generated from GitHub Releases."
+              echo ""
+              echo "---"
+              echo ""
+            } > CHANGELOG.md
+          fi
+
+          awk '/^---$/ && !found {found=1; print > "header.md"; next} !found {print > "header.md"} found {print > "old_entries.md"}' CHANGELOG.md
+          touch old_entries.md
+          cat header.md new_entry.md old_entries.md > CHANGELOG.md
+          rm -f header.md new_entry.md old_entries.md release_body.md
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml Cargo.toml editors/vscode/package.json editors/vscode/package-lock.json CHANGELOG.md
+          git diff --cached --quiet || git commit -m "chore: sync release metadata for ${{ github.event.release.tag_name }}"
+          git push

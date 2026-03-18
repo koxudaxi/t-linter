@@ -1,23 +1,35 @@
 name: Publish VSCode Extension
 
 on:
-  push:
-    tags:
-      - 'vscode-v*'
+  release:
+    types:
+      - published
 
 permissions:
   contents: write
 
+concurrency:
+  group: publish-vscode-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
 jobs:
   publish:
+    if: ${{ startsWith(github.event.release.tag_name, 'vscode-v') }}
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
         node-version: '18'
+
+    - name: Synchronize release version
+      shell: bash
+      run: |
+        VERSION="${{ github.event.release.tag_name }}"
+        VERSION="${VERSION#vscode-v}"
+        python3 scripts/set_release_versions.py --vscode-version "$VERSION"
     
     - name: Install dependencies
       working-directory: editors/vscode
@@ -40,7 +52,7 @@ jobs:
       run: vsce publish
 
     - name: Upload to GitHub Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         files: editors/vscode/*.vsix
-        token: ${{ secrets.GITHUB_TOKEN }}
+        tag_name: ${{ github.event.release.tag_name }}

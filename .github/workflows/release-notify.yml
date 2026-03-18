@@ -1,0 +1,120 @@
+name: Release Notification
+
+on:
+  workflow_run:
+    workflows:
+      - Publish to PyPI
+      - Publish VSCode Extension
+    types:
+      - completed
+
+jobs:
+  notify:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Post release notifications
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            let tag = context.payload.workflow_run.head_branch;
+
+            if (!tag) {
+              const headSha = context.payload.workflow_run.head_sha;
+              for await (const response of github.paginate.iterator(
+                github.rest.repos.listTags,
+                { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
+              )) {
+                const matchingTag = response.data.find((entry) => entry.commit.sha === headSha);
+                if (matchingTag) {
+                  tag = matchingTag.name;
+                  break;
+                }
+              }
+            }
+
+            if (!tag) {
+              core.info("Could not determine release tag; skipping notification.");
+              return;
+            }
+
+            let release;
+            try {
+              const result = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag,
+              });
+              release = result.data;
+            } catch (error) {
+              core.info(`No published release found for ${tag}; skipping notification.`);
+              return;
+            }
+
+            const releaseBody = release.body || "";
+            const releaseUrl = release.html_url;
+            const version = release.tag_name;
+            const issueOrPrNumbers = new Set();
+
+            for (const match of releaseBody.matchAll(/(?:^|[\s({\[-])#(\d+)(?=[\s,.)\]}\]:;]|$)/gm)) {
+              issueOrPrNumbers.add(Number.parseInt(match[1], 10));
+            }
+
+            const prNumbers = [];
+            for (const number of issueOrPrNumbers) {
+              try {
+                await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: number,
+                });
+                prNumbers.push(number);
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+              }
+            }
+
+            async function ensureComment(issueNumber, marker, body) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                per_page: 100,
+              });
+              const exists = comments.some((comment) => comment.body && comment.body.includes(marker));
+              if (!exists) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  body,
+                });
+              }
+            }
+
+            const closingPattern = /(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s*:?\s*#(\d+)/gi;
+
+            for (const prNumber of prNumbers) {
+              const prComment = `Released in [${version}](${releaseUrl}).`;
+              await ensureComment(prNumber, `Released in [${version}]`, prComment);
+
+              const pr = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+
+              const prBody = pr.data.body || "";
+              for (const match of prBody.matchAll(closingPattern)) {
+                const issueNumber = Number.parseInt(match[1], 10);
+                const issueComment = `Resolved by PR #${prNumber} and released in [${version}](${releaseUrl}).`;
+                await ensureComment(issueNumber, `released in [${version}]`, issueComment);
+              }
+            }
