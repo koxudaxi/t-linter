@@ -6,6 +6,8 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 [![VSCode Marketplace](https://img.shields.io/visual-studio-marketplace/v/koxudaxi.t-linter.svg)](https://marketplace.visualstudio.com/items?itemName=koxudaxi.t-linter)
 [![PyPI](https://img.shields.io/pypi/v/t-linter.svg)](https://pypi.org/project/t-linter/)
 
+> 📣 💼 Maintainer update: Open to opportunities. 🔗 [koxudaxi.dev](https://koxudaxi.dev/?utm_source=github_readme&utm_medium=top&utm_campaign=open_to_work)
+
 ## 📖 Documentation
 
 **👉 [t-linter.koxudaxi.dev](https://t-linter.koxudaxi.dev)**
