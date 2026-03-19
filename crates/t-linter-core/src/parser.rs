@@ -485,17 +485,24 @@ impl TemplateStringParser {
             return Ok(None);
         };
 
-        let mut imported_context = ModuleContext::default();
-        self.collect_type_aliases(&tree, &source, &mut imported_context)?;
-        self.collect_imports(&tree, &source, &mut imported_context)?;
-        self.collect_local_callable_signatures(&tree, &source, &mut imported_context)?;
-        self.collect_imported_callable_signatures(&mut imported_context)?;
+        let original_search_root = self.search_root.clone();
+        self.search_root = module_path.parent().map(Path::to_path_buf);
 
-        module_cache.insert(
-            module_name.to_string(),
-            imported_context.callable_signatures.clone(),
-        );
-        Ok(Some(imported_context.callable_signatures))
+        let imported_signatures = (|| -> Result<HashMap<String, Vec<CallableParameter>>> {
+            let mut imported_context = ModuleContext::default();
+            self.collect_type_aliases(&tree, &source, &mut imported_context)?;
+            self.collect_imports(&tree, &source, &mut imported_context)?;
+            self.collect_local_callable_signatures(&tree, &source, &mut imported_context)?;
+            self.collect_imported_callable_signatures(&mut imported_context)?;
+            Ok(imported_context.callable_signatures)
+        })();
+
+        self.search_root = original_search_root;
+
+        let imported_signatures = imported_signatures?;
+
+        module_cache.insert(module_name.to_string(), imported_signatures.clone());
+        Ok(Some(imported_signatures))
     }
 
     fn resolve_python_module_path(&self, module_name: &str) -> Option<PathBuf> {
@@ -2050,6 +2057,52 @@ def render_data(template: Annotated[Template, "yaml"]) -> object:
 
         let source = r#"
 from typed_api import render_data as render_yaml_data
+
+config = t"name: {name}"
+render_yaml_data(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("broken.py"))
+            .unwrap();
+
+        std::env::set_current_dir(original_dir).unwrap();
+        let _ = fs::remove_dir_all(unrelated_dir);
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_imported_nested_local_reexport_annotation_propagates_to_template_variable() {
+        let dir = parser_test_dir("imported-nested-local-reexport");
+        fs::create_dir_all(dir.join("package")).unwrap();
+        fs::write(
+            dir.join("package").join("bindings.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_data(template: Annotated[Template, "yaml"]) -> object:
+    return {"ok": True}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("package").join("typed_api.py"),
+            r#"from bindings import render_data
+"#,
+        )
+        .unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        let unrelated_dir = parser_test_dir("nested-unrelated-cwd");
+        std::env::set_current_dir(&unrelated_dir).unwrap();
+
+        let source = r#"
+from package.typed_api import render_data as render_yaml_data
 
 config = t"name: {name}"
 render_yaml_data(config)
