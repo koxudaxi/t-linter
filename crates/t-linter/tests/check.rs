@@ -106,6 +106,93 @@ service:
 }
 
 #[test]
+fn check_reports_yaml_plain_scalars_via_imported_function_annotation() {
+    let dir = test_dir("yaml-imported-function");
+    write_file(
+        &dir.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_data(template: Annotated[Template, "yaml"]) -> object:
+    return {"ok": True}
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typed_api import render_data as render_yaml_data
+
+name = "api"
+replicas = 3
+
+yaml_template = t"""
+service:
+  name: {name}
+  replicas: fdsa fff {replicas}
+"""
+
+render_yaml_data(yaml_template)
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(
+        json["diagnostics"][0]["message"],
+        "Quote YAML plain scalars that mix whitespace and interpolations."
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_yaml_plain_scalars_via_imported_class_annotation() {
+    let dir = test_dir("yaml-imported-class");
+    write_file(
+        &dir.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+class Loader:
+    def __init__(self, template: Annotated[Template, "yaml"]) -> None:
+        self.template = template
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typed_api import Loader
+
+name = "api"
+replicas = 3
+
+yaml_template = t"""
+service:
+  name: {name}
+  replicas: fdsa fff {replicas}
+"""
+
+Loader(yaml_template)
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(
+        json["diagnostics"][0]["message"],
+        "Quote YAML plain scalars that mix whitespace and interpolations."
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_json_recurses_and_skips_default_excludes() {
     let dir = test_dir("json");
     write_file(
