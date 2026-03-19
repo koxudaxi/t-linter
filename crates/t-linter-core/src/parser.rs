@@ -13,11 +13,26 @@ use tstring_syntax::{
 pub struct ModuleContext {
     pub type_aliases: HashMap<String, String>,
     pub imports: HashMap<String, String>,
-    pub callable_signatures: HashMap<String, Vec<(usize, String)>>,
+    pub callable_signatures: HashMap<String, Vec<CallableParameter>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallableParameter {
+    pub position: usize,
+    pub name: String,
+    pub language: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CallArgument<'a> {
+    position: usize,
+    keyword: Option<&'a str>,
+    value: Node<'a>,
 }
 
 pub struct TemplateStringParser {
     parser: Parser,
+    search_root: Option<PathBuf>,
 }
 
 impl TemplateStringParser {
@@ -27,10 +42,32 @@ impl TemplateStringParser {
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .context("Failed to set Python language")?;
 
-        Ok(Self { parser })
+        Ok(Self {
+            parser,
+            search_root: None,
+        })
     }
 
     pub fn find_template_strings(&mut self, source: &str) -> Result<Vec<TemplateStringInfo>> {
+        self.search_root = None;
+        self.find_template_strings_with_search_root(source, None)
+    }
+
+    pub fn find_template_strings_in_file(
+        &mut self,
+        source: &str,
+        path: &Path,
+    ) -> Result<Vec<TemplateStringInfo>> {
+        let search_root = path.parent().map(Path::to_path_buf);
+        self.find_template_strings_with_search_root(source, search_root)
+    }
+
+    fn find_template_strings_with_search_root(
+        &mut self,
+        source: &str,
+        search_root: Option<PathBuf>,
+    ) -> Result<Vec<TemplateStringInfo>> {
+        self.search_root = search_root;
         let tree = self
             .parser
             .parse(source, None)
@@ -243,30 +280,18 @@ impl TemplateStringParser {
         source: &str,
         context: &mut ModuleContext,
     ) -> Result<()> {
-        let function_query = r#"
-        (function_definition
-            name: (identifier) @func_name
-            parameters: (parameters) @params)
-        "#;
+        let root = tree.root_node();
+        let mut cursor = root.walk();
 
-        if let Ok(query) = Query::new(&tree_sitter_python::LANGUAGE.into(), function_query) {
-            let mut cursor = QueryCursor::new();
-            let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
-
-            while let Some(match_) = matches.next() {
-                let mut func_name = None;
-                let mut params = None;
-
-                for capture in match_.captures {
-                    let name = query.capture_names()[capture.index as usize];
-                    match name {
-                        "func_name" => func_name = Some(capture.node.utf8_text(source.as_bytes())?),
-                        "params" => params = Some(capture.node),
-                        _ => {}
-                    }
-                }
-
-                if let (Some(name), Some(params_node)) = (func_name, params) {
+        for child in root.children(&mut cursor) {
+            match child.kind() {
+                "function_definition" => {
+                    let Some(name_node) = child.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let Some(params_node) = child.child_by_field_name("parameters") else {
+                        continue;
+                    };
                     let parameter_languages = self.extract_callable_parameter_languages(
                         params_node,
                         source,
@@ -274,50 +299,30 @@ impl TemplateStringParser {
                         false,
                     )?;
                     if !parameter_languages.is_empty() {
-                        context
-                            .callable_signatures
-                            .insert(name.to_string(), parameter_languages);
+                        context.callable_signatures.insert(
+                            name_node.utf8_text(source.as_bytes())?.to_string(),
+                            parameter_languages,
+                        );
                     }
                 }
-            }
-        }
-
-        let class_query = r#"
-        (class_definition
-            name: (identifier) @class_name
-            body: (block) @class_body)
-        "#;
-
-        if let Ok(query) = Query::new(&tree_sitter_python::LANGUAGE.into(), class_query) {
-            let mut cursor = QueryCursor::new();
-            let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
-
-            while let Some(match_) = matches.next() {
-                let mut class_name = None;
-                let mut class_body = None;
-
-                for capture in match_.captures {
-                    let name = query.capture_names()[capture.index as usize];
-                    match name {
-                        "class_name" => {
-                            class_name = Some(capture.node.utf8_text(source.as_bytes())?)
-                        }
-                        "class_body" => class_body = Some(capture.node),
-                        _ => {}
-                    }
-                }
-
-                if let (Some(name), Some(body_node)) = (class_name, class_body) {
+                "class_definition" => {
+                    let Some(name_node) = child.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let Some(body_node) = child.child_by_field_name("body") else {
+                        continue;
+                    };
                     if let Some(parameter_languages) =
                         self.extract_class_constructor_languages(body_node, source, context)?
+                        && !parameter_languages.is_empty()
                     {
-                        if !parameter_languages.is_empty() {
-                            context
-                                .callable_signatures
-                                .insert(name.to_string(), parameter_languages);
-                        }
+                        context.callable_signatures.insert(
+                            name_node.utf8_text(source.as_bytes())?.to_string(),
+                            parameter_languages,
+                        );
                     }
                 }
+                _ => {}
             }
         }
 
@@ -329,7 +334,7 @@ impl TemplateStringParser {
         body_node: Node,
         source: &str,
         context: &ModuleContext,
-    ) -> Result<Option<Vec<(usize, String)>>> {
+    ) -> Result<Option<Vec<CallableParameter>>> {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
             if child.kind() != "function_definition" {
@@ -360,7 +365,7 @@ impl TemplateStringParser {
         source: &str,
         context: &ModuleContext,
         skip_receiver: bool,
-    ) -> Result<Vec<(usize, String)>> {
+    ) -> Result<Vec<CallableParameter>> {
         let mut parameter_languages = Vec::new();
         let mut cursor = params_node.walk();
         let mut position = 0;
@@ -379,7 +384,11 @@ impl TemplateStringParser {
                     if let Some(language) =
                         self.resolve_language_from_type_node(type_node, source, context)?
                     {
-                        parameter_languages.push((position, language));
+                        parameter_languages.push(CallableParameter {
+                            position,
+                            name: parameter_name.unwrap_or("").to_string(),
+                            language,
+                        });
                     }
                 }
                 position += 1;
@@ -433,8 +442,8 @@ impl TemplateStringParser {
     fn resolve_imported_callable_signature(
         &mut self,
         import_path: &str,
-        module_cache: &mut HashMap<String, HashMap<String, Vec<(usize, String)>>>,
-    ) -> Result<Option<Vec<(usize, String)>>> {
+        module_cache: &mut HashMap<String, HashMap<String, Vec<CallableParameter>>>,
+    ) -> Result<Option<Vec<CallableParameter>>> {
         let Some((module_name, symbol_name)) = import_path.rsplit_once('.') else {
             return Ok(None);
         };
@@ -451,11 +460,13 @@ impl TemplateStringParser {
     fn load_imported_module_signatures(
         &mut self,
         module_name: &str,
-        module_cache: &mut HashMap<String, HashMap<String, Vec<(usize, String)>>>,
-    ) -> Result<Option<HashMap<String, Vec<(usize, String)>>>> {
+        module_cache: &mut HashMap<String, HashMap<String, Vec<CallableParameter>>>,
+    ) -> Result<Option<HashMap<String, Vec<CallableParameter>>>> {
         if let Some(signatures) = module_cache.get(module_name) {
             return Ok(Some(signatures.clone()));
         }
+
+        module_cache.insert(module_name.to_string(), HashMap::new());
 
         let Some(module_path) = self.resolve_python_module_path(module_name) else {
             return Ok(None);
@@ -478,6 +489,7 @@ impl TemplateStringParser {
         self.collect_type_aliases(&tree, &source, &mut imported_context)?;
         self.collect_imports(&tree, &source, &mut imported_context)?;
         self.collect_local_callable_signatures(&tree, &source, &mut imported_context)?;
+        self.collect_imported_callable_signatures(&mut imported_context)?;
 
         module_cache.insert(
             module_name.to_string(),
@@ -487,6 +499,12 @@ impl TemplateStringParser {
     }
 
     fn resolve_python_module_path(&self, module_name: &str) -> Option<PathBuf> {
+        if let Some(search_root) = self.search_root.as_deref()
+            && let Some(path) = resolve_local_module_path(search_root, module_name)
+        {
+            return Some(path);
+        }
+
         if let Ok(current_dir) = std::env::current_dir()
             && let Some(path) = resolve_local_module_path(&current_dir, module_name)
         {
@@ -570,25 +588,24 @@ if spec and spec.origin:\n\
                 continue;
             };
 
-            let argument_nodes = call_argument_nodes(args);
-            for (position, argument_node) in argument_nodes.into_iter().enumerate() {
-                if argument_node.kind() != "identifier" {
+            let arguments = call_arguments(args, source)?;
+            for argument in arguments {
+                if argument.value.kind() != "identifier" {
                     continue;
                 }
-                let Some((_, language)) = signatures
-                    .iter()
-                    .find(|(param_pos, _)| *param_pos == position)
+                let Some(parameter) =
+                    resolve_callable_parameter(signatures, argument.position, argument.keyword)
                 else {
                     continue;
                 };
-                let variable_name = argument_node.utf8_text(source.as_bytes())?.to_string();
+                let variable_name = argument.value.utf8_text(source.as_bytes())?.to_string();
                 match hints.get(&variable_name) {
-                    Some(Some(existing)) if existing != language => {
+                    Some(Some(existing)) if existing != &parameter.language => {
                         hints.insert(variable_name, None);
                     }
                     Some(None) => {}
                     _ => {
-                        hints.insert(variable_name, Some(language.clone()));
+                        hints.insert(variable_name, Some(parameter.language.clone()));
                     }
                 }
             }
@@ -1049,7 +1066,7 @@ if spec and spec.origin:\n\
         &self,
         func_name: &str,
         string_node: &Node,
-        _source: &str,
+        source: &str,
         context: &ModuleContext,
     ) -> Result<Option<String>> {
         let Some(signatures) = self.lookup_callable_signatures(func_name, context) else {
@@ -1058,12 +1075,15 @@ if spec and spec.origin:\n\
 
         if let Some(call_node) = string_node.parent() {
             if call_node.kind() == "argument_list" {
-                for (position, child) in call_argument_nodes(call_node).into_iter().enumerate() {
-                    if child.kind() == "string" && child.id() == string_node.id() {
-                        for (param_pos, language) in signatures {
-                            if *param_pos == position {
-                                return Ok(Some(language.clone()));
-                            }
+                for argument in call_arguments(call_node, source)? {
+                    if argument.value.kind() == "string" && argument.value.id() == string_node.id()
+                    {
+                        if let Some(parameter) = resolve_callable_parameter(
+                            signatures,
+                            argument.position,
+                            argument.keyword,
+                        ) {
+                            return Ok(Some(parameter.language.clone()));
                         }
                         break;
                     }
@@ -1078,7 +1098,7 @@ if spec and spec.origin:\n\
         &self,
         callee: &str,
         context: &'a ModuleContext,
-    ) -> Option<&'a Vec<(usize, String)>> {
+    ) -> Option<&'a Vec<CallableParameter>> {
         if let Some(signatures) = context.callable_signatures.get(callee) {
             return Some(signatures);
         }
@@ -1121,29 +1141,71 @@ if spec and spec.origin:\n\
     }
 }
 
-fn call_argument_nodes(argument_list: Node) -> Vec<Node> {
+fn call_arguments<'a>(argument_list: Node<'a>, source: &'a str) -> Result<Vec<CallArgument<'a>>> {
+    let mut arguments = Vec::new();
     let mut cursor = argument_list.walk();
-    argument_list
-        .children(&mut cursor)
-        .filter(|child| {
-            matches!(
-                child.kind(),
-                "string"
-                    | "identifier"
-                    | "call"
-                    | "attribute"
-                    | "integer"
-                    | "float"
-                    | "true"
-                    | "false"
-                    | "none"
-                    | "list"
-                    | "dictionary"
-                    | "tuple"
-                    | "set"
-            )
-        })
-        .collect()
+    let mut position = 0;
+
+    for child in argument_list.children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "string"
+                | "identifier"
+                | "call"
+                | "attribute"
+                | "integer"
+                | "float"
+                | "true"
+                | "false"
+                | "none"
+                | "list"
+                | "dictionary"
+                | "tuple"
+                | "set"
+        ) {
+            arguments.push(CallArgument {
+                position,
+                keyword: None,
+                value: child,
+            });
+            position += 1;
+            continue;
+        }
+
+        if child.kind() == "keyword_argument"
+            && let Some(value) = child.child_by_field_name("value")
+        {
+            let keyword = child
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source.as_bytes()).ok());
+            arguments.push(CallArgument {
+                position,
+                keyword,
+                value,
+            });
+            position += 1;
+        }
+    }
+
+    Ok(arguments)
+}
+
+fn resolve_callable_parameter<'a>(
+    signatures: &'a [CallableParameter],
+    position: usize,
+    keyword: Option<&str>,
+) -> Option<&'a CallableParameter> {
+    if let Some(keyword) = keyword
+        && let Some(parameter) = signatures
+            .iter()
+            .find(|parameter| parameter.name == keyword)
+    {
+        return Some(parameter);
+    }
+
+    signatures
+        .iter()
+        .find(|parameter| parameter.position == position)
 }
 
 fn preferred_stub_path(path: &Path) -> Option<PathBuf> {
@@ -1863,6 +1925,27 @@ load_config(config)
     }
 
     #[test]
+    fn test_function_keyword_parameter_inference_propagates_to_template_variable() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+def load_config(template: Annotated[Template, "yaml"]) -> None:
+    return None
+
+config = t"name: {name}"
+load_config(template=config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
     fn test_class_constructor_inference_propagates_to_template_variable() {
         let source = r#"
 from typing import Annotated
@@ -1874,6 +1957,28 @@ class Loader:
 
 config = t"name: {name}"
 Loader(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_class_constructor_keyword_inference_propagates_to_template_variable() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+class Loader:
+    def __init__(self, template: Annotated[Template, "yaml"]) -> None:
+        self.template = template
+
+config = t"name: {name}"
+Loader(template=config)
 "#;
 
         let mut parser = TemplateStringParser::new().unwrap();
@@ -1920,6 +2025,51 @@ render_yaml_data(config)
     }
 
     #[test]
+    fn test_imported_reexported_function_annotation_propagates_to_template_variable() {
+        let dir = parser_test_dir("imported-reexported-function");
+        fs::write(
+            dir.join("bindings.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_data(template: Annotated[Template, "yaml"]) -> object:
+    return {"ok": True}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("typed_api.py"),
+            r#"from bindings import render_data
+"#,
+        )
+        .unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        let unrelated_dir = parser_test_dir("unrelated-cwd");
+        std::env::set_current_dir(&unrelated_dir).unwrap();
+
+        let source = r#"
+from typed_api import render_data as render_yaml_data
+
+config = t"name: {name}"
+render_yaml_data(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("broken.py"))
+            .unwrap();
+
+        std::env::set_current_dir(original_dir).unwrap();
+        let _ = fs::remove_dir_all(unrelated_dir);
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
     fn test_imported_class_annotation_propagates_to_template_variable() {
         let dir = parser_test_dir("imported-class");
         fs::write(
@@ -1953,6 +2103,28 @@ Loader(config)
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].variable_name, Some("config".to_string()));
         assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_method_annotations_do_not_leak_to_top_level_calls() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+class Loader:
+    def render_data(self, template: Annotated[Template, "yaml"]) -> None:
+        self.template = template
+
+config = t"name: {name}"
+render_data(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, None);
     }
 
     #[test]

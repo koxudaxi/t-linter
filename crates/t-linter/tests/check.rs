@@ -149,6 +149,49 @@ render_yaml_data(yaml_template)
 }
 
 #[test]
+fn check_reports_yaml_plain_scalars_via_keyword_function_annotation() {
+    let dir = test_dir("yaml-keyword-function");
+    write_file(
+        &dir.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_data(template: Annotated[Template, "yaml"]) -> object:
+    return {"ok": True}
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typed_api import render_data as render_yaml_data
+
+name = "api"
+replicas = 3
+
+yaml_template = t"""
+service:
+  name: {name}
+  replicas: fdsa fff {replicas}
+"""
+
+render_yaml_data(template=yaml_template)
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(
+        json["diagnostics"][0]["message"],
+        "Quote YAML plain scalars that mix whitespace and interpolations."
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_reports_yaml_plain_scalars_via_imported_class_annotation() {
     let dir = test_dir("yaml-imported-class");
     write_file(
@@ -175,6 +218,54 @@ service:
 """
 
 Loader(yaml_template)
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(
+        json["diagnostics"][0]["message"],
+        "Quote YAML plain scalars that mix whitespace and interpolations."
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_yaml_plain_scalars_via_reexported_function_annotation() {
+    let dir = test_dir("yaml-reexported-function");
+    write_file(
+        &dir.join("bindings.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_data(template: Annotated[Template, "yaml"]) -> object:
+    return {"ok": True}
+"#,
+    );
+    write_file(
+        &dir.join("typed_api.py"),
+        r#"from bindings import render_data
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typed_api import render_data as render_yaml_data
+
+name = "api"
+replicas = 3
+
+yaml_template = t"""
+service:
+  name: {name}
+  replicas: fdsa fff {replicas}
+"""
+
+render_yaml_data(yaml_template)
 "#,
     );
 
