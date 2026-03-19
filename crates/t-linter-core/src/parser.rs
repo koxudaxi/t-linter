@@ -2,12 +2,14 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 use tracing::info;
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 use tstring_syntax::{
     SourcePosition, SourceSpan, TemplateInput, TemplateInterpolation, TemplateSegment,
 };
+use wait_timeout::ChildExt;
 
 #[derive(Debug, Clone, Default)]
 pub struct ModuleContext {
@@ -36,6 +38,8 @@ pub struct TemplateStringParser {
 }
 
 impl TemplateStringParser {
+    const PYTHON_MODULE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
     pub fn new() -> Result<Self> {
         let mut parser = Parser::new();
         parser
@@ -519,7 +523,7 @@ impl TemplateStringParser {
         }
 
         for interpreter in ["python3", "python"] {
-            let output = Command::new(interpreter)
+            let mut child = Command::new(interpreter)
                 .arg("-c")
                 .arg(
                     "import importlib.util, sys\n\
@@ -528,8 +532,19 @@ if spec and spec.origin:\n\
     print(spec.origin)\n",
                 )
                 .arg(module_name)
-                .output()
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
                 .ok()?;
+            let status = child
+                .wait_timeout(Self::PYTHON_MODULE_LOOKUP_TIMEOUT)
+                .ok()?;
+            let Some(_status) = status else {
+                let _ = child.kill();
+                let _ = child.wait();
+                continue;
+            };
+            let output = child.wait_with_output().ok()?;
 
             if !output.status.success() {
                 continue;
