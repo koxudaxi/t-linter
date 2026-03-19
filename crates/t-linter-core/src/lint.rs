@@ -59,7 +59,7 @@ pub fn lint_source(path: &Path, source: &str) -> Result<LintFileResult> {
     let python_diagnostic = lint_python_source(path, source)?;
 
     let mut parser = TemplateStringParser::new()?;
-    let templates = parser.find_template_strings(source)?;
+    let templates = parser.find_template_strings_in_file(source, path)?;
 
     let mut diagnostics = Vec::new();
     if let Some(diagnostic) = python_diagnostic {

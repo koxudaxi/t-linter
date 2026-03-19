@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{Context, Result};
 
 use crate::{Location, TemplateStringInfo, TemplateStringParser};
@@ -11,11 +13,13 @@ pub struct TemplateEdit {
 pub fn format_document(source: &str) -> Result<Vec<TemplateEdit>> {
     let mut parser = TemplateStringParser::new()?;
     let templates = parser.find_template_strings(source)?;
+    format_templates(&templates)
+}
 
-    templates
-        .iter()
-        .filter_map(format_template_edit)
-        .collect::<Result<Vec<_>>>()
+pub fn format_document_in_file(source: &str, path: &Path) -> Result<Vec<TemplateEdit>> {
+    let mut parser = TemplateStringParser::new()?;
+    let templates = parser.find_template_strings_in_file(source, path)?;
+    format_templates(&templates)
 }
 
 pub fn apply_template_edits(source: &str, edits: &[TemplateEdit]) -> Result<String> {
@@ -124,6 +128,13 @@ fn format_template_edit(template: &TemplateStringInfo) -> Option<Result<Template
             })
             .map_err(Into::into),
     )
+}
+
+fn format_templates(templates: &[TemplateStringInfo]) -> Result<Vec<TemplateEdit>> {
+    templates
+        .iter()
+        .filter_map(format_template_edit)
+        .collect::<Result<Vec<_>>>()
 }
 
 fn ranges_overlap(left: &Location, right: &Location) -> bool {

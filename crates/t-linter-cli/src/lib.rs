@@ -2,14 +2,14 @@ mod discovery;
 
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use serde::Serialize;
 use t_linter_core::{
     LintDiagnostic, LintFileResult, LintRunSummary, apply_template_edits, file_read_error,
-    format_document, lint_source,
+    format_document, format_document_in_file, lint_source,
 };
 use tempfile::NamedTempFile;
 
@@ -174,6 +174,7 @@ fn has_read_failure(result: &LintFileResult) -> bool {
 }
 
 fn format_stdin(check: bool, stdin_filename: Option<String>) -> Result<i32> {
+    let stdin_path = stdin_filename.as_ref().map(PathBuf::from);
     let label = stdin_filename.unwrap_or_else(|| "-".to_string());
     let mut bytes = Vec::new();
     std::io::stdin()
@@ -181,7 +182,7 @@ fn format_stdin(check: bool, stdin_filename: Option<String>) -> Result<i32> {
         .context("Failed to read stdin")?;
     let source =
         String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("stdin is not valid UTF-8"))?;
-    let formatted = format_source(&source)?;
+    let formatted = format_source(&source, stdin_path.as_deref())?;
     let changed = formatted != source;
 
     if check {
@@ -227,7 +228,7 @@ fn format_files(paths: Vec<String>, check: bool) -> Result<i32> {
             }
         };
 
-        let formatted = match format_source(&source) {
+        let formatted = match format_source(&source, Some(&file.display_path)) {
             Ok(formatted) => formatted,
             Err(error) => {
                 summary.failed += 1;
@@ -268,8 +269,11 @@ fn format_files(paths: Vec<String>, check: bool) -> Result<i32> {
     }
 }
 
-fn format_source(source: &str) -> Result<String> {
-    let edits = format_document(source)?;
+fn format_source(source: &str, path: Option<&Path>) -> Result<String> {
+    let edits = match path {
+        Some(path) => format_document_in_file(source, path)?,
+        None => format_document(source)?,
+    };
     apply_template_edits(source, &edits)
 }
 
