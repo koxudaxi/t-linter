@@ -2025,9 +2025,6 @@ def render_data(template: Annotated[Template, "yaml"]) -> object:
         )
         .unwrap();
 
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-
         let source = r#"
 from typed_api import render_data as render_yaml_data
 
@@ -2036,9 +2033,10 @@ render_yaml_data(config)
 "#;
 
         let mut parser = TemplateStringParser::new().unwrap();
-        let templates = parser.find_template_strings(source).unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("broken.py"))
+            .unwrap();
 
-        std::env::set_current_dir(original_dir).unwrap();
         let _ = fs::remove_dir_all(dir);
 
         assert_eq!(templates.len(), 1);
@@ -2066,10 +2064,6 @@ def render_data(template: Annotated[Template, "yaml"]) -> object:
         )
         .unwrap();
 
-        let original_dir = std::env::current_dir().unwrap();
-        let unrelated_dir = parser_test_dir("unrelated-cwd");
-        std::env::set_current_dir(&unrelated_dir).unwrap();
-
         let source = r#"
 from typed_api import render_data as render_yaml_data
 
@@ -2082,8 +2076,6 @@ render_yaml_data(config)
             .find_template_strings_in_file(source, &dir.join("broken.py"))
             .unwrap();
 
-        std::env::set_current_dir(original_dir).unwrap();
-        let _ = fs::remove_dir_all(unrelated_dir);
         let _ = fs::remove_dir_all(dir);
 
         assert_eq!(templates.len(), 1);
@@ -2112,10 +2104,6 @@ def render_data(template: Annotated[Template, "yaml"]) -> object:
         )
         .unwrap();
 
-        let original_dir = std::env::current_dir().unwrap();
-        let unrelated_dir = parser_test_dir("nested-unrelated-cwd");
-        std::env::set_current_dir(&unrelated_dir).unwrap();
-
         let source = r#"
 from package.typed_api import render_data as render_yaml_data
 
@@ -2128,8 +2116,6 @@ render_yaml_data(config)
             .find_template_strings_in_file(source, &dir.join("broken.py"))
             .unwrap();
 
-        std::env::set_current_dir(original_dir).unwrap();
-        let _ = fs::remove_dir_all(unrelated_dir);
         let _ = fs::remove_dir_all(dir);
 
         assert_eq!(templates.len(), 1);
@@ -2152,9 +2138,6 @@ class Loader:
         )
         .unwrap();
 
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-
         let source = r#"
 from typed_api import Loader
 
@@ -2163,9 +2146,10 @@ Loader(config)
 "#;
 
         let mut parser = TemplateStringParser::new().unwrap();
-        let templates = parser.find_template_strings(source).unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("broken.py"))
+            .unwrap();
 
-        std::env::set_current_dir(original_dir).unwrap();
         let _ = fs::remove_dir_all(dir);
 
         assert_eq!(templates.len(), 1);
