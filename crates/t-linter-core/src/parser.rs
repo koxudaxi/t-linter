@@ -1,15 +1,13 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::Duration;
 use tracing::info;
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 use tstring_syntax::{
     SourcePosition, SourceSpan, TemplateInput, TemplateInterpolation, TemplateSegment,
 };
-use wait_timeout::ChildExt;
 
 #[derive(Debug, Clone, Default)]
 pub struct ModuleContext {
@@ -32,14 +30,31 @@ struct CallArgument<'a> {
     value: Node<'a>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AssignmentKey {
+    scope_start: usize,
+    scope_end: usize,
+    name: String,
+    assignment_start: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ScopeKey {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct VariableAssignment {
+    key: AssignmentKey,
+}
+
 pub struct TemplateStringParser {
     parser: Parser,
     search_root: Option<PathBuf>,
 }
 
 impl TemplateStringParser {
-    const PYTHON_MODULE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
-
     pub fn new() -> Result<Self> {
         let mut parser = Parser::new();
         parser
@@ -510,60 +525,8 @@ impl TemplateStringParser {
     }
 
     fn resolve_python_module_path(&self, module_name: &str) -> Option<PathBuf> {
-        if let Some(search_root) = self.search_root.as_deref()
-            && let Some(path) = resolve_local_module_path(search_root, module_name)
-        {
-            return Some(path);
-        }
-
-        if let Ok(current_dir) = std::env::current_dir()
-            && let Some(path) = resolve_local_module_path(&current_dir, module_name)
-        {
-            return Some(path);
-        }
-
-        for interpreter in ["python3", "python"] {
-            let mut child = Command::new(interpreter)
-                .arg("-c")
-                .arg(
-                    "import importlib.util, sys\n\
-spec = importlib.util.find_spec(sys.argv[1])\n\
-if spec and spec.origin:\n\
-    print(spec.origin)\n",
-                )
-                .arg(module_name)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()?;
-            let status = child
-                .wait_timeout(Self::PYTHON_MODULE_LOOKUP_TIMEOUT)
-                .ok()?;
-            let Some(_status) = status else {
-                let _ = child.kill();
-                let _ = child.wait();
-                continue;
-            };
-            let output = child.wait_with_output().ok()?;
-
-            if !output.status.success() {
-                continue;
-            }
-
-            let origin = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if origin.is_empty() || origin == "built-in" || origin == "frozen" {
-                continue;
-            }
-
-            let mut path = PathBuf::from(origin);
-            if path.extension().and_then(|ext| ext.to_str()) == Some("pyc") {
-                path.set_extension("py");
-            }
-
-            if let Some(stub_path) = preferred_stub_path(&path) {
-                return Some(stub_path);
-            }
-            if path.exists() {
+        for search_root in python_search_roots(self.search_root.as_deref()) {
+            if let Some(path) = resolve_local_module_path(&search_root, module_name) {
                 return Some(path);
             }
         }
@@ -576,7 +539,7 @@ if spec and spec.origin:\n\
         tree: &Tree,
         source: &str,
         context: &ModuleContext,
-    ) -> Result<HashMap<String, String>> {
+    ) -> Result<HashMap<AssignmentKey, String>> {
         let query_str = r#"
         (call
             function: (_) @func_expr
@@ -586,9 +549,10 @@ if spec and spec.origin:\n\
         let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_str)
             .context("Failed to create call query")?;
 
+        let assignments = collect_variable_assignments(tree, source)?;
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
-        let mut hints = HashMap::<String, Option<String>>::new();
+        let mut hints = HashMap::<AssignmentKey, Option<String>>::new();
 
         while let Some(match_) = matches.next() {
             let mut func_expr = None;
@@ -620,14 +584,18 @@ if spec and spec.origin:\n\
                 else {
                     continue;
                 };
-                let variable_name = argument.value.utf8_text(source.as_bytes())?.to_string();
-                match hints.get(&variable_name) {
+                let Some(binding) =
+                    resolve_assignment_for_identifier(argument.value, source, &assignments)?
+                else {
+                    continue;
+                };
+                match hints.get(&binding.key) {
                     Some(Some(existing)) if existing != &parameter.language => {
-                        hints.insert(variable_name, None);
+                        hints.insert(binding.key.clone(), None);
                     }
                     Some(None) => {}
                     _ => {
-                        hints.insert(variable_name, Some(parameter.language.clone()));
+                        hints.insert(binding.key.clone(), Some(parameter.language.clone()));
                     }
                 }
             }
@@ -645,7 +613,7 @@ if spec and spec.origin:\n\
         source: &str,
         templates: &mut Vec<TemplateStringInfo>,
         context: &ModuleContext,
-        variable_language_hints: &HashMap<String, String>,
+        variable_language_hints: &HashMap<AssignmentKey, String>,
     ) -> Result<()> {
         let query_str = r#"
         (expression_statement
@@ -666,7 +634,11 @@ if spec and spec.origin:\n\
         (call
             function: (_) @func_name
             arguments: (argument_list
-                (string) @string
+                [
+                    (string) @string
+                    (keyword_argument
+                        value: (string) @string)
+                ]
             )
         )
     "#;
@@ -682,6 +654,7 @@ if spec and spec.origin:\n\
         while let Some(match_) = matches.next() {
             let mut string_node = None;
             let mut var_name = None;
+            let mut var_name_node = None;
             let mut type_annotation = None;
             let mut func_name = None;
 
@@ -689,7 +662,10 @@ if spec and spec.origin:\n\
                 let name = query.capture_names()[capture.index as usize];
                 match name {
                     "string" => string_node = Some(capture.node),
-                    "var_name" => var_name = Some(capture.node.utf8_text(source.as_bytes())?),
+                    "var_name" => {
+                        var_name = Some(capture.node.utf8_text(source.as_bytes())?);
+                        var_name_node = Some(capture.node);
+                    }
                     "type_annotation" => type_annotation = Some(capture.node),
                     "func_name" => func_name = Some(capture.node.utf8_text(source.as_bytes())?),
                     _ => {}
@@ -714,6 +690,7 @@ if spec and spec.origin:\n\
                             node,
                             source,
                             var_name,
+                            var_name_node,
                             type_annotation,
                             func_name,
                             context,
@@ -733,10 +710,11 @@ if spec and spec.origin:\n\
         node: Node,
         source: &str,
         var_name: Option<&str>,
+        var_name_node: Option<Node>,
         type_annotation: Option<Node>,
         func_name: Option<&str>,
         context: &ModuleContext,
-        variable_language_hints: &HashMap<String, String>,
+        variable_language_hints: &HashMap<AssignmentKey, String>,
     ) -> Result<TemplateStringInfo> {
         let start_position = node.start_position();
         let end_position = node.end_position();
@@ -771,8 +749,10 @@ if spec and spec.origin:\n\
             None
         };
         if language.is_none() {
-            if let Some(name) = var_name {
-                language = variable_language_hints.get(name).cloned();
+            if let Some(var_node) = var_name_node
+                && let Some(binding) = assignment_key_for_node(var_node, source)
+            {
+                language = variable_language_hints.get(&binding).cloned();
             }
         }
 
@@ -1095,20 +1075,21 @@ if spec and spec.origin:\n\
             return Ok(None);
         };
 
-        if let Some(call_node) = string_node.parent() {
-            if call_node.kind() == "argument_list" {
-                for argument in call_arguments(call_node, source)? {
-                    if argument.value.kind() == "string" && argument.value.id() == string_node.id()
+        let argument_list = match string_node.parent() {
+            Some(parent) if parent.kind() == "argument_list" => Some(parent),
+            Some(parent) if parent.kind() == "keyword_argument" => parent.parent(),
+            _ => None,
+        };
+
+        if let Some(call_node) = argument_list {
+            for argument in call_arguments(call_node, source)? {
+                if argument.value.kind() == "string" && argument.value.id() == string_node.id() {
+                    if let Some(parameter) =
+                        resolve_callable_parameter(signatures, argument.position, argument.keyword)
                     {
-                        if let Some(parameter) = resolve_callable_parameter(
-                            signatures,
-                            argument.position,
-                            argument.keyword,
-                        ) {
-                            return Ok(Some(parameter.language.clone()));
-                        }
-                        break;
+                        return Ok(Some(parameter.language.clone()));
                     }
+                    break;
                 }
             }
         }
@@ -1228,6 +1209,122 @@ fn resolve_callable_parameter<'a>(
     signatures
         .iter()
         .find(|parameter| parameter.position == position)
+}
+
+fn collect_variable_assignments(tree: &Tree, source: &str) -> Result<Vec<VariableAssignment>> {
+    let query_str = r#"
+    (assignment
+        left: (identifier) @var_name)
+    "#;
+
+    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_str)
+        .context("Failed to create assignment query")?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut assignments = Vec::new();
+
+    while let Some(match_) = matches.next() {
+        for capture in match_.captures {
+            if query.capture_names()[capture.index as usize] != "var_name" {
+                continue;
+            }
+            if let Some(key) = assignment_key_for_node(capture.node, source) {
+                assignments.push(VariableAssignment { key });
+            }
+        }
+    }
+
+    assignments.sort_by_key(|assignment| assignment.key.assignment_start);
+    Ok(assignments)
+}
+
+fn resolve_assignment_for_identifier(
+    identifier: Node,
+    source: &str,
+    assignments: &[VariableAssignment],
+) -> Result<Option<VariableAssignment>> {
+    let name = identifier.utf8_text(source.as_bytes())?;
+    let scope_chain = scope_chain(identifier);
+    let use_position = identifier.start_byte();
+
+    for scope in &scope_chain {
+        if let Some(assignment) = assignments.iter().rev().find(|assignment| {
+            assignment.key.name == name
+                && assignment.key.scope_start == scope.start
+                && assignment.key.scope_end == scope.end
+                && assignment.key.assignment_start < use_position
+        }) {
+            return Ok(Some(assignment.clone()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn assignment_key_for_node(identifier: Node, source: &str) -> Option<AssignmentKey> {
+    let name = identifier.utf8_text(source.as_bytes()).ok()?.to_string();
+    let scope = enclosing_scope(identifier);
+    Some(AssignmentKey {
+        scope_start: scope.start,
+        scope_end: scope.end,
+        name,
+        assignment_start: identifier.start_byte(),
+    })
+}
+
+fn scope_chain(node: Node) -> Vec<ScopeKey> {
+    let mut scopes = Vec::new();
+    let mut current = Some(node);
+
+    while let Some(candidate) = current {
+        if is_scope_node(candidate) {
+            scopes.push(ScopeKey {
+                start: candidate.start_byte(),
+                end: candidate.end_byte(),
+            });
+        }
+        current = candidate.parent();
+    }
+
+    if scopes.is_empty() {
+        scopes.push(ScopeKey {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        });
+    }
+
+    scopes
+}
+
+fn enclosing_scope(node: Node) -> ScopeKey {
+    scope_chain(node).into_iter().next().unwrap_or(ScopeKey {
+        start: node.start_byte(),
+        end: node.end_byte(),
+    })
+}
+
+fn is_scope_node(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        "module" | "function_definition" | "class_definition" | "lambda"
+    )
+}
+
+fn python_search_roots(search_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Some(root) = search_root {
+        roots.push(root.to_path_buf());
+    }
+    if let Ok(current_dir) = env::current_dir() {
+        roots.push(current_dir);
+    }
+    if let Some(paths) = env::var_os("PYTHONPATH") {
+        roots.extend(env::split_paths(&paths));
+    }
+
+    roots.dedup();
+    roots
 }
 
 fn preferred_stub_path(path: &Path) -> Option<PathBuf> {
@@ -1926,6 +2023,26 @@ result = execute_query(t"SELECT * FROM users WHERE id = {user_id}")
     }
 
     #[test]
+    fn test_function_keyword_parameter_inference() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+def load_config(template: Annotated[Template, "yaml"]) -> None:
+    return None
+
+load_config(template=t"name: {name}")
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+        assert_eq!(templates[0].content, "name: {}");
+    }
+
+    #[test]
     fn test_function_parameter_inference_propagates_to_template_variable() {
         let source = r#"
 from typing import Annotated
@@ -1965,6 +2082,33 @@ load_config(template=config)
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].variable_name, Some("config".to_string()));
         assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_reassigned_template_variables_keep_distinct_language_hints() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+def load_yaml(template: Annotated[Template, "yaml"]) -> None:
+    return None
+
+def load_toml(template: Annotated[Template, "toml"]) -> None:
+    return None
+
+config = t"name: {name}"
+load_yaml(config)
+
+config = t"title = {title}"
+load_toml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 2);
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+        assert_eq!(templates[1].language, Some("toml".to_string()));
     }
 
     #[test]
