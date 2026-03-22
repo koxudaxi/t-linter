@@ -18,9 +18,9 @@ The LSP server provides:
 - **Diagnostics** — real-time validation of embedded language syntax (debounced for performance)
 - **Formatting** — canonical formatting of template literals while preserving interpolation expressions like `{name!r:>5}`
 
-For JSON, YAML, and TOML templates:
+For HTML, T-HTML, JSON, YAML, and TOML templates:
 
-- Diagnostics are published from the structured-data backend for strict validation
+- Diagnostics are published from the dedicated Rust backends for strict validation
 - Formatting requests rewrite the whole template literal using the backend formatter
 
 ## Editor Integration

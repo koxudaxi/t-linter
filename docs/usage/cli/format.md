@@ -4,6 +4,8 @@ The `format` command rewrites supported Python template strings in place.
 
 Supported formatter backends:
 
+- HTML
+- T-HTML
 - JSON
 - YAML / YML
 - TOML

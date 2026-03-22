@@ -17,7 +17,7 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 - 🔍 [Check Command](https://t-linter.koxudaxi.dev/usage/cli/check/) - CLI validation & output formats
 - 🧹 [Format Command](https://t-linter.koxudaxi.dev/usage/cli/format/) - Canonical formatting for supported templates
 - ⚙️ [Configuration](https://t-linter.koxudaxi.dev/usage/configuration/) - pyproject.toml & ignore files
-- 🌐 [Supported Languages](https://t-linter.koxudaxi.dev/supported-languages/) - HTML, SQL, JS, CSS, JSON, YAML, TOML
+- 🌐 [Supported Languages](https://t-linter.koxudaxi.dev/supported-languages/) - HTML, T-HTML, SQL, JS, CSS, JSON, YAML, TOML
 
 ---
 
@@ -35,12 +35,12 @@ t-linter provides intelligent syntax highlighting and linting for Python templat
 - 🎨 **Smart Syntax Highlighting** - Detects embedded languages in `t"..."` strings
 - 🔍 **Type-based Detection** - Understands `Annotated[Template, "html"]` annotations
 - 🚀 **Fast** - Built with Rust and Tree-sitter for optimal performance
-- 🔧 **Extensible** - Support for HTML, SQL, JavaScript, CSS, JSON, YAML, TOML, and more
+- 🔧 **Extensible** - Support for HTML, T-HTML, SQL, JavaScript, CSS, JSON, YAML, TOML, and more
 
-For JSON, YAML, and TOML, `t-linter` now splits responsibilities:
+For HTML, T-HTML, JSON, YAML, and TOML, `t-linter` now splits responsibilities:
 
 - `semanticTokens`: Tree-sitter only, for low-latency highlighting
-- `check`: strict parsing through the `tstring-json`, `tstring-yaml`, and `tstring-toml` backends
+- `check`: strict parsing through the `tstring-html`, `tstring-thtml`, `tstring-json`, `tstring-yaml`, and `tstring-toml` backends
 - `formatting`: canonical formatting through the same Rust backends
 
 ## Installation
@@ -160,10 +160,10 @@ If you installed via PyPI, you can use t-linter from the command line:
 t-linter lsp
 ```
 
-In the LSP, diagnostics are debounced and published from the structured-data
-backend for JSON/YAML/TOML templates. Formatting requests rewrite the whole
-template literal using the backend formatter while keeping interpolation source
-such as `{name!r:>5}` intact.
+In the LSP, diagnostics are debounced and published from the dedicated Rust
+backends for HTML, T-HTML, JSON, YAML, and TOML templates. Formatting requests
+rewrite the whole template literal using the backend formatter while keeping
+interpolation source such as `{name!r:>5}` intact.
 
 **Check files for issues**:
 ```bash
@@ -183,7 +183,7 @@ t-linter check file.py --error-on-issues  # Exit with error code if issues found
 subcommand to rewrite supported template literals in place:
 
 ```bash
-# Format Python files containing JSON/YAML/TOML templates
+# Format Python files containing HTML/T-HTML/JSON/YAML/TOML templates
 t-linter format file.py
 t-linter format src/
 
@@ -294,7 +294,7 @@ t-linter stats src/  # Specific directory
 
 ### Planned Features
 - ✅ **Language Server Protocol (LSP)** - Fully implemented
-- ✅ **Syntax Highlighting** - Supports HTML, SQL, JavaScript, CSS, JSON, YAML, TOML
+- ✅ **Syntax Highlighting** - Supports HTML, T-HTML, SQL, JavaScript, CSS, JSON, YAML, TOML
 - ✅ **Type Alias Support** - Recognizes `type html = Annotated[Template, "html"]`
 - ✅ **Linting (`check` command)** - Validate template strings for syntax errors
 - 🚧 **Statistics (`stats` command)** - Analyze template string usage across codebases
@@ -334,6 +334,14 @@ FROM users u
 JOIN posts p ON u.id = p.author_id 
 WHERE u.created_at > {start_date}
 ORDER BY u.name
+"""
+
+# T-HTML template with component syntax
+type thtml = Annotated[Template, "thtml"]
+card: thtml = t"""
+<Card title="{title}">
+    <Badge tone="success">{status}</Badge>
+</Card>
 """
 
 # Type aliases for reusable templates
