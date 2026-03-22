@@ -521,6 +521,513 @@ render_mydsl(config)
 }
 
 #[test]
+fn check_reports_diagnostics_via_installed_package_relative_reexport() {
+    let dir = test_dir("installed-package-relative-reexport-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        "from .impl import render_yaml\n",
+    );
+    write_file(
+        &site_packages.join("typed_api").join("impl.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typed_api import render_yaml
+
+config = t"name: bad: {name}"
+render_yaml(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "broken.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "yaml");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_unresolved_relative_import_does_not_infer_language() {
+    let dir = test_dir("unresolved-relative-import-check");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from .typed_api import render_yaml
+
+config = t"name: bad: {name}"
+render_yaml(config)
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+    assert_eq!(json["summary"]["templates_scanned"], 1);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_invalid_relative_import_in_installed_module_does_not_infer_language() {
+    let dir = test_dir("invalid-relative-import-in-installed-module-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        "from .fallback import render_yaml\n",
+    );
+    write_file(
+        &dir.join("fallback.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typed_api import render_yaml
+
+config = t"name: bad: {name}"
+render_yaml(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "ok.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+    assert_eq!(json["summary"]["templates_scanned"], 1);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_diagnostics_via_installed_package_parent_relative_reexport() {
+    let dir = test_dir("installed-package-parent-relative-reexport-check");
+    let site_packages = dir.join("site-packages");
+    write_file(&site_packages.join("typed_api").join("__init__.py"), "");
+    write_file(
+        &site_packages.join("typed_api").join("sub").join("__init__.py"),
+        "from ..impl import render_yaml\n",
+    );
+    write_file(
+        &site_packages.join("typed_api").join("impl.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typed_api.sub import render_yaml
+
+config = t"name: bad: {name}"
+render_yaml(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "broken.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "yaml");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_keeps_installed_package_direct_import_after_global_directive() {
+    let dir = test_dir("installed-package-global-directive-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typed_api import render_yaml
+
+def wrapper():
+    global render_yaml
+    name = "api"
+    replicas = 3
+    config = t"""
+service:
+  name: {name}
+  replicas: fdsa fff {replicas}
+"""
+    render_yaml(config)
+    render_yaml = render_yaml
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "broken.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "yaml");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_global_template_assignment_keeps_inferred_language_hint() {
+    let dir = test_dir("installed-package-global-template-hint-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typed_api import render_yaml
+
+config = ""
+
+def wrapper():
+    global config
+    config = t"name: bad: {name}"
+    render_yaml(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "broken.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "yaml");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_keeps_module_scope_import_after_nested_global_directive() {
+    let dir = test_dir("installed-package-nested-global-directive-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typed_api import render_yaml
+
+def outer():
+    render_yaml = None
+
+    def inner():
+        global render_yaml
+        config = t"name: bad: {name}"
+        render_yaml(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "broken.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "yaml");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_keeps_outer_import_after_nonlocal_directive() {
+    let dir = test_dir("installed-package-nonlocal-directive-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"def outer():
+    import typed_api as api
+
+    def inner():
+        nonlocal api
+        config = t"name: bad: {name}"
+        api.render_yaml(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "broken.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "yaml");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_outer_global_directive_does_not_leak_into_inner_local_scope() {
+    let dir = test_dir("installed-package-outer-global-does-not-leak-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_json(template: Annotated[Template, "json"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typed_api import render_json
+
+def outer():
+    global render_json
+
+    def inner():
+        render_json(t"[1,,2]")
+        render_json = None
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "ok.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+    assert_eq!(json["summary"]["templates_scanned"], 1);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_does_not_use_installed_package_direct_import_after_delete_statement() {
+    let dir = test_dir("installed-package-delete-shadow-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typed_api import render_html
+
+del render_html
+page = t'<div class = "x" >{name}</div>'
+render_html(page)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "ok.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+    assert_eq!(json["summary"]["templates_scanned"], 1);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_does_not_use_installed_package_direct_import_after_global_delete_statement() {
+    let dir = test_dir("installed-package-global-delete-shadow-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typed_api import render_html
+
+def wrapper():
+    global render_html
+    del render_html
+    page = t'<div class = "x" >{name}</div>'
+    render_html(page)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "ok.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+    assert_eq!(json["summary"]["templates_scanned"], 1);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_does_not_use_installed_package_module_alias_inside_comprehension_shadow() {
+    let dir = test_dir("installed-package-comprehension-shadow-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("ok.py"),
+        r#"import typed_api
+
+pages = [typed_api.render_html(t'<div class = "x" >{name}</div>') for typed_api in [{}]]
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "ok.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+    assert_eq!(json["summary"]["templates_scanned"], 1);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_uses_installed_package_module_alias_inside_comprehension_iterable() {
+    let dir = test_dir("installed-package-comprehension-iterable-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"import typed_api
+
+pages = [page for typed_api in [typed_api.render_yaml(t"name: bad: {name}")]]
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "broken.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "yaml");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_does_not_use_installed_package_module_alias_when_shadowed_by_parameter() {
     let dir = test_dir("installed-package-parameter-shadowed-check");
     let site_packages = dir.join("site-packages");
@@ -538,6 +1045,46 @@ def render_yaml(template: Annotated[Template, "yaml"]) -> object:
         r#"import typed_api as api
 
 def wrapper(api):
+    config = t"name: bad: {name}"
+    api.render_yaml(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "ok.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+    assert_eq!(json["summary"]["templates_scanned"], 1);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_does_not_use_installed_package_module_alias_when_shadowed_by_except_alias() {
+    let dir = test_dir("installed-package-except-shadowed-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("ok.py"),
+        r#"import typed_api as api
+
+try:
+    pass
+except Exception as api:
     config = t"name: bad: {name}"
     api.render_yaml(config)
 "#,
@@ -578,6 +1125,199 @@ def render_yaml(template: Annotated[Template, "yaml"]) -> object:
 render_yaml = lambda template: template
 config = t"name: bad: {name}"
 render_yaml(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "ok.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+    assert_eq!(json["summary"]["templates_scanned"], 1);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_uses_package_root_after_dotted_import_from_installed_package() {
+    let dir = test_dir("installed-package-dotted-import-package-root-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(&site_packages.join("typed_api").join("submodule.py"), "value = 1\n");
+    write_file(
+        &dir.join("broken.py"),
+        r#"import typed_api.submodule
+
+config = t"name: bad: {name}"
+typed_api.render_yaml(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "broken.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "yaml");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_uses_intermediate_package_after_dotted_import_from_installed_package() {
+    let dir = test_dir("installed-package-dotted-import-intermediate-package-check");
+    let site_packages = dir.join("site-packages");
+    write_file(&site_packages.join("typed_api").join("__init__.py"), "");
+    write_file(
+        &site_packages.join("typed_api").join("subpkg").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &site_packages.join("typed_api").join("subpkg").join("mod.py"),
+        "value = 1\n",
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"import typed_api.subpkg.mod
+
+config = t"name: bad: {name}"
+typed_api.subpkg.render_yaml(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "broken.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "yaml");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_does_not_bind_package_root_after_aliased_dotted_import() {
+    let dir = test_dir("installed-package-aliased-dotted-import-root-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(&site_packages.join("typed_api").join("submodule.py"), "value = 1\n");
+    write_file(
+        &dir.join("ok.py"),
+        r#"import typed_api.submodule as api
+
+config = t"name: bad: {name}"
+typed_api.render_yaml(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "ok.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+    assert_eq!(json["summary"]["templates_scanned"], 1);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_uses_function_local_import_within_scope() {
+    let dir = test_dir("installed-package-function-local-import-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"def outer():
+    import typed_api
+    config = t"name: bad: {name}"
+    typed_api.render_yaml(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "broken.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "yaml");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_function_local_import_does_not_leak_to_module_scope() {
+    let dir = test_dir("installed-package-function-local-import-no-leak-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("ok.py"),
+        r#"def outer():
+    import typed_api
+
+config = t"name: bad: {name}"
+typed_api.render_yaml(config)
 "#,
     );
 

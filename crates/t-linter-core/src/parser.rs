@@ -19,6 +19,7 @@ pub struct ModuleContext {
     pub imports: HashMap<String, String>,
     pub callable_signatures: HashMap<String, CallableSignature>,
     pub local_callable_signature_names: HashSet<String>,
+    imported_module_paths: HashSet<String>,
     scoped_import_bindings: Vec<ScopedImportBinding>,
 }
 
@@ -104,6 +105,19 @@ enum NameBindingKind {
 }
 
 #[derive(Debug, Clone)]
+struct ScopeDirective {
+    scope: ScopeKey,
+    name: String,
+    kind: ScopeDirectiveKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeDirectiveKind {
+    Global,
+    Nonlocal,
+}
+
+#[derive(Debug, Clone)]
 struct NameBinding {
     scope: ScopeKey,
     name: String,
@@ -160,7 +174,8 @@ impl TemplateStringParser {
             .parser
             .parse(source, None)
             .context("Failed to parse source")?;
-        let assignments = collect_variable_assignments(&tree, source)?;
+        let scope_directives = collect_scope_directives(&tree, source)?;
+        let assignments = collect_variable_assignments(&tree, source, &scope_directives)?;
         let name_bindings = collect_name_bindings(&tree, source)?;
 
         let mut context = ModuleContext::default();
@@ -171,6 +186,7 @@ impl TemplateStringParser {
             source,
             &context,
             &assignments,
+            &scope_directives,
             &name_bindings,
         )?;
         self.last_module_context = context.clone();
@@ -183,6 +199,7 @@ impl TemplateStringParser {
             &context,
             &variable_language_hints,
             &assignments,
+            &scope_directives,
             &name_bindings,
         )?;
 
@@ -200,7 +217,7 @@ impl TemplateStringParser {
         context: &mut ModuleContext,
     ) -> Result<()> {
         self.collect_type_aliases(tree, source, context)?;
-        self.collect_imports(tree, source, context)?;
+        self.collect_imports(tree, source, context, None, false)?;
         self.collect_local_callable_signatures(tree, source, context)?;
         self.collect_imported_callable_signatures(context)?;
         Ok(())
@@ -316,6 +333,8 @@ impl TemplateStringParser {
         tree: &Tree,
         source: &str,
         context: &mut ModuleContext,
+        current_module_name: Option<&str>,
+        current_module_is_package: bool,
     ) -> Result<()> {
         let query_str = r#"
         ; Import statements
@@ -328,11 +347,17 @@ impl TemplateStringParser {
                 alias: (identifier) @import_alias))
 
         (import_from_statement
-            module_name: (dotted_name)? @module_name
+            module_name: [
+                (dotted_name)
+                (relative_import)
+            ] @module_name
             name: (dotted_name) @import_name)
 
         (import_from_statement
-            module_name: (dotted_name)? @module_name
+            module_name: [
+                (dotted_name)
+                (relative_import)
+            ] @module_name
             (aliased_import
                 name: (dotted_name) @import_name
                 alias: (identifier) @import_alias))
@@ -347,6 +372,7 @@ impl TemplateStringParser {
 
         while let Some(match_) = matches.next() {
             let mut module_name = None;
+            let mut has_module_name_capture = false;
             let mut import_name = None;
             let mut import_name_node = None;
             let mut import_alias = None;
@@ -354,7 +380,14 @@ impl TemplateStringParser {
             for capture in match_.captures {
                 let name = query.capture_names()[capture.index as usize];
                 match name {
-                    "module_name" => module_name = Some(capture.node.utf8_text(source.as_bytes())?),
+                    "module_name" => {
+                        has_module_name_capture = true;
+                        module_name = resolve_import_module_name(
+                            capture.node.utf8_text(source.as_bytes())?,
+                            current_module_name,
+                            current_module_is_package,
+                        );
+                    }
                     "import_name" => {
                         import_name = Some(capture.node.utf8_text(source.as_bytes())?);
                         import_name_node = Some(capture.node);
@@ -365,6 +398,10 @@ impl TemplateStringParser {
                     }
                     _ => {}
                 }
+            }
+
+            if has_module_name_capture && module_name.is_none() {
+                continue;
             }
 
             if let Some(import) = import_name {
@@ -379,8 +416,10 @@ impl TemplateStringParser {
 
                 let value = if let Some(module) = module_name {
                     format!("{}.{}", module, import)
-                } else {
+                } else if import_alias.is_some() {
                     import.to_string()
+                } else {
+                    import.split('.').next().unwrap_or(import).to_string()
                 };
 
                 if let Some(binding_node) = import_alias_node.or(import_name_node) {
@@ -393,6 +432,12 @@ impl TemplateStringParser {
                     });
                     if matches!(scope.kind, ScopeKind::Module) {
                         context.imports.insert(key, value);
+                    }
+                }
+
+                if !is_from_import {
+                    for module_path in imported_module_paths_for(import) {
+                        context.imported_module_paths.insert(module_path);
                     }
                 }
             }
@@ -611,6 +656,23 @@ impl TemplateStringParser {
             }
         }
 
+        for import_path in context.imported_module_paths.clone() {
+            if !should_resolve_imported_signatures(&import_path) {
+                continue;
+            }
+
+            if let Some(module_signatures) =
+                self.load_imported_module_signatures(&import_path, &mut module_cache)?
+            {
+                for (callable_name, signatures) in module_signatures {
+                    context
+                        .callable_signatures
+                        .entry(format!("{import_path}.{callable_name}"))
+                        .or_insert(signatures);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -666,7 +728,13 @@ impl TemplateStringParser {
         let imported_signatures = (|| -> Result<HashMap<String, CallableSignature>> {
             let mut imported_context = ModuleContext::default();
             self.collect_type_aliases(&tree, &source, &mut imported_context)?;
-            self.collect_imports(&tree, &source, &mut imported_context)?;
+            self.collect_imports(
+                &tree,
+                &source,
+                &mut imported_context,
+                Some(module_name),
+                is_package_init_path(&module_path),
+            )?;
             self.collect_local_callable_signatures(&tree, &source, &mut imported_context)?;
             self.collect_imported_callable_signatures(&mut imported_context)?;
             Ok(imported_context.callable_signatures)
@@ -696,6 +764,7 @@ impl TemplateStringParser {
         source: &str,
         context: &ModuleContext,
         assignments: &[VariableAssignment],
+        scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
     ) -> Result<HashMap<AssignmentKey, String>> {
         let query_str = r#"
@@ -739,6 +808,7 @@ impl TemplateStringParser {
                 source,
                 context,
                 assignments,
+                scope_directives,
                 name_bindings,
             )?
             else {
@@ -758,7 +828,12 @@ impl TemplateStringParser {
                     continue;
                 };
                 let Some(binding) =
-                    resolve_assignment_for_identifier(argument.value, source, &assignments)?
+                    resolve_assignment_for_identifier(
+                        argument.value,
+                        source,
+                        &assignments,
+                        scope_directives,
+                    )?
                 else {
                     continue;
                 };
@@ -795,6 +870,7 @@ impl TemplateStringParser {
         context: &ModuleContext,
         variable_language_hints: &HashMap<AssignmentKey, String>,
         assignments: &[VariableAssignment],
+        scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
     ) -> Result<()> {
         let query_str = r#"
@@ -878,6 +954,7 @@ impl TemplateStringParser {
                             context,
                             variable_language_hints,
                             assignments,
+                            scope_directives,
                             name_bindings,
                         )?;
                         templates.push(info);
@@ -900,6 +977,7 @@ impl TemplateStringParser {
         context: &ModuleContext,
         variable_language_hints: &HashMap<AssignmentKey, String>,
         assignments: &[VariableAssignment],
+        scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
     ) -> Result<TemplateStringInfo> {
         let start_position = node.start_position();
@@ -936,6 +1014,7 @@ impl TemplateStringParser {
                 source,
                 context,
                 assignments,
+                scope_directives,
                 name_bindings,
             )?
         } else {
@@ -943,7 +1022,8 @@ impl TemplateStringParser {
         };
         if language.is_none() {
             if let Some(var_node) = var_name_node
-                && let Some(binding) = assignment_key_for_node(var_node, source)
+                && let Some(binding) =
+                    assignment_key_for_node_with_directives(var_node, source, scope_directives)
             {
                 language = variable_language_hints.get(&binding).cloned();
             }
@@ -1265,6 +1345,7 @@ impl TemplateStringParser {
         source: &str,
         context: &ModuleContext,
         assignments: &[VariableAssignment],
+        scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
     ) -> Result<Option<String>> {
         let callee_node = string_node
@@ -1284,6 +1365,7 @@ impl TemplateStringParser {
             source,
             context,
             assignments,
+            scope_directives,
             name_bindings,
         )?
         else {
@@ -1321,11 +1403,34 @@ impl TemplateStringParser {
         source: &str,
         context: &'a ModuleContext,
         assignments: &[VariableAssignment],
+        scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
     ) -> Result<Option<&'a CallableSignature>> {
         if let Some(signatures) = context.callable_signatures.get(callee) {
             if callee.contains('.') {
-                if module_reference_is_shadowed(callee_node, source, assignments, name_bindings)? {
+                if module_reference_is_shadowed(
+                    callee_node,
+                    source,
+                    assignments,
+                    scope_directives,
+                    name_bindings,
+                )? {
+                    return Ok(None);
+                }
+                let Some(root_identifier) = callee_node.and_then(root_identifier_node) else {
+                    return Ok(None);
+                };
+                let import_target = resolve_import_target_for_identifier(
+                    root_identifier,
+                    source,
+                    scope_directives,
+                    &context.scoped_import_bindings,
+                )?
+                .or_else(|| context.imports.get(root_identifier_text(callee)).cloned());
+                let Some(import_target) = import_target else {
+                    return Ok(None);
+                };
+                if !callable_matches_import_target(callee, &import_target) {
                     return Ok(None);
                 }
             } else if context.imports.contains_key(callee)
@@ -1333,6 +1438,7 @@ impl TemplateStringParser {
                     callee_node,
                     source,
                     assignments,
+                    scope_directives,
                     name_bindings,
                     context.local_callable_signature_names.contains(callee),
                 )?
@@ -1345,7 +1451,13 @@ impl TemplateStringParser {
         let Some((base, member)) = callee.split_once('.') else {
             return Ok(None);
         };
-        if module_reference_is_shadowed(callee_node, source, assignments, name_bindings)? {
+        if module_reference_is_shadowed(
+            callee_node,
+            source,
+            assignments,
+            scope_directives,
+            name_bindings,
+        )? {
             return Ok(None);
         }
         let import_target =
@@ -1353,6 +1465,7 @@ impl TemplateStringParser {
                 resolve_import_target_for_identifier(
                     root_identifier,
                     source,
+                    scope_directives,
                     &context.scoped_import_bindings,
                 )?
             } else {
@@ -1406,6 +1519,71 @@ impl TemplateStringParser {
 
         Ok(None)
     }
+}
+
+fn resolve_import_module_name(
+    module_name: &str,
+    current_module_name: Option<&str>,
+    current_module_is_package: bool,
+) -> Option<String> {
+    if !module_name.starts_with('.') {
+        return Some(module_name.to_string());
+    }
+
+    let current_module_name = current_module_name?;
+    let leading_dots = module_name.bytes().take_while(|byte| *byte == b'.').count();
+    let remainder = module_name[leading_dots..]
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    let mut package_segments = current_module_name
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if !current_module_is_package {
+        package_segments.pop()?;
+        if package_segments.is_empty() {
+            return None;
+        }
+    }
+
+    let levels_up = leading_dots.saturating_sub(1);
+    if levels_up > package_segments.len() {
+        return None;
+    }
+    package_segments.truncate(package_segments.len() - levels_up);
+
+    if package_segments.is_empty() && remainder.is_empty() {
+        return None;
+    }
+
+    package_segments.extend(remainder);
+    Some(package_segments.join("."))
+}
+
+fn imported_module_paths_for(import_path: &str) -> Vec<String> {
+    let segments = import_path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return Vec::new();
+    }
+
+    let mut paths = Vec::with_capacity(segments.len());
+    for index in 1..=segments.len() {
+        paths.push(segments[..index].join("."));
+    }
+    paths
+}
+
+fn root_identifier_text(callee: &str) -> &str {
+    callee.split('.').next().unwrap_or(callee)
+}
+
+fn callable_matches_import_target(callee: &str, import_target: &str) -> bool {
+    callee == import_target || callee.starts_with(&format!("{import_target}."))
 }
 
 impl TemplateStringParser {
@@ -1651,10 +1829,17 @@ fn is_float_literal(value: &str) -> bool {
     value.contains('.') && value.parse::<f64>().is_ok()
 }
 
-fn collect_variable_assignments(tree: &Tree, source: &str) -> Result<Vec<VariableAssignment>> {
+fn collect_variable_assignments(
+    tree: &Tree,
+    source: &str,
+    scope_directives: &[ScopeDirective],
+) -> Result<Vec<VariableAssignment>> {
     let query_str = r#"
     (assignment
         left: (identifier) @var_name)
+
+    (delete_statement
+        (_) @delete_target)
     "#;
 
     let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_str)
@@ -1665,17 +1850,101 @@ fn collect_variable_assignments(tree: &Tree, source: &str) -> Result<Vec<Variabl
 
     while let Some(match_) = matches.next() {
         for capture in match_.captures {
-            if query.capture_names()[capture.index as usize] != "var_name" {
-                continue;
-            }
-            if let Some(key) = assignment_key_for_node(capture.node, source) {
-                assignments.push(VariableAssignment { key });
+            match query.capture_names()[capture.index as usize] {
+                "var_name" => {
+                    if let Some(key) =
+                        assignment_key_for_node_with_directives(capture.node, source, scope_directives)
+                    {
+                        assignments.push(VariableAssignment { key });
+                    }
+                }
+                "delete_target" => {
+                    collect_target_assignment_entries(
+                        capture.node,
+                        source,
+                        scope_directives,
+                        &mut assignments,
+                    );
+                }
+                _ => {}
             }
         }
     }
 
     assignments.sort_by_key(|assignment| assignment.key.assignment_start);
     Ok(assignments)
+}
+
+fn collect_target_assignment_entries(
+    node: Node,
+    source: &str,
+    scope_directives: &[ScopeDirective],
+    assignments: &mut Vec<VariableAssignment>,
+) {
+    match node.kind() {
+        "identifier" | "keyword_identifier" => {
+            if let Some(key) =
+                assignment_key_for_node_with_directives(node, source, scope_directives)
+            {
+                assignments.push(VariableAssignment { key });
+            }
+        }
+        "tuple"
+        | "list"
+        | "expression_list"
+        | "parenthesized_expression"
+        | "tuple_pattern"
+        | "list_pattern"
+        | "pattern_list"
+        | "list_splat_pattern"
+        | "dictionary_splat_pattern" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_target_assignment_entries(child, source, scope_directives, assignments);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_scope_directives(tree: &Tree, source: &str) -> Result<Vec<ScopeDirective>> {
+    let query_str = r#"
+    (global_statement
+        (identifier) @directive_name)
+
+    (nonlocal_statement
+        (identifier) @directive_name)
+    "#;
+
+    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_str)
+        .context("Failed to create scope directive query")?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut directives = Vec::new();
+
+    while let Some(match_) = matches.next() {
+        for capture in match_.captures {
+            let kind = match query.capture_names()[capture.index as usize] {
+                "directive_name" => match capture.node.parent().map(|node| node.kind()) {
+                    Some("global_statement") => ScopeDirectiveKind::Global,
+                    Some("nonlocal_statement") => ScopeDirectiveKind::Nonlocal,
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let scope = enclosing_scope(capture.node);
+            if !matches!(scope.kind, ScopeKind::FunctionLike) {
+                continue;
+            }
+            directives.push(ScopeDirective {
+                scope,
+                name: capture.node.utf8_text(source.as_bytes())?.to_string(),
+                kind,
+            });
+        }
+    }
+
+    Ok(directives)
 }
 
 fn collect_name_bindings(tree: &Tree, source: &str) -> Result<Vec<NameBinding>> {
@@ -1905,6 +2174,21 @@ fn collect_target_name_bindings(
     Ok(())
 }
 
+fn target_binds_name(node: Node, source: &str, name: &str) -> Result<bool> {
+    match node.kind() {
+        "identifier" | "keyword_identifier" => Ok(node.utf8_text(source.as_bytes())? == name),
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if target_binds_name(child, source, name)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+}
+
 fn scope_containing_definition(definition_node: Node) -> ScopeKey {
     let mut current = definition_node.parent();
     while let Some(candidate) = current {
@@ -1929,9 +2213,10 @@ fn resolve_assignment_for_identifier(
     identifier: Node,
     source: &str,
     assignments: &[VariableAssignment],
+    scope_directives: &[ScopeDirective],
 ) -> Result<Option<VariableAssignment>> {
     let name = identifier.utf8_text(source.as_bytes())?;
-    let scope_chain = scope_chain(identifier);
+    let scope_chain = filtered_scope_chain(identifier, name, scope_directives);
     let use_position = identifier.start_byte();
 
     for scope in &scope_chain {
@@ -1939,7 +2224,7 @@ fn resolve_assignment_for_identifier(
             assignment.key.name == name
                 && assignment.key.scope_start == scope.start
                 && assignment.key.scope_end == scope.end
-                && (matches!(scope.kind, ScopeKind::FunctionLike)
+                && (scope_uses_function_like_binding_rules(scope.kind)
                     || assignment.key.assignment_start < use_position)
         }) {
             return Ok(Some(assignment.clone()));
@@ -1953,9 +2238,10 @@ fn resolve_name_binding_for_identifier(
     identifier: Node,
     source: &str,
     bindings: &[NameBinding],
+    scope_directives: &[ScopeDirective],
 ) -> Result<Option<NameBindingKind>> {
     let name = identifier.utf8_text(source.as_bytes())?;
-    let scope_chain = scope_chain(identifier);
+    let scope_chain = filtered_scope_chain(identifier, name, scope_directives);
     let use_position = identifier.start_byte();
 
     for scope in &scope_chain {
@@ -1963,7 +2249,7 @@ fn resolve_name_binding_for_identifier(
             binding.name == name
                 && binding.scope.start == scope.start
                 && binding.scope.end == scope.end
-                && (matches!(scope.kind, ScopeKind::FunctionLike)
+                && (scope_uses_function_like_binding_rules(scope.kind)
                     || binding.binding_start < use_position)
         }) {
             return Ok(Some(binding.kind));
@@ -1976,10 +2262,11 @@ fn resolve_name_binding_for_identifier(
 fn resolve_import_target_for_identifier(
     identifier: Node,
     source: &str,
+    scope_directives: &[ScopeDirective],
     bindings: &[ScopedImportBinding],
 ) -> Result<Option<String>> {
     let name = identifier.utf8_text(source.as_bytes())?;
-    let scope_chain = scope_chain(identifier);
+    let scope_chain = filtered_scope_chain(identifier, name, scope_directives);
     let use_position = identifier.start_byte();
 
     for scope in &scope_chain {
@@ -1987,7 +2274,7 @@ fn resolve_import_target_for_identifier(
             binding.name == name
                 && binding.scope.start == scope.start
                 && binding.scope.end == scope.end
-                && (matches!(scope.kind, ScopeKind::FunctionLike)
+                && (scope_uses_function_like_binding_rules(scope.kind)
                     || binding.binding_start < use_position)
         }) {
             return Ok(Some(binding.import_target.clone()));
@@ -1997,9 +2284,16 @@ fn resolve_import_target_for_identifier(
     Ok(None)
 }
 
-fn assignment_key_for_node(identifier: Node, source: &str) -> Option<AssignmentKey> {
+fn assignment_key_for_node_with_directives(
+    identifier: Node,
+    source: &str,
+    scope_directives: &[ScopeDirective],
+) -> Option<AssignmentKey> {
     let name = identifier.utf8_text(source.as_bytes()).ok()?.to_string();
-    let scope = enclosing_scope(identifier);
+    let scope = filtered_scope_chain(identifier, &name, scope_directives)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| enclosing_scope(identifier));
     Some(AssignmentKey {
         scope_start: scope.start,
         scope_end: scope.end,
@@ -2051,6 +2345,49 @@ fn scope_chain(node: Node) -> Vec<ScopeKey> {
     }
 
     scopes
+}
+
+fn filtered_scope_chain(
+    node: Node,
+    name: &str,
+    scope_directives: &[ScopeDirective],
+) -> Vec<ScopeKey> {
+    let mut scopes = scope_chain(node);
+
+    loop {
+        let Some((index, scope)) = scopes
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, scope)| matches!(scope.kind, ScopeKind::FunctionLike))
+        else {
+            return scopes;
+        };
+
+        let directive_kind = scope_directives.iter().find_map(|directive| {
+            (directive.name == name
+                && directive.scope.start == scope.start
+                && directive.scope.end == scope.end)
+                .then_some(directive.kind)
+        });
+
+        match directive_kind {
+            Some(ScopeDirectiveKind::Global) => {
+                return scopes
+                    .into_iter()
+                    .filter(|scope| matches!(scope.kind, ScopeKind::Module))
+                    .collect();
+            }
+            Some(ScopeDirectiveKind::Nonlocal) => {
+                scopes.remove(index);
+            }
+            None => return scopes,
+        }
+    }
+}
+
+fn scope_uses_function_like_binding_rules(kind: ScopeKind) -> bool {
+    matches!(kind, ScopeKind::FunctionLike)
 }
 
 pub(crate) fn enclosing_scope(node: Node) -> ScopeKey {
@@ -2273,6 +2610,7 @@ fn module_reference_is_shadowed(
     callee_node: Option<Node>,
     source: &str,
     assignments: &[VariableAssignment],
+    scope_directives: &[ScopeDirective],
     name_bindings: &[NameBinding],
 ) -> Result<bool> {
     let Some(callee_node) = callee_node else {
@@ -2282,12 +2620,27 @@ fn module_reference_is_shadowed(
         return Ok(false);
     };
 
-    if resolve_assignment_for_identifier(root_identifier, source, assignments)?.is_some() {
+    if resolve_assignment_for_identifier(root_identifier, source, assignments, scope_directives)?
+        .is_some()
+    {
+        return Ok(true);
+    }
+
+    if comprehension_target_shadows_identifier(root_identifier, source)? {
+        return Ok(true);
+    }
+
+    if except_alias_shadows_identifier(root_identifier, source)? {
         return Ok(true);
     }
 
     Ok(matches!(
-        resolve_name_binding_for_identifier(root_identifier, source, name_bindings)?,
+        resolve_name_binding_for_identifier(
+            root_identifier,
+            source,
+            name_bindings,
+            scope_directives,
+        )?,
         Some(NameBindingKind::Definition | NameBindingKind::Value)
     ))
 }
@@ -2296,6 +2649,7 @@ fn direct_callable_reference_is_shadowed(
     callee_node: Option<Node>,
     source: &str,
     assignments: &[VariableAssignment],
+    scope_directives: &[ScopeDirective],
     name_bindings: &[NameBinding],
     has_local_callable_signature: bool,
 ) -> Result<bool> {
@@ -2306,12 +2660,27 @@ fn direct_callable_reference_is_shadowed(
         return Ok(false);
     };
 
-    if resolve_assignment_for_identifier(identifier, source, assignments)?.is_some() {
+    if resolve_assignment_for_identifier(identifier, source, assignments, scope_directives)?
+        .is_some()
+    {
+        return Ok(true);
+    }
+
+    if comprehension_target_shadows_identifier(identifier, source)? {
+        return Ok(true);
+    }
+
+    if except_alias_shadows_identifier(identifier, source)? {
         return Ok(true);
     }
 
     Ok(
-        match resolve_name_binding_for_identifier(identifier, source, name_bindings)? {
+        match resolve_name_binding_for_identifier(
+            identifier,
+            source,
+            name_bindings,
+            scope_directives,
+        )? {
             Some(NameBindingKind::Value) => true,
             Some(NameBindingKind::Definition) => !has_local_callable_signature,
             _ => false,
@@ -2328,6 +2697,92 @@ fn root_identifier_node(node: Node) -> Option<Node> {
             _ => return None,
         }
     }
+}
+
+fn is_comprehension_node(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        "list_comprehension"
+            | "dictionary_comprehension"
+            | "set_comprehension"
+            | "generator_expression"
+    )
+}
+
+fn node_contains(ancestor: Node, descendant: Node) -> bool {
+    ancestor.start_byte() <= descendant.start_byte() && descendant.end_byte() <= ancestor.end_byte()
+}
+
+fn comprehension_target_shadows_identifier(identifier: Node, source: &str) -> Result<bool> {
+    let name = identifier.utf8_text(source.as_bytes())?;
+    let mut current = identifier.parent();
+
+    while let Some(node) = current {
+        if is_comprehension_node(node) {
+            let mut clauses = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "for_in_clause" {
+                    clauses.push(child);
+                }
+            }
+
+            let containing_right_index = clauses.iter().position(|clause| {
+                clause
+                    .child_by_field_name("right")
+                    .is_some_and(|right| node_contains(right, identifier))
+            });
+
+            for (index, clause) in clauses.into_iter().enumerate() {
+                if containing_right_index.is_some_and(|limit| index >= limit) {
+                    break;
+                }
+                let Some(left) = clause.child_by_field_name("left") else {
+                    continue;
+                };
+                if target_binds_name(left, source, name)? {
+                    return Ok(true);
+                }
+            }
+        }
+        current = node.parent();
+    }
+
+    Ok(false)
+}
+
+fn except_clause_alias_node(node: Node) -> Option<Node> {
+    if let Some(alias) = node.child_by_field_name("alias") {
+        return Some(alias);
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "as_pattern" {
+            return child.child_by_field_name("alias").or(Some(child));
+        }
+    }
+
+    None
+}
+
+fn except_alias_shadows_identifier(identifier: Node, source: &str) -> Result<bool> {
+    let name = identifier.utf8_text(source.as_bytes())?;
+    let use_position = identifier.start_byte();
+    let mut current = identifier.parent();
+
+    while let Some(node) = current {
+        if node.kind() == "except_clause"
+            && let Some(alias) = except_clause_alias_node(node)
+            && alias.start_byte() < use_position
+            && target_binds_name(alias, source, name)?
+        {
+            return Ok(true);
+        }
+        current = node.parent();
+    }
+
+    Ok(false)
 }
 
 fn parameter_pattern_name_node(node: Node) -> Option<Node> {
@@ -2368,6 +2823,13 @@ fn preferred_stub_path(path: &Path) -> Option<PathBuf> {
     }
 
     None
+}
+
+fn is_package_init_path(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("__init__.py" | "__init__.pyi")
+    )
 }
 
 fn resolve_local_module_path(search_root: &Path, module_name: &str) -> Option<PathBuf> {
@@ -3596,6 +4058,141 @@ api.render_yaml(config)
     }
 
     #[test]
+    fn test_installed_package_relative_reexport_annotation_propagates_to_template_variable() {
+        let dir = parser_test_dir("installed-package-relative-reexport");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api").join("__init__.py"),
+            "from .impl import render_yaml\n",
+        );
+        write_file(
+            &site_packages.join("typed_api").join("impl.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+from typed_api import render_yaml
+
+config = t"name: bad: {name}"
+render_yaml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_unresolved_relative_import_does_not_infer_language() {
+        let dir = parser_test_dir("unresolved-relative-import");
+        let source = r#"
+from .typed_api import render_yaml
+
+config = t"name: bad: {name}"
+render_yaml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, None);
+    }
+
+    #[test]
+    fn test_invalid_relative_import_in_installed_module_does_not_infer_language() {
+        let dir = parser_test_dir("invalid-relative-import-in-installed-module");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api.py"),
+            "from .fallback import render_yaml\n",
+        );
+        write_file(
+            &dir.join("fallback.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+from typed_api import render_yaml
+
+config = t"name: bad: {name}"
+render_yaml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, None);
+    }
+
+    #[test]
+    fn test_installed_package_parent_relative_reexport_annotation_propagates_to_template_variable()
+    {
+        let dir = parser_test_dir("installed-package-parent-relative-reexport");
+        let site_packages = project_site_packages(&dir);
+        write_file(&site_packages.join("typed_api").join("__init__.py"), "");
+        write_file(
+            &site_packages.join("typed_api").join("sub").join("__init__.py"),
+            "from ..impl import render_yaml\n",
+        );
+        write_file(
+            &site_packages.join("typed_api").join("impl.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+from typed_api.sub import render_yaml
+
+config = t"name: bad: {name}"
+render_yaml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
     fn test_installed_package_is_found_via_ancestor_virtualenv_root() {
         let dir = parser_test_dir("installed-package-ancestor-venv");
         let site_packages = project_site_packages(&dir);
@@ -3692,6 +4289,185 @@ typed_api.submodule.render_yaml(config)
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].variable_name, Some("config".to_string()));
         assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_installed_package_dotted_import_keeps_package_root_binding() {
+        let dir = parser_test_dir("installed-package-dotted-import-package-root");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api").join("__init__.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+        write_file(
+            &site_packages.join("typed_api").join("submodule.py"),
+            "value = 1\n",
+        );
+
+        let source = r#"
+import typed_api.submodule
+
+config = t"name: bad: {name}"
+typed_api.render_yaml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_installed_package_dotted_import_keeps_intermediate_package_binding() {
+        let dir = parser_test_dir("installed-package-dotted-import-intermediate-package");
+        let site_packages = project_site_packages(&dir);
+        write_file(&site_packages.join("typed_api").join("__init__.py"), "");
+        write_file(
+            &site_packages.join("typed_api").join("subpkg").join("__init__.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+        write_file(
+            &site_packages.join("typed_api").join("subpkg").join("mod.py"),
+            "value = 1\n",
+        );
+
+        let source = r#"
+import typed_api.subpkg.mod
+
+config = t"name: bad: {name}"
+typed_api.subpkg.render_yaml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_aliased_dotted_import_does_not_bind_installed_package_root() {
+        let dir = parser_test_dir("installed-package-aliased-dotted-import-root-shadow");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api").join("__init__.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+        write_file(
+            &site_packages.join("typed_api").join("submodule.py"),
+            "value = 1\n",
+        );
+
+        let source = r#"
+import typed_api.submodule as api
+
+config = t"name: bad: {name}"
+typed_api.render_yaml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, None);
+    }
+
+    #[test]
+    fn test_function_local_import_infers_installed_package_module_alias_within_scope() {
+        let dir = parser_test_dir("installed-package-function-local-import");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api").join("__init__.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+def outer():
+    import typed_api
+    config = t"name: bad: {name}"
+    typed_api.render_yaml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_function_local_import_does_not_leak_to_module_scope() {
+        let dir = parser_test_dir("installed-package-function-local-import-no-leak");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api").join("__init__.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+def outer():
+    import typed_api
+
+config = t"name: bad: {name}"
+typed_api.render_yaml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, None);
     }
 
     #[test]
@@ -4000,6 +4776,43 @@ with Local() as api:
     }
 
     #[test]
+    fn test_except_alias_shadows_installed_package_module_alias() {
+        let dir = parser_test_dir("installed-package-module-except-shadowed");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api").join("__init__.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+import typed_api as api
+
+try:
+    pass
+except Exception as api:
+    config = t"name: bad: {name}"
+    api.render_yaml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, None);
+    }
+
+
+    #[test]
     fn test_function_parameter_shadows_installed_package_module_alias() {
         let dir = parser_test_dir("installed-package-module-parameter-shadowed");
         let site_packages = project_site_packages(&dir);
@@ -4070,6 +4883,359 @@ def wrapper():
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].variable_name, Some("config".to_string()));
         assert_eq!(templates[0].language, None);
+    }
+
+    #[test]
+    fn test_global_directive_keeps_installed_package_direct_import_in_function_scope() {
+        let dir = parser_test_dir("installed-package-direct-import-global");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+from typed_api import render_yaml
+
+def wrapper():
+    global render_yaml
+    config = t"name: bad: {name}"
+    render_yaml(config)
+    render_yaml = render_yaml
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_global_template_assignment_keeps_inferred_language_hint() {
+        let dir = parser_test_dir("installed-package-global-template-hint");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+from typed_api import render_yaml
+
+config = ""
+
+def wrapper():
+    global config
+    config = t"name: bad: {name}"
+    render_yaml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_global_directive_in_nested_function_keeps_module_scope_import() {
+        let dir = parser_test_dir("installed-package-direct-import-nested-global");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+from typed_api import render_yaml
+
+def outer():
+    render_yaml = None
+
+    def inner():
+        global render_yaml
+        config = t"name: bad: {name}"
+        render_yaml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_nonlocal_directive_keeps_outer_import_binding() {
+        let dir = parser_test_dir("installed-package-direct-import-nonlocal");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+def outer():
+    import typed_api as api
+
+    def inner():
+        nonlocal api
+        config = t"name: bad: {name}"
+        api.render_yaml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_nonlocal_template_assignment_keeps_inferred_language_hint() {
+        let dir = parser_test_dir("installed-package-nonlocal-template-hint");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api").join("__init__.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+import typed_api as api
+
+def outer():
+    config = ""
+
+    def inner():
+        nonlocal config
+        config = t"name: bad: {name}"
+        api.render_yaml(config)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("config".to_string()));
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_outer_global_directive_does_not_leak_into_inner_local_scope() {
+        let dir = parser_test_dir("installed-package-outer-global-does-not-leak");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_json(template: Annotated[Template, "json"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+from typed_api import render_json
+
+def outer():
+    global render_json
+
+    def inner():
+        render_json(t"[1,,2]")
+        render_json = None
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, None);
+    }
+
+    #[test]
+    fn test_delete_statement_shadows_installed_package_direct_import() {
+        let dir = parser_test_dir("installed-package-direct-import-deleted");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+from typed_api import render_html
+
+del render_html
+page = t"<div class = 'x' >{name}</div>"
+render_html(page)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("page".to_string()));
+        assert_eq!(templates[0].language, None);
+    }
+
+    #[test]
+    fn test_global_delete_statement_shadows_installed_package_direct_import() {
+        let dir = parser_test_dir("installed-package-direct-import-global-deleted");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+from typed_api import render_html
+
+def wrapper():
+    global render_html
+    del render_html
+    page = t"<div class = 'x' >{name}</div>"
+    render_html(page)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].variable_name, Some("page".to_string()));
+        assert_eq!(templates[0].language, None);
+    }
+
+    #[test]
+    fn test_comprehension_target_shadows_installed_package_module_alias() {
+        let dir = parser_test_dir("installed-package-comprehension-shadowed");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api").join("__init__.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+import typed_api
+
+pages = [typed_api.render_html(t"<div class = 'x' >{name}</div>") for typed_api in [{}]]
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, None);
+    }
+
+    #[test]
+    fn test_comprehension_target_does_not_shadow_iterable_expression() {
+        let dir = parser_test_dir("installed-package-comprehension-iterable");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("typed_api").join("__init__.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+        );
+
+        let source = r#"
+import typed_api
+
+pages = [page for typed_api in [typed_api.render_yaml(t"name: bad: {name}")]]
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
     }
 
     #[test]

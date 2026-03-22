@@ -378,6 +378,610 @@ render_thtml(component_markup)
 }
 
 #[test]
+fn format_skips_unsupported_templates_inferred_via_installed_package_annotations() {
+    let dir = test_dir("installed-package-unsupported-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    let original = r#"from typed_api import render_mydsl
+
+config = t"<value = {name}>"
+render_mydsl(config)
+"#;
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_mydsl(template: Annotated[Template, "mydsl"]) -> object:
+    return None
+"#,
+    );
+    write_file(&path, original);
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(content, original);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_rewrites_template_via_installed_package_relative_reexport() {
+    let dir = test_dir("installed-package-relative-reexport-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        "from .impl import render_yaml\n",
+    );
+    write_file(
+        &site_packages.join("typed_api").join("impl.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &path,
+        r#"from typed_api import render_yaml
+
+config = t"name : {name}"
+render_yaml(config)
+"#,
+    );
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t"name: {name}""#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_unresolved_relative_import_does_not_rewrite_template() {
+    let dir = test_dir("unresolved-relative-import-format");
+    let path = dir.join("example.py");
+    let original = r#"from .typed_api import render_yaml
+
+config = t"name : {name}"
+render_yaml(config)
+"#;
+    write_file(&path, original);
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(content, original);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_invalid_relative_import_in_installed_module_does_not_rewrite_template() {
+    let dir = test_dir("invalid-relative-import-in-installed-module-format");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        "from .fallback import render_yaml\n",
+    );
+    write_file(
+        &dir.join("fallback.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    let path = dir.join("example.py");
+    let original = r#"from typed_api import render_yaml
+
+config = t"name : {name}"
+render_yaml(config)
+"#;
+    write_file(&path, original);
+
+    let output = run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(content, original);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_rewrites_template_via_installed_package_parent_relative_reexport() {
+    let dir = test_dir("installed-package-parent-relative-reexport-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    write_file(&site_packages.join("typed_api").join("__init__.py"), "");
+    write_file(
+        &site_packages.join("typed_api").join("sub").join("__init__.py"),
+        "from ..impl import render_yaml\n",
+    );
+    write_file(
+        &site_packages.join("typed_api").join("impl.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &path,
+        r#"from typed_api.sub import render_yaml
+
+config = t"name : {name}"
+render_yaml(config)
+"#,
+    );
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t"name: {name}""#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_does_not_rewrite_template_after_delete_statement_shadows_import() {
+    let dir = test_dir("installed-package-delete-shadow-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    let original = r#"from typed_api import render_html
+
+del render_html
+page = t'<div class = "x" >{name}</div>'
+render_html(page)
+"#;
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> object:
+    return None
+"#,
+    );
+    write_file(&path, original);
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(content, original);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_does_not_rewrite_template_after_global_delete_statement_shadows_import() {
+    let dir = test_dir("installed-package-global-delete-shadow-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    let original = r#"from typed_api import render_html
+
+def wrapper():
+    global render_html
+    del render_html
+    page = t'<div class = "x" >{name}</div>'
+    render_html(page)
+"#;
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> object:
+    return None
+"#,
+    );
+    write_file(&path, original);
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(content, original);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_does_not_rewrite_template_inside_comprehension_shadow() {
+    let dir = test_dir("installed-package-comprehension-shadow-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    let original = r#"import typed_api
+
+pages = [typed_api.render_html(t'<div class = "x" >{name}</div>') for typed_api in [{}]]
+"#;
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> object:
+    return None
+"#,
+    );
+    write_file(&path, original);
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(content, original);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_rewrites_template_inside_comprehension_iterable() {
+    let dir = test_dir("installed-package-comprehension-iterable-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &path,
+        r#"import typed_api
+
+pages = [page for typed_api in [typed_api.render_html(t'<div class = "x" >{name}</div>')]]
+"#,
+    );
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t'<div class="x">{name}</div>'"#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_uses_package_root_after_dotted_import_from_installed_package() {
+    let dir = test_dir("installed-package-dotted-import-package-root-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(&site_packages.join("typed_api").join("submodule.py"), "value = 1\n");
+    write_file(
+        &path,
+        r#"import typed_api.submodule
+
+config = t"name : {name}"
+typed_api.render_yaml(config)
+"#,
+    );
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t"name: {name}""#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_uses_intermediate_package_after_dotted_import_from_installed_package() {
+    let dir = test_dir("installed-package-dotted-import-intermediate-package-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    write_file(&site_packages.join("typed_api").join("__init__.py"), "");
+    write_file(
+        &site_packages.join("typed_api").join("subpkg").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &site_packages.join("typed_api").join("subpkg").join("mod.py"),
+        "value = 1\n",
+    );
+    write_file(
+        &path,
+        r#"import typed_api.subpkg.mod
+
+config = t"name : {name}"
+typed_api.subpkg.render_yaml(config)
+"#,
+    );
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t"name: {name}""#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_uses_module_scope_import_after_nested_global_directive() {
+    let dir = test_dir("installed-package-nested-global-directive-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &path,
+        r#"from typed_api import render_yaml
+
+def outer():
+    render_yaml = None
+
+    def inner():
+        global render_yaml
+        config = t"name : {name}"
+        render_yaml(config)
+"#,
+    );
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t"name: {name}""#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_uses_outer_import_after_nonlocal_directive() {
+    let dir = test_dir("installed-package-nonlocal-directive-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &path,
+        r#"def outer():
+    import typed_api as api
+
+    def inner():
+        nonlocal api
+        config = t"name : {name}"
+        api.render_yaml(config)
+"#,
+    );
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t"name: {name}""#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_nonlocal_template_assignment_keeps_inferred_language_hint() {
+    let dir = test_dir("installed-package-nonlocal-template-hint-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &path,
+        r#"import typed_api as api
+
+def outer():
+    config = ""
+
+    def inner():
+        nonlocal config
+        config = t"name : {name}"
+        api.render_yaml(config)
+"#,
+    );
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t"name: {name}""#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_outer_global_directive_does_not_leak_into_inner_local_scope() {
+    let dir = test_dir("installed-package-outer-global-does-not-leak-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    let original = r#"from typed_api import render_json
+
+def outer():
+    global render_json
+
+    def inner():
+        render_json(t"[1,,2]")
+        render_json = None
+"#;
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_json(template: Annotated[Template, "json"]) -> object:
+    return None
+"#,
+    );
+    write_file(&path, original);
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(content, original);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_does_not_bind_package_root_after_aliased_dotted_import() {
+    let dir = test_dir("installed-package-aliased-dotted-import-root-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    let original = r#"import typed_api.submodule as api
+
+config = t"name : {name}"
+typed_api.render_yaml(config)
+"#;
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(&site_packages.join("typed_api").join("submodule.py"), "value = 1\n");
+    write_file(&path, original);
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(content, original);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_uses_function_local_import_within_scope() {
+    let dir = test_dir("installed-package-function-local-import-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &path,
+        r#"def outer():
+    import typed_api
+    config = t"name : {name}"
+    typed_api.render_yaml(config)
+"#,
+    );
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t"name: {name}""#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_function_local_import_does_not_leak_to_module_scope() {
+    let dir = test_dir("installed-package-function-local-import-no-leak-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    let original = r#"def outer():
+    import typed_api
+
+config = t"name : {name}"
+typed_api.render_yaml(config)
+"#;
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(&path, original);
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(content, original);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn format_stdin_filename_uses_installed_package_import_inference() {
     let dir = test_dir("installed-package-stdin-format");
     let site_packages = dir.join("site-packages");
