@@ -59,7 +59,8 @@ directory.
 
 ## Line Length
 
-HTML and T-HTML formatting uses the following precedence:
+HTML and T-HTML formatting uses the following precedence. JSON, YAML, and TOML
+formatters ignore `line-length`.
 
 1. `--line-length`
 2. `pyproject.toml` `tool.t-linter.line-length`
