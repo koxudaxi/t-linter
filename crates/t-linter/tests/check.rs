@@ -947,6 +947,37 @@ def render() -> None:
 }
 
 #[test]
+fn check_prefers_static_spread_bindings_from_the_template_scope() {
+    let dir = test_dir("thtml-scope-aware-spread");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str) -> object:
+    return None
+
+props = {"label": "Save"}
+
+def helper() -> None:
+    props = {"disabled": True}
+    return None
+
+template: Annotated[Template, "thtml"] = t"<Button {props} />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_mixed_known_and_unknown_spreads_still_report_known_unexpected_props() {
     let dir = test_dir("thtml-known-and-unknown-spread");
     write_file(
@@ -1133,6 +1164,70 @@ template: Annotated[Template, "html"] = t"<div><"
 
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(json["summary"]["files_scanned"], 1);
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_does_not_infer_html_language_from_unknown_keyword_for_keyword_only_params() {
+    let dir = test_dir("html-keyword-only-no-fallback");
+    write_file(
+        &dir.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_markup(*, template: Annotated[Template, "html"]) -> str:
+    return ""
+"#,
+    );
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typed_api import render_markup
+
+page = t"<div><"
+
+render_markup(markup=page)
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_does_not_infer_html_language_positionally_after_args_splat() {
+    let dir = test_dir("html-varargs-keyword-only");
+    write_file(
+        &dir.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_markup(*args: object, template: Annotated[Template, "html"]) -> str:
+    return ""
+"#,
+    );
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typed_api import render_markup
+
+page = t"<div><"
+
+render_markup(page)
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
     assert_eq!(json["summary"]["diagnostics"], 0);
 
     let _ = fs::remove_dir_all(dir);
