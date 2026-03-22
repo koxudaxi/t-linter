@@ -20,12 +20,12 @@ t-linter provides intelligent syntax highlighting and linting for Python templat
 - **Smart Syntax Highlighting** - Detects embedded languages in `t"..."` strings
 - **Type-based Detection** - Understands `Annotated[Template, "html"]` annotations
 - **Fast** - Built with Rust and Tree-sitter for optimal performance
-- **Extensible** - Support for HTML, SQL, JavaScript, CSS, JSON, YAML, TOML, and more
+- **Extensible** - Support for HTML, T-HTML, SQL, JavaScript, CSS, JSON, YAML, TOML, and more
 
-For JSON, YAML, and TOML, t-linter splits responsibilities:
+For HTML, T-HTML, JSON, YAML, and TOML, t-linter splits responsibilities:
 
 - `semanticTokens`: Tree-sitter only, for low-latency highlighting
-- `check`: strict parsing through the `tstring-json`, `tstring-yaml`, and `tstring-toml` backends
+- `check`: strict parsing through the `tstring-html`, `tstring-thtml`, `tstring-json`, `tstring-yaml`, and `tstring-toml` backends
 - `formatting`: canonical formatting through the same Rust backends
 
 ## Quick Start
@@ -264,7 +264,7 @@ Source: https://t-linter.koxudaxi.dev/usage/cli/check/
 The `check` command validates Python template strings for syntax errors in embedded languages.
 
 `check --format` controls the report output format only. To rewrite supported
-JSON, YAML, and TOML template literals, use [`t-linter format`](./format.md).
+HTML, T-HTML, JSON, YAML, and TOML template literals, use [`t-linter format`](./format.md).
 
 ## Basic Usage
 
@@ -396,6 +396,8 @@ The `format` command rewrites supported Python template strings in place.
 
 Supported formatter backends:
 
+- HTML
+- T-HTML
 - JSON
 - YAML / YML
 - TOML
@@ -473,9 +475,9 @@ The LSP server provides:
 - **Diagnostics** — real-time validation of embedded language syntax (debounced for performance)
 - **Formatting** — canonical formatting of template literals while preserving interpolation expressions like `{name!r:>5}`
 
-For JSON, YAML, and TOML templates:
+For HTML, T-HTML, JSON, YAML, and TOML templates:
 
-- Diagnostics are published from the structured-data backend for strict validation
+- Diagnostics are published from the dedicated Rust backends for strict validation
 - Formatting requests rewrite the whole template literal using the backend formatter
 
 ## Editor Integration
@@ -645,7 +647,7 @@ Source: https://t-linter.koxudaxi.dev/roadmap/
 ## Completed
 
 - **Language Server Protocol (LSP)** — Fully implemented
-- **Syntax Highlighting** — Supports HTML, SQL, JavaScript, CSS, JSON, YAML, TOML
+- **Syntax Highlighting** — Supports HTML, T-HTML, SQL, JavaScript, CSS, JSON, YAML, TOML
 - **Type Alias Support** — Recognizes `type html = Annotated[Template, "html"]`
 - **Linting (`check` command)** — Validate template strings for syntax errors
 

@@ -14,6 +14,7 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 
 ### Supported Languages
 - HTML
+- T-HTML (component-based HTML)
 - SQL
 - JavaScript
 - CSS

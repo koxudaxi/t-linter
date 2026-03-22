@@ -18,12 +18,12 @@ t-linter provides intelligent syntax highlighting and linting for Python templat
 - **Smart Syntax Highlighting** - Detects embedded languages in `t"..."` strings
 - **Type-based Detection** - Understands `Annotated[Template, "html"]` annotations
 - **Fast** - Built with Rust and Tree-sitter for optimal performance
-- **Extensible** - Support for HTML, SQL, JavaScript, CSS, JSON, YAML, TOML, and more
+- **Extensible** - Support for HTML, T-HTML, SQL, JavaScript, CSS, JSON, YAML, TOML, and more
 
-For JSON, YAML, and TOML, t-linter splits responsibilities:
+For HTML, T-HTML, JSON, YAML, and TOML, t-linter splits responsibilities:
 
 - `semanticTokens`: Tree-sitter only, for low-latency highlighting
-- `check`: strict parsing through the `tstring-json`, `tstring-yaml`, and `tstring-toml` backends
+- `check`: strict parsing through the `tstring-html`, `tstring-thtml`, `tstring-json`, `tstring-yaml`, and `tstring-toml` backends
 - `formatting`: canonical formatting through the same Rust backends
 
 ## Quick Start
