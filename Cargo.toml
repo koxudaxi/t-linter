@@ -41,5 +41,5 @@ tstring-json = "0.2.1"
 tstring-toml = "0.2.1"
 tstring-yaml = "0.2.1"
 tstring-syntax = "0.2.1"
-tstring-html = "0.1.3"
-tstring-thtml = "0.1.3"
+tstring-html = { git = "https://github.com/koxudaxi/tstring-html.git", rev = "70db53807b5ee1564edac813bccafa1ca2d9edea" }
+tstring-thtml = { git = "https://github.com/koxudaxi/tstring-html.git", rev = "70db53807b5ee1564edac813bccafa1ca2d9edea" }

@@ -58,9 +58,10 @@ async fn main() {
             paths,
             check,
             stdin_filename,
+            line_length,
         }) => {
             init_logging("off");
-            match t_linter_cli::format(paths, check, stdin_filename) {
+            match t_linter_cli::format(paths, check, stdin_filename, line_length) {
                 Ok(code) => code,
                 Err(error) => {
                     eprintln!("{error}");

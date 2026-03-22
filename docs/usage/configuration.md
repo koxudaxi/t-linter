@@ -8,6 +8,7 @@ Add a `[tool.t-linter]` section to your `pyproject.toml`:
 
 ```toml
 [tool.t-linter]
+line-length = 80
 extend-exclude = ["generated", "vendor"]
 ignore-file = ".t-linterignore"
 ```
@@ -16,6 +17,7 @@ ignore-file = ".t-linterignore"
 
 | Key | Description |
 |-----|-------------|
+| `line-length` | Formatter print width for HTML and T-HTML templates |
 | `exclude` | Override the built-in default excludes |
 | `extend-exclude` | Add more exclude patterns on top of the defaults |
 | `ignore-file` | Path to a gitignore-style ignore file, relative to the project root |

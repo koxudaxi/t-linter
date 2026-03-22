@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use t_linter_core::{find_config_root, load_project_config};
 
 const DEFAULT_EXCLUDES: &[&str] = &[
     ".git",
@@ -39,26 +40,6 @@ pub struct WalkReport {
 pub enum DiscoveryMode {
     Check,
     Format,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct PyprojectToml {
-    tool: Option<ToolSection>,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct ToolSection {
-    #[serde(rename = "t-linter")]
-    t_linter: Option<TLinterConfig>,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct TLinterConfig {
-    exclude: Option<Vec<String>>,
-    #[serde(rename = "extend-exclude")]
-    extend_exclude: Option<Vec<String>>,
-    #[serde(rename = "ignore-file")]
-    ignore_file: Option<String>,
 }
 
 #[derive(Debug)]
@@ -288,20 +269,7 @@ fn display_path_for_child(
 }
 
 fn load_discovery_config(root: &Path) -> Result<DiscoveryConfig> {
-    let pyproject_path = root.join("pyproject.toml");
-    let pyproject = if pyproject_path.is_file() {
-        let content = fs::read_to_string(&pyproject_path)
-            .with_context(|| format!("Failed to read {}", pyproject_path.display()))?;
-        toml::from_str::<PyprojectToml>(&content)
-            .with_context(|| format!("Failed to parse {}", pyproject_path.display()))?
-    } else {
-        PyprojectToml::default()
-    };
-
-    let config = pyproject
-        .tool
-        .and_then(|tool| tool.t_linter)
-        .unwrap_or_default();
+    let config = load_project_config(root)?;
 
     let mut builder = GitignoreBuilder::new(root);
 
@@ -317,9 +285,9 @@ fn load_discovery_config(root: &Path) -> Result<DiscoveryConfig> {
             .with_context(|| format!("Invalid exclude pattern: {pattern}"))?;
     }
 
-    for pattern in config.extend_exclude.unwrap_or_default() {
+    for pattern in &config.extend_exclude {
         builder
-            .add_line(None, &pattern)
+            .add_line(None, pattern)
             .with_context(|| format!("Invalid extend-exclude pattern: {pattern}"))?;
     }
 
@@ -336,15 +304,6 @@ fn load_discovery_config(root: &Path) -> Result<DiscoveryConfig> {
         root: root.to_path_buf(),
         matcher,
     })
-}
-
-fn find_config_root(start_dir: &Path) -> PathBuf {
-    for dir in start_dir.ancestors() {
-        if dir.join("pyproject.toml").is_file() || dir.join(".t-linterignore").is_file() {
-            return dir.to_path_buf();
-        }
-    }
-    start_dir.to_path_buf()
 }
 
 fn should_ignore_path(path: &Path, is_dir: bool, discovery: &DiscoveryConfig) -> bool {

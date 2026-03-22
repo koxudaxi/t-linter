@@ -143,6 +143,141 @@ payload: Annotated[Template, "toml"] = t'title={title}'
 }
 
 #[test]
+fn format_uses_pyproject_line_length_when_cli_override_is_missing() {
+    let dir = test_dir("pyproject-line-length");
+    let path = dir.join("example.py");
+    write_file(
+        &dir.join("pyproject.toml"),
+        "[tool.t-linter]\nline-length = 20\n",
+    );
+    write_file(
+        &path,
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+markup: Annotated[Template, "html"] = t'<div data-a="12345" data-b="67890"></div>'
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains("<div\n  data-a=\"12345\"\n  data-b=\"67890\"\n></div>"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_cli_line_length_overrides_pyproject() {
+    let dir = test_dir("cli-line-length");
+    let path = dir.join("example.py");
+    write_file(
+        &dir.join("pyproject.toml"),
+        "[tool.t-linter]\nline-length = 120\n",
+    );
+    write_file(
+        &path,
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+markup: Annotated[Template, "html"] = t'<div data-a="12345" data-b="67890"></div>'
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "--line-length", "20", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains("<div\n  data-a=\"12345\"\n  data-b=\"67890\"\n></div>"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_cli_line_length_ignores_invalid_pyproject_line_length() {
+    let dir = test_dir("invalid-pyproject-line-length");
+    let path = dir.join("example.py");
+    write_file(
+        &dir.join("pyproject.toml"),
+        "[tool.t-linter]\nline-length = \"bad\"\n",
+    );
+    write_file(
+        &path,
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+markup: Annotated[Template, "html"] = t'<div data-a="12345" data-b="67890"></div>'
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "--line-length", "20", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains("<div\n  data-a=\"12345\"\n  data-b=\"67890\"\n></div>"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_uses_default_line_length_without_config() {
+    let dir = test_dir("default-line-length");
+    let path = dir.join("example.py");
+    write_file(
+        &path,
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+markup: Annotated[Template, "html"] = t'<div data-a="12345" data-b="67890"></div>'
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t'<div data-a="12345" data-b="67890"></div>'"#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_stdin_uses_stdin_filename_to_resolve_config_root() {
+    let dir = test_dir("stdin-line-length");
+    let project = dir.join("project");
+    let runner = dir.join("runner");
+    fs::create_dir_all(&runner).unwrap();
+    write_file(
+        &project.join("pyproject.toml"),
+        "[tool.t-linter]\nline-length = 20\n",
+    );
+
+    let input = br#"from typing import Annotated
+from string.templatelib import Template
+
+markup: Annotated[Template, "html"] = t'<div data-a="12345" data-b="67890"></div>'
+"#;
+
+    let output = run_t_linter(
+        &runner,
+        &[
+            "format",
+            "--stdin-filename",
+            project.join("example.py").to_str().unwrap(),
+            "-",
+        ],
+        Some(input),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout.contains("<div\n  data-a=\"12345\"\n  data-b=\"67890\"\n></div>"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn format_rejects_invalid_stdin_combinations() {
     let dir = test_dir("stdin-invalid");
 
@@ -360,7 +495,9 @@ component_markup: Annotated[Template, "thtml"] = t'<Card title="{title}" disable
     let stderr = String::from_utf8(output.stderr).unwrap();
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(stderr.contains("0 files would be reformatted, 1 files already formatted, 0 inputs failed"));
+    assert!(
+        stderr.contains("0 files would be reformatted, 1 files already formatted, 0 inputs failed")
+    );
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
 
     let _ = fs::remove_dir_all(dir);
@@ -419,7 +556,9 @@ card: Annotated[Template, "thtml"] = t'<Card title = "{title}" ><Badge tone = "o
 
     assert_eq!(output.status.code(), Some(0));
     assert!(content.contains(r#"t'<main class="app">{body}</main>'"#));
-    assert!(content.contains(r#"t'<Card title="{title}"><Badge tone="ok">{status}</Badge></Card>'"#));
+    assert!(
+        content.contains(r#"t'<Card title="{title}"><Badge tone="ok">{status}</Badge></Card>'"#)
+    );
 
     let _ = fs::remove_dir_all(dir);
 }

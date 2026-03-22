@@ -23,6 +23,13 @@ For HTML, T-HTML, JSON, YAML, and TOML templates:
 - Diagnostics are published from the dedicated Rust backends for strict validation
 - Formatting requests rewrite the whole template literal using the backend formatter
 
+For HTML and T-HTML formatting, line length is resolved in this order:
+
+1. `textDocument/formatting` or `textDocument/rangeFormatting` custom option `printWidth`
+2. custom option `lineLength`
+3. `pyproject.toml` `tool.t-linter.line-length`
+4. default `80`
+
 ## Editor Integration
 
 The LSP server can be used with any editor that supports LSP. The VSCode extension uses this server automatically.

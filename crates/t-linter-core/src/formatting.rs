@@ -4,6 +4,17 @@ use anyhow::{Context, Result};
 
 use crate::{Location, TemplateStringInfo, TemplateStringParser};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatOptions {
+    pub line_length: usize,
+}
+
+impl Default for FormatOptions {
+    fn default() -> Self {
+        Self { line_length: 80 }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateEdit {
     pub location: Location,
@@ -11,15 +22,30 @@ pub struct TemplateEdit {
 }
 
 pub fn format_document(source: &str) -> Result<Vec<TemplateEdit>> {
+    format_document_with_options(source, &FormatOptions::default())
+}
+
+pub fn format_document_with_options(
+    source: &str,
+    options: &FormatOptions,
+) -> Result<Vec<TemplateEdit>> {
     let mut parser = TemplateStringParser::new()?;
     let templates = parser.find_template_strings(source)?;
-    format_templates(&templates)
+    format_templates(&templates, options)
 }
 
 pub fn format_document_in_file(source: &str, path: &Path) -> Result<Vec<TemplateEdit>> {
+    format_document_in_file_with_options(source, path, &FormatOptions::default())
+}
+
+pub fn format_document_in_file_with_options(
+    source: &str,
+    path: &Path,
+    options: &FormatOptions,
+) -> Result<Vec<TemplateEdit>> {
     let mut parser = TemplateStringParser::new()?;
     let templates = parser.find_template_strings_in_file(source, path)?;
-    format_templates(&templates)
+    format_templates(&templates, options)
 }
 
 pub fn apply_template_edits(source: &str, edits: &[TemplateEdit]) -> Result<String> {
@@ -87,6 +113,14 @@ pub fn apply_template_edits(source: &str, edits: &[TemplateEdit]) -> Result<Stri
 }
 
 pub fn format_document_range(source: &str, range: &Location) -> Result<Vec<TemplateEdit>> {
+    format_document_range_with_options(source, range, &FormatOptions::default())
+}
+
+pub fn format_document_range_with_options(
+    source: &str,
+    range: &Location,
+    options: &FormatOptions,
+) -> Result<Vec<TemplateEdit>> {
     let mut parser = TemplateStringParser::new()?;
     let templates = parser.find_template_strings(source)?;
 
@@ -104,18 +138,28 @@ pub fn format_document_range(source: &str, range: &Location) -> Result<Vec<Templ
         ));
     }
 
-    format_template_edit(matches[0])
+    format_template_edit(matches[0], options)
         .transpose()
         .map(|edit| edit.into_iter().collect())
 }
 
-fn format_template_edit(template: &TemplateStringInfo) -> Option<Result<TemplateEdit>> {
+fn format_template_edit(
+    template: &TemplateStringInfo,
+    options: &FormatOptions,
+) -> Option<Result<TemplateEdit>> {
     let language = template.language.as_deref()?.to_ascii_lowercase();
     let input = template.to_template_input();
+    let line_length = options.line_length.max(1);
 
     let formatted = match language.as_str() {
-        "html" => tstring_html::format_template(&input),
-        "thtml" => tstring_thtml::format_template(&input),
+        "html" => tstring_html::format_template_with_options(
+            &input,
+            &tstring_html::FormatOptions { line_length },
+        ),
+        "thtml" => tstring_thtml::format_template_with_options(
+            &input,
+            &tstring_html::FormatOptions { line_length },
+        ),
         "json" => tstring_json::format_template(&input),
         "yaml" | "yml" => tstring_yaml::format_template(&input),
         "toml" => tstring_toml::format_template(&input),
@@ -132,10 +176,13 @@ fn format_template_edit(template: &TemplateStringInfo) -> Option<Result<Template
     )
 }
 
-fn format_templates(templates: &[TemplateStringInfo]) -> Result<Vec<TemplateEdit>> {
+fn format_templates(
+    templates: &[TemplateStringInfo],
+    options: &FormatOptions,
+) -> Result<Vec<TemplateEdit>> {
     templates
         .iter()
-        .filter_map(format_template_edit)
+        .filter_map(|template| format_template_edit(template, options))
         .collect::<Result<Vec<_>>>()
 }
 
@@ -262,6 +309,53 @@ config: Annotated[Template, "json"] = t'{"name": {name}}'
         assert_eq!(
             output,
             "title = \"こんにちは\"\r\npayload = t'{\"a\": 1, \"b\": 2}'\r\n"
+        );
+    }
+
+    #[test]
+    fn format_document_with_options_passes_line_length_to_html_backend() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+markup: Annotated[Template, "html"] = t'<div data-a="12345" data-b="67890"></div>'
+"#;
+
+        let edits = format_document_with_options(source, &FormatOptions { line_length: 20 })
+            .expect("expected format success");
+
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0].replacement,
+            "t'''<div\n  data-a=\"12345\"\n  data-b=\"67890\"\n></div>'''"
+        );
+    }
+
+    #[test]
+    fn range_formatting_with_options_reformats_whole_matching_template() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+markup: Annotated[Template, "html"] = t'<div data-a="12345" data-b="67890"></div>'
+"#;
+
+        let edits = format_document_range_with_options(
+            source,
+            &Location {
+                start_line: 5,
+                start_column: 50,
+                end_line: 5,
+                end_column: 55,
+            },
+            &FormatOptions { line_length: 20 },
+        )
+        .expect("expected range format success");
+
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0].replacement,
+            "t'''<div\n  data-a=\"12345\"\n  data-b=\"67890\"\n></div>'''"
         );
     }
 }
