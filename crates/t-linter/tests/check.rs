@@ -24,11 +24,20 @@ fn write_file(path: &Path, contents: &str) {
 }
 
 fn run_check(dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_t-linter"))
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap()
+    run_check_with_pythonpath(dir, args, None)
+}
+
+fn run_check_with_pythonpath(
+    dir: &Path,
+    args: &[&str],
+    pythonpath: Option<&Path>,
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_t-linter"));
+    command.args(args).current_dir(dir);
+    if let Some(pythonpath) = pythonpath {
+        command.env("PYTHONPATH", pythonpath);
+    }
+    command.output().unwrap()
 }
 
 #[test]
@@ -388,6 +397,243 @@ render_html_markup(page)
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(json["summary"]["diagnostics"], 1);
     assert_eq!(json["diagnostics"][0]["rule"], "embedded-parse-error");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_supported_diagnostics_via_installed_package_annotations() {
+    let dir = test_dir("installed-package-supported-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_json(template: Annotated[Template, "json"]) -> object:
+    return None
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+
+def render_toml(template: Annotated[Template, "toml"]) -> object:
+    return None
+
+def render_html(template: Annotated[Template, "html"]) -> object:
+    return None
+
+def render_thtml(template: Annotated[Template, "thtml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typed_api import render_html, render_json, render_thtml, render_toml, render_yaml
+
+name = "api"
+replicas = 3
+
+def Button(*, label: str) -> object:
+    return None
+
+json_payload = t"""[1,,2]"""
+yaml_payload = t"""
+service:
+  name: {name}
+  replicas: fdsa fff {replicas}
+"""
+toml_payload = t"title ="
+html_payload = t"<div><"
+component_payload = t"<Button />"
+
+render_json(json_payload)
+render_yaml(yaml_payload)
+render_toml(toml_payload)
+render_html(html_payload)
+render_thtml(component_payload)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "broken.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let diagnostics = json["diagnostics"].as_array().unwrap();
+    let languages = diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic["language"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let rules = diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic["rule"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 5);
+    assert_eq!(
+        languages,
+        std::collections::BTreeSet::from(["html", "json", "thtml", "toml", "yaml"])
+    );
+    assert!(rules.contains("embedded-parse-error"));
+    assert!(rules.contains("component-missing-prop"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_keeps_unsupported_installed_package_languages_ignored() {
+    let dir = test_dir("installed-package-unsupported-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_mydsl(template: Annotated[Template, "mydsl"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typed_api import render_mydsl
+
+config = t"broken < syntax {value}"
+render_mydsl(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "ok.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+    assert_eq!(json["summary"]["templates_scanned"], 1);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_does_not_use_installed_package_module_alias_when_shadowed_by_parameter() {
+    let dir = test_dir("installed-package-parameter-shadowed-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("ok.py"),
+        r#"import typed_api as api
+
+def wrapper(api):
+    config = t"name: bad: {name}"
+    api.render_yaml(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "ok.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+    assert_eq!(json["summary"]["templates_scanned"], 1);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_does_not_use_installed_package_direct_import_when_shadowed_by_assignment() {
+    let dir = test_dir("installed-package-direct-import-shadowed-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typed_api import render_yaml
+
+render_yaml = lambda template: template
+config = t"name: bad: {name}"
+render_yaml(config)
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "ok.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+    assert_eq!(json["summary"]["templates_scanned"], 1);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_nested_import_does_not_clobber_outer_installed_package_module_alias() {
+    let dir = test_dir("installed-package-nested-import-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api").join("__init__.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_json(template: Annotated[Template, "json"]) -> object:
+    return None
+"#,
+    );
+    write_file(&site_packages.join("other.py"), "value = 1\n");
+    write_file(
+        &dir.join("broken.py"),
+        r#"import typed_api as api
+
+config = t"[1,,2]"
+api.render_json(config)
+
+def wrapper():
+    import other as api
+    return api
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "broken.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "json");
 
     let _ = fs::remove_dir_all(dir);
 }

@@ -27,8 +27,20 @@ fn write_file(path: &Path, contents: &str) {
 }
 
 fn run_t_linter(dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
+    run_t_linter_with_pythonpath(dir, args, stdin, None)
+}
+
+fn run_t_linter_with_pythonpath(
+    dir: &Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    pythonpath: Option<&Path>,
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_t-linter"));
     command.args(args).current_dir(dir);
+    if let Some(pythonpath) = pythonpath {
+        command.env("PYTHONPATH", pythonpath);
+    }
 
     if stdin.is_some() {
         command.stdin(Stdio::piped());
@@ -308,6 +320,99 @@ render_html_markup(page)
 }
 
 #[test]
+fn format_rewrites_supported_templates_inferred_via_installed_package_annotations() {
+    let dir = test_dir("installed-package-format");
+    let site_packages = dir.join("site-packages");
+    let path = dir.join("example.py");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> object:
+    return None
+
+def render_json(template: Annotated[Template, "json"]) -> object:
+    return None
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> object:
+    return None
+
+def render_toml(template: Annotated[Template, "toml"]) -> object:
+    return None
+
+def render_thtml(template: Annotated[Template, "thtml"]) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &path,
+        r#"from typed_api import render_html, render_json, render_thtml, render_toml, render_yaml
+
+html_page = t'<div class = "x" >{name}</div>'
+json_payload = t'[1,{count}]'
+yaml_payload = t"name : {name}"
+toml_payload = t'title={title}'
+component_markup = t'<Card title = "{title}" disabled ></Card>'
+
+render_html(html_page)
+render_json(json_payload)
+render_yaml(yaml_payload)
+render_toml(toml_payload)
+render_thtml(component_markup)
+"#,
+    );
+
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t'<div class="x">{name}</div>'"#));
+    assert!(content.contains(r#"t'[1, {count}]'"#));
+    assert!(content.contains(r#"t"name: {name}""#));
+    assert!(content.contains(r#"t'title = {title}'"#));
+    assert!(content.contains(r#"t'<Card title="{title}" disabled></Card>'"#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_stdin_filename_uses_installed_package_import_inference() {
+    let dir = test_dir("installed-package-stdin-format");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> object:
+    return None
+"#,
+    );
+    let input = br#"from typed_api import render_html
+
+page = t'<div class = "x" >{name}</div>'
+render_html(page)
+"#;
+
+    let output = run_t_linter_with_pythonpath(
+        &dir,
+        &["format", "--stdin-filename", "example.py", "-"],
+        Some(input),
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr.is_empty());
+    assert!(stdout.contains(r#"t'<div class="x">{name}</div>'"#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn format_rewrites_thtml_template_inferred_via_reexported_class_signature() {
     let dir = test_dir("thtml-reexported-format");
     let path = dir.join("example.py");
@@ -360,7 +465,9 @@ component_markup: Annotated[Template, "thtml"] = t'<Card title="{title}" disable
     let stderr = String::from_utf8(output.stderr).unwrap();
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(stderr.contains("0 files would be reformatted, 1 files already formatted, 0 inputs failed"));
+    assert!(
+        stderr.contains("0 files would be reformatted, 1 files already formatted, 0 inputs failed")
+    );
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
 
     let _ = fs::remove_dir_all(dir);
@@ -419,7 +526,9 @@ card: Annotated[Template, "thtml"] = t'<Card title = "{title}" ><Badge tone = "o
 
     assert_eq!(output.status.code(), Some(0));
     assert!(content.contains(r#"t'<main class="app">{body}</main>'"#));
-    assert!(content.contains(r#"t'<Card title="{title}"><Badge tone="ok">{status}</Badge></Card>'"#));
+    assert!(
+        content.contains(r#"t'<Card title="{title}"><Badge tone="ok">{status}</Badge></Card>'"#)
+    );
 
     let _ = fs::remove_dir_all(dir);
 }
