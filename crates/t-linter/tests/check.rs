@@ -332,6 +332,639 @@ render_yaml_data(yaml_template)
 }
 
 #[test]
+fn check_uses_html_backend_semantics_for_raw_text_interpolations() {
+    let dir = test_dir("html-raw-text");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "html"] = t"<script>{code}</script>"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Interpolations are not allowed inside <script>")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_html_parse_errors_via_imported_function_annotation() {
+    let dir = test_dir("html-imported-parse");
+    write_file(
+        &dir.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_markup(template: Annotated[Template, "html"]) -> str:
+    return ""
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typed_api import render_markup as render_html_markup
+
+page = t"<div><"
+
+render_html_markup(page)
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "embedded-parse-error");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_html_raw_text_interpolation_via_reexported_annotation() {
+    let dir = test_dir("html-reexported-raw-text");
+    write_file(
+        &dir.join("bindings.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_markup(template: Annotated[Template, "html"]) -> str:
+    return ""
+"#,
+    );
+    write_file(
+        &dir.join("typed_api.py"),
+        r#"from bindings import render_markup
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typed_api import render_markup as render_html_markup
+
+css = "body { color: red; }"
+page = t"<style>{css}</style>"
+
+render_html_markup(page)
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "embedded-parse-error");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Interpolations are not allowed inside <style>")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_thtml_missing_required_component_props() {
+    let dir = test_dir("thtml-missing-prop");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str) -> object:
+    return None
+
+template: Annotated[Template, "thtml"] = t"<Button />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "component-missing-prop");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing required prop 'label'")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_thtml_unexpected_component_props() {
+    let dir = test_dir("thtml-unexpected-prop");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str) -> object:
+    return None
+
+template: Annotated[Template, "thtml"] = t"<Button label='Save' tone='info' />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "component-unexpected-prop");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not accept prop 'tone'")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_thtml_component_prop_type_errors() {
+    let dir = test_dir("thtml-prop-type");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, disabled: bool = False, count: int = 0) -> object:
+    return None
+
+template: Annotated[Template, "thtml"] = t"""
+<Button disabled="yes" count="{count}" />
+"""
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 2);
+    let rules = json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|diagnostic| diagnostic["rule"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(rules.iter().all(|rule| rule == "component-prop-type-error"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_accepts_thtml_bool_props_and_kwargs_passthrough() {
+    let dir = test_dir("thtml-bool-prop-ok");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, disabled: bool = False, **props) -> object:
+    return None
+
+template: Annotated[Template, "thtml"] = t"<Button disabled tone='info' />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_unresolved_thtml_components() {
+    let dir = test_dir("thtml-unresolved-component");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "thtml"] = t"<MissingCard title='Hello' />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "component-unresolved");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_expands_static_thtml_spread_props() {
+    let dir = test_dir("thtml-static-spread");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str, disabled: bool = False) -> object:
+    return None
+
+props = {"label": "Save", "disabled": "yes", "tone": "info"}
+
+template: Annotated[Template, "thtml"] = t"<Button {props} />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 2);
+    let rules = json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|diagnostic| diagnostic["rule"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(rules.contains(&"component-prop-type-error".to_string()));
+    assert!(rules.contains(&"component-unexpected-prop".to_string()));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_thtml_component_props_via_import_alias_signature() {
+    let dir = test_dir("thtml-import-alias-function");
+    write_file(
+        &dir.join("components.py"),
+        r#"def Button(*, label: str, disabled: bool = False) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+from components import Button as PrimaryButton
+
+template: Annotated[Template, "thtml"] = t"<PrimaryButton disabled='yes' />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 2);
+    let rules = json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|diagnostic| diagnostic["rule"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(rules.contains(&"component-missing-prop".to_string()));
+    assert!(rules.contains(&"component-prop-type-error".to_string()));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_thtml_component_props_via_imported_function_signature() {
+    let dir = test_dir("thtml-imported-function");
+    write_file(
+        &dir.join("components.py"),
+        r#"def Button(*, label: str, disabled: bool = False) -> object:
+    return None
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+from components import Button
+
+template: Annotated[Template, "thtml"] = t"<Button disabled='yes' />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 2);
+    let rules = json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|diagnostic| diagnostic["rule"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(rules.contains(&"component-missing-prop".to_string()));
+    assert!(rules.contains(&"component-prop-type-error".to_string()));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_thtml_component_props_via_reexported_class_signature() {
+    let dir = test_dir("thtml-reexported-class");
+    write_file(
+        &dir.join("ui_impl.py"),
+        r#"class Card:
+    def __init__(self, *, title: str) -> None:
+        self.title = title
+"#,
+    );
+    write_file(
+        &dir.join("ui.py"),
+        r#"from ui_impl import Card
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+from ui import Card
+
+template: Annotated[Template, "thtml"] = t"<Card title='Hello' tone='info' />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "component-unexpected-prop");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_rejects_inline_thtml_dict_spread_syntax() {
+    let dir = test_dir("thtml-inline-spread");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str, disabled: bool = False) -> object:
+    return None
+
+template: Annotated[Template, "thtml"] = t"<Button {{'label': 'Save', 'disabled': 'yes', 'tone': 'info'}} />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "embedded-parse-error");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_uses_latest_static_spread_assignment_before_template() {
+    let dir = test_dir("thtml-spread-reassignment");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str) -> object:
+    return None
+
+props = {"tone": "info"}
+props = {"label": "Save"}
+
+template: Annotated[Template, "thtml"] = t"<Button {props} />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_unknown_thtml_spread_suppresses_missing_required_props() {
+    let dir = test_dir("thtml-unknown-spread");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str) -> object:
+    return None
+
+template: Annotated[Template, "thtml"] = t"<Button {props} tone='info' />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "component-unexpected-prop");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_explicit_prop_after_spread_overrides_static_spread_value() {
+    let dir = test_dir("thtml-spread-explicit-overrides");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str, disabled: bool = False) -> object:
+    return None
+
+props = {"label": "Save", "disabled": "yes"}
+
+template: Annotated[Template, "thtml"] = t"<Button {props} disabled />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_later_static_spread_overrides_earlier_explicit_prop() {
+    let dir = test_dir("thtml-spread-overrides-explicit");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str, disabled: bool = False) -> object:
+    return None
+
+props = {"label": "Save", "disabled": "yes"}
+
+template: Annotated[Template, "thtml"] = t"<Button disabled {props} />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "component-prop-type-error");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_accepts_typed_static_spread_values_for_bool_int_and_none() {
+    let dir = test_dir("thtml-typed-static-spread");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str, disabled: bool = False, count: int = 0, subtitle: str | None = None) -> object:
+    return None
+
+props = {"label": "Save", "disabled": True, "count": 3, "subtitle": None}
+
+template: Annotated[Template, "thtml"] = t"<Button {props} />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_mixed_known_and_unknown_spreads_still_report_known_unexpected_props() {
+    let dir = test_dir("thtml-known-and-unknown-spread");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str) -> object:
+    return None
+
+known = {"tone": "info"}
+
+template: Annotated[Template, "thtml"] = t"<Button {known} {dynamic} />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "component-unexpected-prop");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not accept prop 'tone'")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_unresolved_nested_component_without_flagging_known_siblings() {
+    let dir = test_dir("thtml-nested-unresolved");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Layout(*, children: str | None = None) -> object:
+    return None
+
+def Button(*, label: str) -> object:
+    return None
+
+template: Annotated[Template, "thtml"] = t"""
+<Layout>
+  <MissingCard />
+  <Button label='Save' />
+</Layout>
+"""
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "component-unresolved");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("MissingCard")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_json_recurses_and_skips_default_excludes() {
     let dir = test_dir("json");
     write_file(

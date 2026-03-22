@@ -1,18 +1,27 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
+use tstring_html as backend_html;
+use tstring_html::{Attribute, AttributeLike, Node as HtmlNode};
 use tstring_json as backend_json;
 use tstring_syntax::Diagnostic;
+use tstring_thtml as backend_thtml;
 use tstring_toml as backend_toml;
 use tstring_yaml as backend_yaml;
 
+use crate::parser::{CallableParameter, CallableValueType, ModuleContext};
 use crate::{TemplateStringInfo, TemplateStringParser};
 
 const RULE_EMBEDDED_PARSE_ERROR: &str = "embedded-parse-error";
 const RULE_FILE_READ_ERROR: &str = "file-read-error";
 const RULE_PYTHON_PARSE_ERROR: &str = "python-parse-error";
+const RULE_COMPONENT_MISSING_PROP: &str = "component-missing-prop";
+const RULE_COMPONENT_UNEXPECTED_PROP: &str = "component-unexpected-prop";
+const RULE_COMPONENT_PROP_TYPE_ERROR: &str = "component-prop-type-error";
+const RULE_COMPONENT_UNRESOLVED: &str = "component-unresolved";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,11 +64,54 @@ struct ProcessedTemplate {
     processed_to_original: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct StaticSpreadAnalysis {
+    bindings: std::collections::HashMap<String, Vec<StaticSpreadBinding>>,
+}
+
+#[derive(Debug, Clone)]
+struct StaticSpreadBinding {
+    assignment_start: usize,
+    dict: StaticDictLiteral,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StaticDictLiteral {
+    entries: Vec<StaticDictEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct StaticDictEntry {
+    key: String,
+    value_type: Option<CallableValueType>,
+    accepts_none: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedSpreadEntry {
+    key: String,
+    value_type: Option<CallableValueType>,
+    accepts_none: bool,
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedPropValue {
+    Explicit(Attribute),
+    Spread {
+        key: String,
+        value_type: Option<CallableValueType>,
+        accepts_none: bool,
+        span: Option<tstring_syntax::SourceSpan>,
+    },
+}
+
 pub fn lint_source(path: &Path, source: &str) -> Result<LintFileResult> {
     let python_diagnostic = lint_python_source(path, source)?;
 
     let mut parser = TemplateStringParser::new()?;
     let templates = parser.find_template_strings_in_file(source, path)?;
+    let module_context = parser.module_context().clone();
+    let static_spread_analysis = build_static_spread_analysis(source)?;
 
     let mut diagnostics = Vec::new();
     if let Some(diagnostic) = python_diagnostic {
@@ -67,7 +119,13 @@ pub fn lint_source(path: &Path, source: &str) -> Result<LintFileResult> {
     }
 
     for template in &templates {
-        diagnostics.extend(lint_template(path, template)?);
+        diagnostics.extend(lint_template(
+            path,
+            source,
+            template,
+            &module_context,
+            &static_spread_analysis,
+        )?);
     }
 
     sort_and_dedup_diagnostics(&mut diagnostics);
@@ -129,7 +187,13 @@ fn lint_python_source(path: &Path, source: &str) -> Result<Option<LintDiagnostic
     }))
 }
 
-fn lint_template(path: &Path, template: &TemplateStringInfo) -> Result<Vec<LintDiagnostic>> {
+fn lint_template(
+    path: &Path,
+    source: &str,
+    template: &TemplateStringInfo,
+    module_context: &ModuleContext,
+    static_spread_analysis: &StaticSpreadAnalysis,
+) -> Result<Vec<LintDiagnostic>> {
     let Some(language) = template
         .language
         .as_deref()
@@ -139,8 +203,18 @@ fn lint_template(path: &Path, template: &TemplateStringInfo) -> Result<Vec<LintD
         return Ok(Vec::new());
     };
 
-    if matches!(language.as_str(), "json" | "yaml" | "yml" | "toml") {
-        return lint_backend_template(path, template, &language);
+    if matches!(
+        language.as_str(),
+        "html" | "thtml" | "json" | "yaml" | "yml" | "toml"
+    ) {
+        return lint_backend_template(
+            path,
+            source,
+            template,
+            &language,
+            module_context,
+            static_spread_analysis,
+        );
     }
 
     let processed = prepare_template_for_lint(template, &language);
@@ -190,11 +264,16 @@ fn lint_template(path: &Path, template: &TemplateStringInfo) -> Result<Vec<LintD
 
 fn lint_backend_template(
     path: &Path,
+    source: &str,
     template: &TemplateStringInfo,
     language: &str,
+    module_context: &ModuleContext,
+    static_spread_analysis: &StaticSpreadAnalysis,
 ) -> Result<Vec<LintDiagnostic>> {
     let input = template.to_template_input();
     let result = match language {
+        "html" => backend_html::check_template(&input),
+        "thtml" => backend_thtml::check_template(&input),
         "json" => backend_json::check_template(&input),
         "yaml" | "yml" => backend_yaml::check_template(&input),
         "toml" => backend_toml::check_template(&input),
@@ -202,7 +281,18 @@ fn lint_backend_template(
     };
 
     let Err(error) = result else {
-        return Ok(Vec::new());
+        let mut diagnostics = Vec::new();
+        if language == "thtml" {
+            diagnostics.extend(lint_thtml_component_props(
+                path,
+                source,
+                template,
+                module_context,
+                static_spread_analysis,
+            )?);
+        }
+        sort_and_dedup_diagnostics(&mut diagnostics);
+        return Ok(diagnostics);
     };
 
     let backend_diagnostics = if error.diagnostics.is_empty() {
@@ -461,6 +551,7 @@ fn next_char_boundary(content: &str, start_offset: usize) -> usize {
 fn placeholder_for_language(language: &str) -> &'static str {
     match language {
         "html" => "t_linter_expr",
+        "thtml" => "t_linter_expr",
         "css" => "0",
         "javascript" => "tLinterExpr",
         "json" => "\"t_linter_expr\"",
@@ -474,6 +565,7 @@ fn placeholder_for_language(language: &str) -> &'static str {
 fn normalize_language(language: &str) -> Option<&str> {
     match language.to_ascii_lowercase().as_str() {
         "html" => Some("html"),
+        "thtml" => Some("thtml"),
         "css" => Some("css"),
         "javascript" | "js" => Some("javascript"),
         "json" => Some("json"),
@@ -481,6 +573,580 @@ fn normalize_language(language: &str) -> Option<&str> {
         "toml" => Some("toml"),
         "sql" => Some("sql"),
         _ => None,
+    }
+}
+
+fn lint_thtml_component_props(
+    path: &Path,
+    source: &str,
+    template: &TemplateStringInfo,
+    module_context: &ModuleContext,
+    static_spread_analysis: &StaticSpreadAnalysis,
+) -> Result<Vec<LintDiagnostic>> {
+    let document = backend_thtml::prepare_template(&template.to_template_input())
+        .map_err(|error| anyhow::anyhow!(error.message))?;
+    let mut diagnostics = Vec::new();
+    for child in &document.children {
+        lint_thtml_component_node(
+            path,
+            source,
+            template,
+            module_context,
+            static_spread_analysis,
+            child,
+            &mut diagnostics,
+        );
+    }
+    Ok(diagnostics)
+}
+
+fn lint_thtml_component_node(
+    path: &Path,
+    source: &str,
+    template: &TemplateStringInfo,
+    module_context: &ModuleContext,
+    static_spread_analysis: &StaticSpreadAnalysis,
+    node: &HtmlNode,
+    diagnostics: &mut Vec<LintDiagnostic>,
+) {
+    match node {
+        HtmlNode::ComponentTag(component) => {
+            lint_component_signature(
+                path,
+                source,
+                template,
+                module_context,
+                static_spread_analysis,
+                component,
+                diagnostics,
+            );
+            for child in &component.children {
+                lint_thtml_component_node(
+                    path,
+                    source,
+                    template,
+                    module_context,
+                    static_spread_analysis,
+                    child,
+                    diagnostics,
+                );
+            }
+        }
+        HtmlNode::Element(element) => {
+            for child in &element.children {
+                lint_thtml_component_node(
+                    path,
+                    source,
+                    template,
+                    module_context,
+                    static_spread_analysis,
+                    child,
+                    diagnostics,
+                );
+            }
+        }
+        HtmlNode::RawTextElement(element) => {
+            for child in &element.children {
+                lint_thtml_component_node(
+                    path,
+                    source,
+                    template,
+                    module_context,
+                    static_spread_analysis,
+                    child,
+                    diagnostics,
+                );
+            }
+        }
+        HtmlNode::Fragment(fragment) => {
+            for child in &fragment.children {
+                lint_thtml_component_node(
+                    path,
+                    source,
+                    template,
+                    module_context,
+                    static_spread_analysis,
+                    child,
+                    diagnostics,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn lint_component_signature(
+    path: &Path,
+    source: &str,
+    template: &TemplateStringInfo,
+    module_context: &ModuleContext,
+    static_spread_analysis: &StaticSpreadAnalysis,
+    component: &tstring_html::ComponentTagNode,
+    diagnostics: &mut Vec<LintDiagnostic>,
+) {
+    let Some(signature) = module_context.callable_signatures.get(&component.name) else {
+        diagnostics.push(make_component_diagnostic(
+            path,
+            template,
+            RULE_COMPONENT_UNRESOLVED,
+            format!(
+                "Component '{}' is not defined in local or imported callables visible to t-linter.",
+                component.name
+            ),
+            component.span.as_ref(),
+        ));
+        return;
+    };
+
+    let mut provided_names = BTreeSet::new();
+    let mut resolved_props = std::collections::BTreeMap::<String, ResolvedPropValue>::new();
+    let mut has_unknown_spread = false;
+
+    for attribute in &component.attributes {
+        match attribute {
+            AttributeLike::Attribute(attribute) => {
+                provided_names.insert(attribute.name.clone());
+                resolved_props.insert(
+                    attribute.name.clone(),
+                    ResolvedPropValue::Explicit(attribute.clone()),
+                );
+            }
+            AttributeLike::SpreadAttribute(spread) => {
+                if let Some(entries) = resolve_static_spread_entries(
+                    source,
+                    template,
+                    static_spread_analysis,
+                    &spread.interpolation.expression,
+                    spread.interpolation.span.as_ref().or(spread.span.as_ref()),
+                ) {
+                    for entry in entries {
+                        provided_names.insert(entry.key.clone());
+                        resolved_props.insert(
+                            entry.key.clone(),
+                            ResolvedPropValue::Spread {
+                                key: entry.key,
+                                value_type: entry.value_type,
+                                accepts_none: entry.accepts_none,
+                                span: spread
+                                    .interpolation
+                                    .span
+                                    .clone()
+                                    .or_else(|| spread.span.clone()),
+                            },
+                        );
+                    }
+                } else {
+                    has_unknown_spread = true;
+                }
+            }
+        }
+    }
+
+    for (prop_name, resolved_prop) in &resolved_props {
+        if let Some(parameter) = signature
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == *prop_name && parameter.allows_keyword)
+        {
+            if let Some(diagnostic) =
+                lint_component_attribute_type(path, template, component, resolved_prop, parameter)
+            {
+                diagnostics.push(diagnostic);
+            }
+            continue;
+        }
+
+        if !signature.accepts_kwargs {
+            let span = match resolved_prop {
+                ResolvedPropValue::Explicit(attribute) => {
+                    attribute.span.as_ref().or(component.span.as_ref())
+                }
+                ResolvedPropValue::Spread { span, .. } => span.as_ref().or(component.span.as_ref()),
+            };
+            diagnostics.push(make_component_diagnostic(
+                path,
+                template,
+                RULE_COMPONENT_UNEXPECTED_PROP,
+                format!(
+                    "Component '{}' does not accept prop '{}'.",
+                    component.name, prop_name
+                ),
+                span,
+            ));
+        }
+    }
+
+    for parameter in &signature.parameters {
+        if !parameter.required
+            || parameter.name == "children"
+            || parameter.template_language.is_some()
+        {
+            continue;
+        }
+        if provided_names.contains(&parameter.name) {
+            continue;
+        }
+        if has_unknown_spread {
+            continue;
+        }
+
+        diagnostics.push(make_component_diagnostic(
+            path,
+            template,
+            RULE_COMPONENT_MISSING_PROP,
+            format!(
+                "Component '{}' is missing required prop '{}'.",
+                component.name, parameter.name
+            ),
+            component.span.as_ref(),
+        ));
+    }
+}
+
+fn lint_component_attribute_type(
+    path: &Path,
+    template: &TemplateStringInfo,
+    component: &tstring_html::ComponentTagNode,
+    resolved_prop: &ResolvedPropValue,
+    parameter: &CallableParameter,
+) -> Option<LintDiagnostic> {
+    if parameter.value_types.is_empty() {
+        return None;
+    }
+
+    let (prop_name, value_kind, span) = match resolved_prop {
+        ResolvedPropValue::Explicit(attribute) => (
+            attribute.name.as_str(),
+            classify_component_attribute_value(attribute),
+            attribute.span.as_ref().or(component.span.as_ref()),
+        ),
+        ResolvedPropValue::Spread {
+            key,
+            value_type,
+            accepts_none,
+            span,
+        } => {
+            if spread_value_matches_parameter(*value_type, *accepts_none, parameter) {
+                return None;
+            }
+            (
+                key.as_str(),
+                ComponentAttributeValueKind::StringLike,
+                span.as_ref().or(component.span.as_ref()),
+            )
+        }
+    };
+    let accepts_string = parameter.value_types.contains(&CallableValueType::String);
+    let accepts_bool = parameter.value_types.contains(&CallableValueType::Bool);
+
+    match value_kind {
+        ComponentAttributeValueKind::BareBoolean if accepts_bool => None,
+        ComponentAttributeValueKind::StringLike if accepts_string => None,
+        ComponentAttributeValueKind::BareBoolean => Some(make_component_diagnostic(
+            path,
+            template,
+            RULE_COMPONENT_PROP_TYPE_ERROR,
+            format!(
+                "Component '{}' prop '{}' expects {}, but bare T-HTML attributes pass boolean true.",
+                component.name,
+                prop_name,
+                describe_callable_value_types(&parameter.value_types, parameter.accepts_none),
+            ),
+            span,
+        )),
+        ComponentAttributeValueKind::StringLike => Some(make_component_diagnostic(
+            path,
+            template,
+            RULE_COMPONENT_PROP_TYPE_ERROR,
+            format!(
+                "Component '{}' prop '{}' expects {}, but T-HTML attribute syntax passes strings here. Use a spread prop for typed values.",
+                component.name,
+                prop_name,
+                describe_callable_value_types(&parameter.value_types, parameter.accepts_none),
+            ),
+            span,
+        )),
+    }
+}
+
+fn make_component_diagnostic(
+    path: &Path,
+    template: &TemplateStringInfo,
+    rule: &str,
+    message: String,
+    span: Option<&tstring_syntax::SourceSpan>,
+) -> LintDiagnostic {
+    let location = span.map_or_else(
+        || template.location.clone(),
+        |span| template.backend_span_to_location(span),
+    );
+
+    LintDiagnostic {
+        rule: rule.to_string(),
+        severity: LintSeverity::Error,
+        language: Some("thtml".to_string()),
+        message,
+        file: path.to_path_buf(),
+        start_line: location.start_line,
+        start_column: location.start_column,
+        end_line: location.end_line,
+        end_column: location.end_column,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComponentAttributeValueKind {
+    BareBoolean,
+    StringLike,
+}
+
+fn classify_component_attribute_value(attribute: &Attribute) -> ComponentAttributeValueKind {
+    match &attribute.value {
+        None => ComponentAttributeValueKind::BareBoolean,
+        Some(_) => ComponentAttributeValueKind::StringLike,
+    }
+}
+
+fn spread_value_matches_parameter(
+    value_type: Option<CallableValueType>,
+    accepts_none: bool,
+    parameter: &CallableParameter,
+) -> bool {
+    match value_type {
+        Some(value_type) => parameter.value_types.contains(&value_type),
+        None if accepts_none => parameter.accepts_none,
+        None => true,
+    }
+}
+
+fn describe_callable_value_types(value_types: &[CallableValueType], accepts_none: bool) -> String {
+    let mut names = value_types
+        .iter()
+        .map(|value_type| match value_type {
+            CallableValueType::Bool => "bool",
+            CallableValueType::Int => "int",
+            CallableValueType::Float => "float",
+            CallableValueType::String => "str",
+        })
+        .collect::<Vec<_>>();
+    if accepts_none {
+        names.push("None");
+    }
+    names.sort_unstable();
+    names.dedup();
+    names.join(" | ")
+}
+
+fn build_static_spread_analysis(source: &str) -> Result<StaticSpreadAnalysis> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .context("Failed to initialize Python parser for spread analysis")?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow::anyhow!("Failed to parse Python source for spread analysis"))?;
+
+    let query = Query::new(
+        &tree_sitter_python::LANGUAGE.into(),
+        r#"
+        (assignment
+            left: (identifier) @name
+            right: (dictionary) @value)
+        "#,
+    )
+    .context("Failed to create spread analysis query")?;
+
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut analysis = StaticSpreadAnalysis::default();
+
+    while let Some(match_) = matches.next() {
+        let mut name: Option<Node<'_>> = None;
+        let mut value: Option<Node<'_>> = None;
+        for capture in match_.captures {
+            match query.capture_names()[capture.index as usize] {
+                "name" => name = Some(capture.node),
+                "value" => value = Some(capture.node),
+                _ => {}
+            }
+        }
+
+        let (Some(name_node), Some(value_node)) = (name, value) else {
+            continue;
+        };
+        let Some(name_text) = name_node.utf8_text(source.as_bytes()).ok() else {
+            continue;
+        };
+        let Some(dict) = parse_static_dictionary_node(value_node, source) else {
+            continue;
+        };
+
+        analysis
+            .bindings
+            .entry(name_text.to_string())
+            .or_default()
+            .push(StaticSpreadBinding {
+                assignment_start: name_node.start_byte(),
+                dict,
+            });
+    }
+
+    for bindings in analysis.bindings.values_mut() {
+        bindings.sort_by_key(|binding| binding.assignment_start);
+    }
+
+    Ok(analysis)
+}
+
+fn resolve_static_spread_entries(
+    source: &str,
+    template: &TemplateStringInfo,
+    analysis: &StaticSpreadAnalysis,
+    expression: &str,
+    span: Option<&tstring_syntax::SourceSpan>,
+) -> Option<Vec<ResolvedSpreadEntry>> {
+    if let Some(dict) = parse_static_dictionary_expression(expression) {
+        return Some(
+            dict.entries
+                .into_iter()
+                .map(|entry| ResolvedSpreadEntry {
+                    key: entry.key,
+                    value_type: entry.value_type,
+                    accepts_none: entry.accepts_none,
+                })
+                .collect(),
+        );
+    }
+
+    if !is_identifier_expression(expression) {
+        return None;
+    }
+
+    let use_offset = span
+        .map(|span| template.backend_span_to_location(span))
+        .and_then(|location| {
+            location_to_byte_offset(source, location.start_line, location.start_column)
+        })
+        .unwrap_or(source.len());
+
+    let bindings = analysis.bindings.get(expression)?;
+    let binding = bindings
+        .iter()
+        .rev()
+        .find(|binding| binding.assignment_start < use_offset)?;
+
+    Some(
+        binding
+            .dict
+            .entries
+            .iter()
+            .map(|entry| ResolvedSpreadEntry {
+                key: entry.key.clone(),
+                value_type: entry.value_type,
+                accepts_none: entry.accepts_none,
+            })
+            .collect(),
+    )
+}
+
+fn parse_static_dictionary_expression(expression: &str) -> Option<StaticDictLiteral> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(expression, None)?;
+    let root = tree.root_node();
+    let dict_node = match root.named_child(0) {
+        Some(child) if child.kind() == "expression_statement" => child.named_child(0)?,
+        Some(child) => child,
+        None => root,
+    };
+    parse_static_dictionary_node(dict_node, expression)
+}
+
+fn parse_static_dictionary_node(node: Node<'_>, source: &str) -> Option<StaticDictLiteral> {
+    if node.kind() != "dictionary" {
+        return None;
+    }
+
+    let mut cursor = node.walk();
+    let mut dict = StaticDictLiteral::default();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "pair" {
+            return None;
+        }
+        let key_node = child.child_by_field_name("key")?;
+        let value_node = child.child_by_field_name("value")?;
+        let key_text = key_node.utf8_text(source.as_bytes()).ok()?;
+        let key = unquote_python_string(key_text)?;
+        let (value_type, accepts_none) = parse_static_value_node(value_node);
+        dict.entries.push(StaticDictEntry {
+            key,
+            value_type,
+            accepts_none,
+        });
+    }
+
+    Some(dict)
+}
+
+fn parse_static_value_node(node: Node<'_>) -> (Option<CallableValueType>, bool) {
+    match node.kind() {
+        "true" | "false" => (Some(CallableValueType::Bool), false),
+        "integer" => (Some(CallableValueType::Int), false),
+        "float" => (Some(CallableValueType::Float), false),
+        "string" => (Some(CallableValueType::String), false),
+        "none" => (None, true),
+        _ => (None, false),
+    }
+}
+
+fn unquote_python_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let without_prefix = trimmed.trim_start_matches(['r', 'R', 'u', 'U', 'b', 'B']);
+    if without_prefix.len() < 2 {
+        return None;
+    }
+    let first = without_prefix.as_bytes().first().copied()?;
+    let last = without_prefix.as_bytes().last().copied()?;
+    if !matches!(first, b'\'' | b'"') || first != last {
+        return None;
+    }
+    Some(without_prefix[1..without_prefix.len() - 1].to_string())
+}
+
+fn is_identifier_expression(expression: &str) -> bool {
+    let mut chars = expression.chars();
+    match chars.next() {
+        Some(ch) if ch == '_' || ch.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn location_to_byte_offset(source: &str, line: usize, column: usize) -> Option<usize> {
+    if line == 0 || column == 0 {
+        return None;
+    }
+
+    let mut current_line = 1usize;
+    let mut current_column = 1usize;
+    for (offset, ch) in source.char_indices() {
+        if current_line == line && current_column == column {
+            return Some(offset);
+        }
+        if ch == '\n' {
+            current_line += 1;
+            current_column = 1;
+        } else {
+            current_column += 1;
+        }
+    }
+
+    if current_line == line && current_column == column {
+        Some(source.len())
+    } else {
+        None
     }
 }
 
@@ -523,8 +1189,19 @@ mod tests {
 
     fn lint_embedded(language: &str, template: &str) -> LintFileResult {
         let python_template = to_python_template_source(template);
+        let prefix = if language == "thtml" {
+            r#"def Card(*, title: str, children: str | None = None) -> object:
+    return None
+
+def Badge(*, children: str | None = None) -> object:
+    return None
+
+"#
+        } else {
+            ""
+        };
         let source = format!(
-            r#"from typing import Annotated
+            r#"{prefix}from typing import Annotated
 from string.templatelib import Template
 
 value: Annotated[Template, "{language}"] = t"""{python_template}"""
@@ -538,6 +1215,7 @@ value: Annotated[Template, "{language}"] = t"""{python_template}"""
     fn valid_templates_do_not_report_diagnostics() {
         let valid_cases = [
             ("html", "<div>{}</div>"),
+            ("thtml", "<Card title=\"{}\"><Badge>{}</Badge></Card>"),
             ("css", "body { color: {}; }"),
             ("javascript", "const value = {};"),
             ("json", r#"{"name": {}, "enabled": true}"#),
@@ -560,6 +1238,7 @@ value: Annotated[Template, "{language}"] = t"""{python_template}"""
     fn invalid_templates_report_embedded_parse_errors() {
         let invalid_cases = [
             ("html", "<div><"),
+            ("thtml", "<Card><"),
             ("css", "body { color: ; }"),
             ("javascript", "function {"),
             ("json", "[1,,2]"),

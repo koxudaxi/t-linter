@@ -114,6 +114,8 @@ fn format_template_edit(template: &TemplateStringInfo) -> Option<Result<Template
     let input = template.to_template_input();
 
     let formatted = match language.as_str() {
+        "html" => tstring_html::format_template(&input),
+        "thtml" => tstring_thtml::format_template(&input),
         "json" => tstring_json::format_template(&input),
         "yaml" | "yml" => tstring_yaml::format_template(&input),
         "toml" => tstring_toml::format_template(&input),

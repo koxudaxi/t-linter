@@ -13,14 +13,38 @@ use tstring_syntax::{
 pub struct ModuleContext {
     pub type_aliases: HashMap<String, String>,
     pub imports: HashMap<String, String>,
-    pub callable_signatures: HashMap<String, Vec<CallableParameter>>,
+    pub callable_signatures: HashMap<String, CallableSignature>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallableSignature {
+    pub parameters: Vec<CallableParameter>,
+    pub accepts_kwargs: bool,
+}
+
+impl CallableSignature {
+    fn is_empty(&self) -> bool {
+        self.parameters.is_empty() && !self.accepts_kwargs
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallableParameter {
     pub position: usize,
     pub name: String,
-    pub language: String,
+    pub template_language: Option<String>,
+    pub value_types: Vec<CallableValueType>,
+    pub accepts_none: bool,
+    pub required: bool,
+    pub allows_keyword: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallableValueType {
+    Bool,
+    Int,
+    Float,
+    String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +76,7 @@ struct VariableAssignment {
 pub struct TemplateStringParser {
     parser: Parser,
     search_root: Option<PathBuf>,
+    last_module_context: ModuleContext,
 }
 
 impl TemplateStringParser {
@@ -64,6 +89,7 @@ impl TemplateStringParser {
         Ok(Self {
             parser,
             search_root: None,
+            last_module_context: ModuleContext::default(),
         })
     }
 
@@ -97,6 +123,7 @@ impl TemplateStringParser {
         self.collect_module_context(&tree, source, &mut context)?;
         let variable_language_hints =
             self.collect_variable_language_hints(&tree, source, &context)?;
+        self.last_module_context = context.clone();
 
         let mut templates = Vec::new();
         self.find_strings_with_query(
@@ -108,6 +135,10 @@ impl TemplateStringParser {
         )?;
 
         Ok(templates)
+    }
+
+    pub fn module_context(&self) -> &ModuleContext {
+        &self.last_module_context
     }
 
     fn collect_module_context(
@@ -311,16 +342,12 @@ impl TemplateStringParser {
                     let Some(params_node) = child.child_by_field_name("parameters") else {
                         continue;
                     };
-                    let parameter_languages = self.extract_callable_parameter_languages(
-                        params_node,
-                        source,
-                        context,
-                        false,
-                    )?;
-                    if !parameter_languages.is_empty() {
+                    let signature =
+                        self.extract_callable_signature(params_node, source, context, false)?;
+                    if !signature.is_empty() {
                         context.callable_signatures.insert(
                             name_node.utf8_text(source.as_bytes())?.to_string(),
-                            parameter_languages,
+                            signature,
                         );
                     }
                 }
@@ -331,13 +358,13 @@ impl TemplateStringParser {
                     let Some(body_node) = child.child_by_field_name("body") else {
                         continue;
                     };
-                    if let Some(parameter_languages) =
+                    if let Some(signature) =
                         self.extract_class_constructor_languages(body_node, source, context)?
-                        && !parameter_languages.is_empty()
+                        && !signature.is_empty()
                     {
                         context.callable_signatures.insert(
                             name_node.utf8_text(source.as_bytes())?.to_string(),
-                            parameter_languages,
+                            signature,
                         );
                     }
                 }
@@ -353,7 +380,7 @@ impl TemplateStringParser {
         body_node: Node,
         source: &str,
         context: &ModuleContext,
-    ) -> Result<Option<Vec<CallableParameter>>> {
+    ) -> Result<Option<CallableSignature>> {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
             if child.kind() != "function_definition" {
@@ -370,60 +397,100 @@ impl TemplateStringParser {
             let Some(params_node) = child.child_by_field_name("parameters") else {
                 continue;
             };
-            let parameter_languages =
-                self.extract_callable_parameter_languages(params_node, source, context, true)?;
-            return Ok(Some(parameter_languages));
+            let signature = self.extract_callable_signature(params_node, source, context, true)?;
+            return Ok(Some(signature));
         }
 
         Ok(None)
     }
 
-    fn extract_callable_parameter_languages(
+    fn extract_callable_signature(
         &self,
         params_node: Node,
         source: &str,
         context: &ModuleContext,
         skip_receiver: bool,
-    ) -> Result<Vec<CallableParameter>> {
-        let mut parameter_languages = Vec::new();
+    ) -> Result<CallableSignature> {
+        let mut signature = CallableSignature::default();
         let mut cursor = params_node.walk();
         let mut position = 0;
         let mut receiver_skipped = !skip_receiver;
-
         for child in params_node.children(&mut cursor) {
-            if child.kind() == "typed_parameter" || child.kind() == "typed_default_parameter" {
-                let parameter_name = child
-                    .child_by_field_name("name")
-                    .and_then(|node| node.utf8_text(source.as_bytes()).ok());
-                if !receiver_skipped && matches!(parameter_name, Some("self" | "cls")) {
-                    receiver_skipped = true;
-                    continue;
-                }
-                if let Some(type_node) = child.child_by_field_name("type") {
-                    if let Some(language) =
-                        self.resolve_language_from_type_node(type_node, source, context)?
-                    {
-                        parameter_languages.push(CallableParameter {
-                            position,
-                            name: parameter_name.unwrap_or("").to_string(),
-                            language,
-                        });
+            match child.kind() {
+                "keyword_separator" => {}
+                "positional_separator" => {
+                    for parameter in &mut signature.parameters {
+                        parameter.allows_keyword = false;
                     }
                 }
-                position += 1;
-                receiver_skipped = true;
-            } else if child.kind() == "identifier" || child.kind() == "default_parameter" {
-                let parameter_name = child.utf8_text(source.as_bytes()).ok();
-                if !receiver_skipped && matches!(parameter_name, Some("self" | "cls")) {
-                    receiver_skipped = true;
-                    continue;
+                "dictionary_splat_pattern" => {
+                    signature.accepts_kwargs = true;
                 }
-                position += 1;
-                receiver_skipped = true;
+                "list_splat_pattern" => receiver_skipped = true,
+                "typed_parameter"
+                | "typed_default_parameter"
+                | "identifier"
+                | "default_parameter" => {
+                    let parameter_name = match child.kind() {
+                        "typed_parameter" => {
+                            let Some(name_node) = child.child(0) else {
+                                continue;
+                            };
+                            match name_node.kind() {
+                                "dictionary_splat_pattern" => {
+                                    signature.accepts_kwargs = true;
+                                    receiver_skipped = true;
+                                    continue;
+                                }
+                                "list_splat_pattern" => {
+                                    receiver_skipped = true;
+                                    continue;
+                                }
+                                _ => name_node.utf8_text(source.as_bytes()).ok().unwrap_or(""),
+                            }
+                        }
+                        "typed_default_parameter" | "default_parameter" => child
+                            .child_by_field_name("name")
+                            .and_then(|node| node.utf8_text(source.as_bytes()).ok())
+                            .unwrap_or(""),
+                        "identifier" => child.utf8_text(source.as_bytes()).ok().unwrap_or(""),
+                        _ => "",
+                    };
+                    if !receiver_skipped && matches!(parameter_name, "self" | "cls") {
+                        receiver_skipped = true;
+                        continue;
+                    }
+
+                    let required = matches!(child.kind(), "typed_parameter" | "identifier");
+                    let type_node = child.child_by_field_name("type");
+                    let template_language = if let Some(type_node) = type_node {
+                        self.resolve_language_from_type_node(type_node, source, context)?
+                    } else {
+                        None
+                    };
+                    let type_hints = if let Some(type_node) = type_node {
+                        self.resolve_value_types_from_type_node(type_node, source)?
+                    } else {
+                        ParsedValueTypes::default()
+                    };
+
+                    signature.parameters.push(CallableParameter {
+                        position,
+                        name: parameter_name.to_string(),
+                        template_language,
+                        value_types: type_hints.value_types,
+                        accepts_none: type_hints.accepts_none,
+                        required,
+                        allows_keyword: true,
+                    });
+                    position += 1;
+                    receiver_skipped = true;
+                }
+                _ => {}
             }
         }
 
-        Ok(parameter_languages)
+        Ok(signature)
     }
 
     fn collect_imported_callable_signatures(&mut self, context: &mut ModuleContext) -> Result<()> {
@@ -461,8 +528,8 @@ impl TemplateStringParser {
     fn resolve_imported_callable_signature(
         &mut self,
         import_path: &str,
-        module_cache: &mut HashMap<String, HashMap<String, Vec<CallableParameter>>>,
-    ) -> Result<Option<Vec<CallableParameter>>> {
+        module_cache: &mut HashMap<String, HashMap<String, CallableSignature>>,
+    ) -> Result<Option<CallableSignature>> {
         let Some((module_name, symbol_name)) = import_path.rsplit_once('.') else {
             return Ok(None);
         };
@@ -479,8 +546,8 @@ impl TemplateStringParser {
     fn load_imported_module_signatures(
         &mut self,
         module_name: &str,
-        module_cache: &mut HashMap<String, HashMap<String, Vec<CallableParameter>>>,
-    ) -> Result<Option<HashMap<String, Vec<CallableParameter>>>> {
+        module_cache: &mut HashMap<String, HashMap<String, CallableSignature>>,
+    ) -> Result<Option<HashMap<String, CallableSignature>>> {
         if let Some(signatures) = module_cache.get(module_name) {
             return Ok(Some(signatures.clone()));
         }
@@ -507,7 +574,7 @@ impl TemplateStringParser {
         let original_search_root = self.search_root.clone();
         self.search_root = module_path.parent().map(Path::to_path_buf);
 
-        let imported_signatures = (|| -> Result<HashMap<String, Vec<CallableParameter>>> {
+        let imported_signatures = (|| -> Result<HashMap<String, CallableSignature>> {
             let mut imported_context = ModuleContext::default();
             self.collect_type_aliases(&tree, &source, &mut imported_context)?;
             self.collect_imports(&tree, &source, &mut imported_context)?;
@@ -579,9 +646,11 @@ impl TemplateStringParser {
                 if argument.value.kind() != "identifier" {
                     continue;
                 }
-                let Some(parameter) =
-                    resolve_callable_parameter(signatures, argument.position, argument.keyword)
-                else {
+                let Some(parameter) = resolve_callable_parameter(
+                    &signatures.parameters,
+                    argument.position,
+                    argument.keyword,
+                ) else {
                     continue;
                 };
                 let Some(binding) =
@@ -590,12 +659,19 @@ impl TemplateStringParser {
                     continue;
                 };
                 match hints.get(&binding.key) {
-                    Some(Some(existing)) if existing != &parameter.language => {
+                    Some(Some(existing))
+                        if parameter
+                            .template_language
+                            .as_ref()
+                            .is_some_and(|lang| existing != lang) =>
+                    {
                         hints.insert(binding.key.clone(), None);
                     }
                     Some(None) => {}
                     _ => {
-                        hints.insert(binding.key.clone(), Some(parameter.language.clone()));
+                        if let Some(language) = &parameter.template_language {
+                            hints.insert(binding.key.clone(), Some(language.clone()));
+                        }
                     }
                 }
             }
@@ -1084,10 +1160,12 @@ impl TemplateStringParser {
         if let Some(call_node) = argument_list {
             for argument in call_arguments(call_node, source)? {
                 if argument.value.kind() == "string" && argument.value.id() == string_node.id() {
-                    if let Some(parameter) =
-                        resolve_callable_parameter(signatures, argument.position, argument.keyword)
-                    {
-                        return Ok(Some(parameter.language.clone()));
+                    if let Some(parameter) = resolve_callable_parameter(
+                        &signatures.parameters,
+                        argument.position,
+                        argument.keyword,
+                    ) {
+                        return Ok(parameter.template_language.clone());
                     }
                     break;
                 }
@@ -1101,7 +1179,7 @@ impl TemplateStringParser {
         &self,
         callee: &str,
         context: &'a ModuleContext,
-    ) -> Option<&'a Vec<CallableParameter>> {
+    ) -> Option<&'a CallableSignature> {
         if let Some(signatures) = context.callable_signatures.get(callee) {
             return Some(signatures);
         }
@@ -1129,6 +1207,15 @@ impl TemplateStringParser {
         }
 
         self.extract_language_from_type_string(type_text)
+    }
+
+    fn resolve_value_types_from_type_node(
+        &self,
+        type_node: Node,
+        source: &str,
+    ) -> Result<ParsedValueTypes> {
+        let type_text = type_node.utf8_text(source.as_bytes())?;
+        Ok(parse_callable_value_types(type_text))
     }
 
     fn extract_language_from_type_string(&self, type_str: &str) -> Result<Option<String>> {
@@ -1201,7 +1288,7 @@ fn resolve_callable_parameter<'a>(
     if let Some(keyword) = keyword
         && let Some(parameter) = signatures
             .iter()
-            .find(|parameter| parameter.name == keyword)
+            .find(|parameter| parameter.name == keyword && parameter.allows_keyword)
     {
         return Some(parameter);
     }
@@ -1209,6 +1296,153 @@ fn resolve_callable_parameter<'a>(
     signatures
         .iter()
         .find(|parameter| parameter.position == position)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ParsedValueTypes {
+    value_types: Vec<CallableValueType>,
+    accepts_none: bool,
+}
+
+fn parse_callable_value_types(type_text: &str) -> ParsedValueTypes {
+    parse_callable_value_types_inner(&strip_type_prefixes(type_text))
+}
+
+fn parse_callable_value_types_inner(type_text: &str) -> ParsedValueTypes {
+    let type_text = type_text.trim();
+    if type_text.is_empty() {
+        return ParsedValueTypes::default();
+    }
+    if matches!(type_text, "None" | "NoneType") {
+        return ParsedValueTypes {
+            value_types: Vec::new(),
+            accepts_none: true,
+        };
+    }
+
+    if let Some(inner) = unwrap_generic(type_text, "Annotated") {
+        if let Some(first) = split_top_level(inner, ',').into_iter().next() {
+            return parse_callable_value_types_inner(first);
+        }
+    }
+
+    if let Some(inner) = unwrap_generic(type_text, "Optional") {
+        let mut parsed = parse_callable_value_types_inner(inner);
+        parsed.accepts_none = true;
+        return parsed;
+    }
+
+    if let Some(inner) = unwrap_generic(type_text, "Union") {
+        let mut merged = ParsedValueTypes::default();
+        for part in split_top_level(inner, ',') {
+            merge_parsed_value_types(&mut merged, parse_callable_value_types_inner(part));
+        }
+        return merged;
+    }
+
+    if let Some(inner) = unwrap_generic(type_text, "Literal") {
+        let mut merged = ParsedValueTypes::default();
+        for part in split_top_level(inner, ',') {
+            match part.trim() {
+                "True" | "False" => {
+                    push_value_type(&mut merged.value_types, CallableValueType::Bool)
+                }
+                "None" | "NoneType" => merged.accepts_none = true,
+                literal if is_string_literal(literal) => {
+                    push_value_type(&mut merged.value_types, CallableValueType::String);
+                }
+                literal if is_float_literal(literal) => {
+                    push_value_type(&mut merged.value_types, CallableValueType::Float);
+                }
+                literal if is_int_literal(literal) => {
+                    push_value_type(&mut merged.value_types, CallableValueType::Int);
+                }
+                _ => {}
+            }
+        }
+        return merged;
+    }
+
+    let union_parts = split_top_level(type_text, '|');
+    if union_parts.len() > 1 {
+        let mut merged = ParsedValueTypes::default();
+        for part in union_parts {
+            merge_parsed_value_types(&mut merged, parse_callable_value_types_inner(part));
+        }
+        return merged;
+    }
+
+    let mut parsed = ParsedValueTypes::default();
+    match type_text {
+        "bool" => push_value_type(&mut parsed.value_types, CallableValueType::Bool),
+        "int" => push_value_type(&mut parsed.value_types, CallableValueType::Int),
+        "float" => push_value_type(&mut parsed.value_types, CallableValueType::Float),
+        "str" => push_value_type(&mut parsed.value_types, CallableValueType::String),
+        _ => {}
+    }
+    parsed
+}
+
+fn strip_type_prefixes(type_text: &str) -> String {
+    type_text
+        .replace("typing.", "")
+        .replace("builtins.", "")
+        .replace(' ', "")
+}
+
+fn unwrap_generic<'a>(type_text: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}[");
+    type_text
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(']'))
+}
+
+fn split_top_level(input: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, ch) in input.char_indices() {
+        match ch {
+            '[' | '(' | '{' => depth += 1,
+            ']' | ')' | '}' => depth = depth.saturating_sub(1),
+            _ if ch == separator && depth == 0 => {
+                parts.push(&input[start..index]);
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&input[start..]);
+    parts
+}
+
+fn merge_parsed_value_types(target: &mut ParsedValueTypes, other: ParsedValueTypes) {
+    for value_type in other.value_types {
+        push_value_type(&mut target.value_types, value_type);
+    }
+    target.accepts_none |= other.accepts_none;
+}
+
+fn push_value_type(types: &mut Vec<CallableValueType>, value_type: CallableValueType) {
+    if !types.contains(&value_type) {
+        types.push(value_type);
+    }
+}
+
+fn is_string_literal(value: &str) -> bool {
+    (value.starts_with('"') && value.ends_with('"'))
+        || (value.starts_with('\'') && value.ends_with('\''))
+}
+
+fn is_int_literal(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ch == '-' || ch == '+')
+}
+
+fn is_float_literal(value: &str) -> bool {
+    value.contains('.') && value.parse::<f64>().is_ok()
 }
 
 fn collect_variable_assignments(tree: &Tree, source: &str) -> Result<Vec<VariableAssignment>> {
