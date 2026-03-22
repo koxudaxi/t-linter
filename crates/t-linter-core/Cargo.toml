@@ -24,6 +24,8 @@ tstring-json.workspace = true
 tstring-toml.workspace = true
 tstring-yaml.workspace = true
 tstring-syntax.workspace = true
+tstring-html.workspace = true
+tstring-thtml.workspace = true
 
 [features]
 default = ["sql"]

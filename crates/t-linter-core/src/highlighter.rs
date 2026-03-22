@@ -76,6 +76,12 @@ impl TemplateHighlighter {
                 language: tree_sitter_html::LANGUAGE.into(),
             },
         );
+        language_configs.insert(
+            "thtml".to_string(),
+            LanguageConfig {
+                language: tree_sitter_html::LANGUAGE.into(),
+            },
+        );
 
         language_configs.insert(
             "css".to_string(),
@@ -157,6 +163,7 @@ impl TemplateHighlighter {
             language,
             match language.to_lowercase().as_str() {
                 "html" => tree_sitter_html::HIGHLIGHTS_QUERY,
+                "thtml" => tree_sitter_html::HIGHLIGHTS_QUERY,
                 "css" => tree_sitter_css::HIGHLIGHTS_QUERY,
                 "javascript" | "js" => tree_sitter_javascript::HIGHLIGHT_QUERY,
                 "json" => tree_sitter_json::HIGHLIGHTS_QUERY,
@@ -604,6 +611,54 @@ mod tests {
                     end_column: 25,
                 },
             }],
+            TemplateStringFlags::default(),
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+
+        assert!(ranges.iter().any(|r| r.highlight_name == "tag"));
+        assert!(ranges.iter().any(|r| r.highlight_name == "attribute"));
+        assert!(
+            ranges
+                .iter()
+                .any(|r| r.highlight_name == "variable.parameter")
+        );
+    }
+
+    #[test]
+    fn test_thtml_highlighting() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+
+        let template = make_template(
+            "<Card title=\"{}\"><Badge>{}</Badge></Card>",
+            r#"t"<Card title=\"{title}\"><Badge>{status}</Badge></Card>""#,
+            "thtml",
+            Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 58,
+            },
+            vec![
+                Expression {
+                    content: "title".to_string(),
+                    location: Location {
+                        start_line: 1,
+                        start_column: 15,
+                        end_line: 1,
+                        end_column: 20,
+                    },
+                },
+                Expression {
+                    content: "status".to_string(),
+                    location: Location {
+                        start_line: 1,
+                        start_column: 30,
+                        end_line: 1,
+                        end_column: 36,
+                    },
+                },
+            ],
             TemplateStringFlags::default(),
         );
 

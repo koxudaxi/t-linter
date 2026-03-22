@@ -252,6 +252,179 @@ markup: Annotated[Template, "html"] = t"<div>{name}</div>"
 }
 
 #[test]
+fn format_rewrites_html_and_thtml_backend_templates() {
+    let dir = test_dir("html-thtml-backend");
+    let path = dir.join("example.py");
+    write_file(
+        &path,
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+html_markup: Annotated[Template, "html"] = t'<div class = "x" >{name}</div>'
+component_markup: Annotated[Template, "thtml"] = t'<Card title = "{title}" disabled ></Card>'
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t'<div class="x">{name}</div>'"#));
+    assert!(content.contains(r#"t'<Card title="{title}" disabled></Card>'"#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_rewrites_html_template_inferred_via_imported_function_annotation() {
+    let dir = test_dir("html-imported-format");
+    let path = dir.join("example.py");
+    write_file(
+        &dir.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_markup(template: Annotated[Template, "html"]) -> str:
+    return ""
+"#,
+    );
+    write_file(
+        &path,
+        r#"from typed_api import render_markup as render_html_markup
+
+page = t'<div class = "x" >{name}</div>'
+
+render_html_markup(page)
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t'<div class="x">{name}</div>'"#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_rewrites_thtml_template_inferred_via_reexported_class_signature() {
+    let dir = test_dir("thtml-reexported-format");
+    let path = dir.join("example.py");
+    write_file(
+        &dir.join("ui_impl.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+class Renderer:
+    def __init__(self, template: Annotated[Template, "thtml"]) -> None:
+        self.template = template
+"#,
+    );
+    write_file(
+        &dir.join("ui.py"),
+        r#"from ui_impl import Renderer
+"#,
+    );
+    write_file(
+        &path,
+        r#"from ui import Renderer
+
+card = t'<Card title = "{title}" ><Badge>{status}</Badge></Card>'
+
+Renderer(card)
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t'<Card title="{title}"><Badge>{status}</Badge></Card>'"#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_check_recognizes_already_formatted_thtml_templates() {
+    let dir = test_dir("thtml-check-clean");
+    let path = dir.join("example.py");
+    let original = r#"from typing import Annotated
+from string.templatelib import Template
+
+component_markup: Annotated[Template, "thtml"] = t'<Card title="{title}" disabled><Badge>{status}</Badge></Card>'
+"#;
+    write_file(&path, original);
+
+    let output = run_t_linter(&dir, &["format", "--check", "example.py"], None);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr.contains("0 files would be reformatted, 1 files already formatted, 0 inputs failed"));
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_stdin_uses_stdin_filename_for_import_inferred_html() {
+    let dir = test_dir("stdin-import-inferred-html");
+    write_file(
+        &dir.join("typed_api.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_markup(template: Annotated[Template, "html"]) -> str:
+    return ""
+"#,
+    );
+    let input = br#"from typed_api import render_markup as render_html_markup
+
+page = t'<div class = "x" >{name}</div>'
+
+render_html_markup(page)
+"#;
+
+    let output = run_t_linter(
+        &dir,
+        &["format", "--stdin-filename", "example.py", "-"],
+        Some(input),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr.is_empty());
+    assert!(stdout.contains(r#"t'<div class="x">{name}</div>'"#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_rewrites_multiple_html_and_thtml_templates_together() {
+    let dir = test_dir("html-thtml-multiple");
+    let path = dir.join("example.py");
+    write_file(
+        &path,
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+page: Annotated[Template, "html"] = t'<main class = "app" >{body}</main>'
+card: Annotated[Template, "thtml"] = t'<Card title = "{title}" ><Badge tone = "ok" >{status}</Badge></Card>'
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t'<main class="app">{body}</main>'"#));
+    assert!(content.contains(r#"t'<Card title="{title}"><Badge tone="ok">{status}</Badge></Card>'"#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn format_reports_invalid_explicit_non_python_files() {
     let dir = test_dir("non-py");
     write_file(&dir.join("notes.txt"), "hello");
