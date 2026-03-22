@@ -71,8 +71,15 @@ struct StaticSpreadAnalysis {
 
 #[derive(Debug, Clone)]
 struct StaticSpreadBinding {
+    scope: ScopeKey,
     assignment_start: usize,
     dict: StaticDictLiteral,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ScopeKey {
+    start: usize,
+    end: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -913,6 +920,10 @@ fn spread_value_matches_parameter(
     parameter: &CallableParameter,
 ) -> bool {
     match value_type {
+        Some(CallableValueType::Int) => {
+            parameter.value_types.contains(&CallableValueType::Int)
+                || parameter.value_types.contains(&CallableValueType::Float)
+        }
         Some(value_type) => parameter.value_types.contains(&value_type),
         None if accepts_none => parameter.accepts_none,
         None => true,
@@ -986,6 +997,7 @@ fn build_static_spread_analysis(source: &str) -> Result<StaticSpreadAnalysis> {
             .entry(name_text.to_string())
             .or_default()
             .push(StaticSpreadBinding {
+                scope: enclosing_scope(name_node),
                 assignment_start: name_node.start_byte(),
                 dict,
             });
@@ -1030,10 +1042,21 @@ fn resolve_static_spread_entries(
         .unwrap_or(source.len());
 
     let bindings = analysis.bindings.get(expression)?;
-    let binding = bindings
+    let scope_chain = scope_chain_for_offset(source, use_offset);
+    let binding = scope_chain
         .iter()
-        .rev()
-        .find(|binding| binding.assignment_start < use_offset)?;
+        .find_map(|scope| {
+            bindings
+                .iter()
+                .rev()
+                .find(|binding| binding.scope == *scope && binding.assignment_start < use_offset)
+        })
+        .or_else(|| {
+            bindings
+                .iter()
+                .rev()
+                .find(|binding| binding.assignment_start < use_offset)
+        })?;
 
     Some(
         binding
@@ -1088,6 +1111,71 @@ fn parse_static_dictionary_node(node: Node<'_>, source: &str) -> Option<StaticDi
     }
 
     Some(dict)
+}
+
+fn scope_chain_for_offset(source: &str, offset: usize) -> Vec<ScopeKey> {
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .is_err()
+    {
+        return vec![ScopeKey {
+            start: 0,
+            end: source.len(),
+        }];
+    }
+    let Some(tree) = parser.parse(source, None) else {
+        return vec![ScopeKey {
+            start: 0,
+            end: source.len(),
+        }];
+    };
+    let root = tree.root_node();
+    let Some(node) = root.named_descendant_for_byte_range(offset, offset) else {
+        return vec![ScopeKey {
+            start: root.start_byte(),
+            end: root.end_byte(),
+        }];
+    };
+    scope_chain(node)
+}
+
+fn scope_chain(node: Node) -> Vec<ScopeKey> {
+    let mut scopes = Vec::new();
+    let mut current = Some(node);
+
+    while let Some(candidate) = current {
+        if is_scope_node(candidate) {
+            scopes.push(ScopeKey {
+                start: candidate.start_byte(),
+                end: candidate.end_byte(),
+            });
+        }
+        current = candidate.parent();
+    }
+
+    if scopes.is_empty() {
+        scopes.push(ScopeKey {
+            start: node.start_byte(),
+            end: node.end_byte(),
+        });
+    }
+
+    scopes
+}
+
+fn enclosing_scope(node: Node) -> ScopeKey {
+    scope_chain(node).into_iter().next().unwrap_or(ScopeKey {
+        start: node.start_byte(),
+        end: node.end_byte(),
+    })
+}
+
+fn is_scope_node(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        "module" | "function_definition" | "class_definition" | "lambda"
+    )
 }
 
 fn parse_static_value_node(node: Node<'_>) -> (Option<CallableValueType>, bool) {

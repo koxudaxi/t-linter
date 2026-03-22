@@ -37,6 +37,7 @@ pub struct CallableParameter {
     pub accepts_none: bool,
     pub required: bool,
     pub allows_keyword: bool,
+    pub keyword_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,9 +64,9 @@ struct AssignmentKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ScopeKey {
-    start: usize,
-    end: usize,
+pub(crate) struct ScopeKey {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -415,9 +416,10 @@ impl TemplateStringParser {
         let mut cursor = params_node.walk();
         let mut position = 0;
         let mut receiver_skipped = !skip_receiver;
+        let mut keyword_only = false;
         for child in params_node.children(&mut cursor) {
             match child.kind() {
-                "keyword_separator" => {}
+                "keyword_separator" => keyword_only = true,
                 "positional_separator" => {
                     for parameter in &mut signature.parameters {
                         parameter.allows_keyword = false;
@@ -426,7 +428,10 @@ impl TemplateStringParser {
                 "dictionary_splat_pattern" => {
                     signature.accepts_kwargs = true;
                 }
-                "list_splat_pattern" => receiver_skipped = true,
+                "list_splat_pattern" => {
+                    receiver_skipped = true;
+                    keyword_only = true;
+                }
                 "typed_parameter"
                 | "typed_default_parameter"
                 | "identifier"
@@ -444,6 +449,7 @@ impl TemplateStringParser {
                                 }
                                 "list_splat_pattern" => {
                                     receiver_skipped = true;
+                                    keyword_only = true;
                                     continue;
                                 }
                                 _ => name_node.utf8_text(source.as_bytes()).ok().unwrap_or(""),
@@ -482,6 +488,7 @@ impl TemplateStringParser {
                         accepts_none: type_hints.accepts_none,
                         required,
                         allows_keyword: true,
+                        keyword_only,
                     });
                     position += 1;
                     receiver_skipped = true;
@@ -1285,17 +1292,15 @@ fn resolve_callable_parameter<'a>(
     position: usize,
     keyword: Option<&str>,
 ) -> Option<&'a CallableParameter> {
-    if let Some(keyword) = keyword
-        && let Some(parameter) = signatures
+    if let Some(keyword) = keyword {
+        return signatures
             .iter()
-            .find(|parameter| parameter.name == keyword && parameter.allows_keyword)
-    {
-        return Some(parameter);
+            .find(|parameter| parameter.name == keyword && parameter.allows_keyword);
     }
 
     signatures
         .iter()
-        .find(|parameter| parameter.position == position)
+        .find(|parameter| parameter.position == position && !parameter.keyword_only)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1530,14 +1535,14 @@ fn scope_chain(node: Node) -> Vec<ScopeKey> {
     scopes
 }
 
-fn enclosing_scope(node: Node) -> ScopeKey {
+pub(crate) fn enclosing_scope(node: Node) -> ScopeKey {
     scope_chain(node).into_iter().next().unwrap_or(ScopeKey {
         start: node.start_byte(),
         end: node.end_byte(),
     })
 }
 
-fn is_scope_node(node: Node) -> bool {
+pub(crate) fn is_scope_node(node: Node) -> bool {
     matches!(
         node.kind(),
         "module" | "function_definition" | "class_definition" | "lambda"
@@ -2274,6 +2279,63 @@ load_config(template=t"name: {name}")
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("yaml".to_string()));
         assert_eq!(templates[0].content, "name: {}");
+    }
+
+    #[test]
+    fn test_function_keyword_only_parameter_inference() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+def load_config(*, template: Annotated[Template, "yaml"]) -> None:
+    return None
+
+load_config(template=t"name: {name}")
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_keyword_only_parameter_does_not_accept_positional_template_argument() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+def load_config(*, template: Annotated[Template, "yaml"]) -> None:
+    return None
+
+load_config(t"name: {name}")
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, None);
+    }
+
+    #[test]
+    fn test_positional_only_parameter_does_not_accept_keyword_template_argument() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+def load_config(template: Annotated[Template, "yaml"], /) -> None:
+    return None
+
+load_config(template=t"name: {name}")
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, None);
     }
 
     #[test]

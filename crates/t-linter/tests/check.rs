@@ -891,6 +891,62 @@ template: Annotated[Template, "thtml"] = t"<Button {props} />"
 }
 
 #[test]
+fn check_accepts_int_static_spread_values_for_float_props() {
+    let dir = test_dir("thtml-float-from-int-spread");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Meter(*, ratio: float) -> object:
+    return None
+
+props = {"ratio": 1}
+
+template: Annotated[Template, "thtml"] = t"<Meter {props} />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_resolves_static_spread_bindings_in_the_nearest_scope() {
+    let dir = test_dir("thtml-static-spread-scope");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str) -> object:
+    return None
+
+props = {"tone": "info"}
+
+def render() -> None:
+    props = {"label": "Save"}
+    template: Annotated[Template, "thtml"] = t"<Button {props} />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_mixed_known_and_unknown_spreads_still_report_known_unexpected_props() {
     let dir = test_dir("thtml-known-and-unknown-spread");
     write_file(
