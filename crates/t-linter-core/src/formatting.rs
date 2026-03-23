@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use tstring_syntax::BackendError;
 
 use crate::{Location, TemplateStringInfo, TemplateStringParser};
 
@@ -20,6 +21,44 @@ pub struct TemplateEdit {
     pub location: Location,
     pub replacement: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatError {
+    pub message: String,
+    pub language: Option<String>,
+    pub location: Option<Location>,
+}
+
+impl FormatError {
+    fn from_backend_error(
+        template: &TemplateStringInfo,
+        language: &str,
+        error: BackendError,
+    ) -> Self {
+        let display_language = if language == "yml" { "yaml" } else { language };
+        let primary = error.diagnostics.first();
+        let location = primary
+            .and_then(|diagnostic| diagnostic.span.as_ref())
+            .map(|span| template.backend_span_to_location(span))
+            .or_else(|| Some(template.location.clone()));
+
+        Self {
+            message: primary
+                .map(|diagnostic| diagnostic.message.clone())
+                .unwrap_or(error.message),
+            language: Some(display_language.to_string()),
+            location,
+        }
+    }
+}
+
+impl std::fmt::Display for FormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FormatError {}
 
 pub fn format_document(source: &str) -> Result<Vec<TemplateEdit>> {
     format_document_with_options(source, &FormatOptions::default())
@@ -172,7 +211,7 @@ fn format_template_edit(
                 location: template.location.clone(),
                 replacement: template.formatted_literal(&content),
             })
-            .map_err(Into::into),
+            .map_err(|error| FormatError::from_backend_error(template, &language, error).into()),
     )
 }
 

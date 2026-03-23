@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use serde::Serialize;
 use t_linter_core::{
-    FormatOptions as CoreFormatOptions, LintDiagnostic, LintFileResult, LintRunSummary,
-    apply_template_edits, file_read_error, format_document_in_file_with_options,
+    FormatError, FormatOptions as CoreFormatOptions, LintDiagnostic, LintFileResult,
+    LintRunSummary, apply_template_edits, file_read_error, format_document_in_file_with_options,
     format_document_with_options, lint_source, load_project_config_for_path,
 };
 use tempfile::NamedTempFile;
@@ -203,7 +203,8 @@ fn format_stdin(
     let source =
         String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("stdin is not valid UTF-8"))?;
     let options = resolve_format_options(cli_line_length, &option_source)?;
-    let formatted = format_source(&source, stdin_path.as_deref(), options)?;
+    let formatted = format_source(&source, stdin_path.as_deref(), options)
+        .map_err(|error| anyhow::anyhow!("{}", render_format_failure(Path::new(&label), &error)))?;
     let changed = formatted != source;
 
     if check {
@@ -227,7 +228,7 @@ fn format_files(paths: Vec<String>, check: bool, cli_line_length: Option<usize>)
 
     for failure in walk_report.failures {
         summary.failed += 1;
-        print_format_failure(&failure.display_path, &failure.message);
+        print_format_failure(&failure.display_path, &anyhow::anyhow!(failure.message));
     }
 
     for file in walk_report.python_files {
@@ -235,7 +236,10 @@ fn format_files(paths: Vec<String>, check: bool, cli_line_length: Option<usize>)
             Ok(source) => source,
             Err(error) => {
                 summary.failed += 1;
-                print_format_failure(&file.display_path, &format!("Failed to read file: {error}"));
+                print_format_failure(
+                    &file.display_path,
+                    &anyhow::anyhow!("Failed to read file: {error}"),
+                );
                 continue;
             }
         };
@@ -244,7 +248,10 @@ fn format_files(paths: Vec<String>, check: bool, cli_line_length: Option<usize>)
             Ok(source) => source,
             Err(_) => {
                 summary.failed += 1;
-                print_format_failure(&file.display_path, "File is not valid UTF-8");
+                print_format_failure(
+                    &file.display_path,
+                    &anyhow::anyhow!("File is not valid UTF-8"),
+                );
                 continue;
             }
         };
@@ -253,7 +260,7 @@ fn format_files(paths: Vec<String>, check: bool, cli_line_length: Option<usize>)
             Ok(options) => options,
             Err(error) => {
                 summary.failed += 1;
-                print_format_failure(&file.display_path, &error.to_string());
+                print_format_failure(&file.display_path, &error);
                 continue;
             }
         };
@@ -262,7 +269,7 @@ fn format_files(paths: Vec<String>, check: bool, cli_line_length: Option<usize>)
             Ok(formatted) => formatted,
             Err(error) => {
                 summary.failed += 1;
-                print_format_failure(&file.display_path, &error.to_string());
+                print_format_failure(&file.display_path, &error);
                 continue;
             }
         };
@@ -280,7 +287,7 @@ fn format_files(paths: Vec<String>, check: bool, cli_line_length: Option<usize>)
 
         if let Err(error) = write_formatted_file(&file.canonical_path, formatted.as_bytes()) {
             summary.failed += 1;
-            print_format_failure(&file.display_path, &error.to_string());
+            print_format_failure(&file.display_path, &error);
             continue;
         }
 
@@ -356,8 +363,38 @@ fn write_formatted_file(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn print_format_failure(path: &Path, message: &str) {
-    eprintln!("{}: {}", path.display(), message);
+fn print_format_failure(path: &Path, error: &anyhow::Error) {
+    eprintln!("{}", render_format_failure(path, error));
+}
+
+fn render_format_failure(path: &Path, error: &anyhow::Error) -> String {
+    if let Some(format_error) = error.downcast_ref::<FormatError>() {
+        let language = format_error
+            .language
+            .as_ref()
+            .map(|language| format!(" (language={language})"))
+            .unwrap_or_default();
+
+        if let Some(location) = &format_error.location {
+            return format!(
+                "error: Failed to format {}:{}:{}: {}{}",
+                path.display(),
+                location.start_line,
+                location.start_column,
+                format_error.message,
+                language
+            );
+        }
+
+        return format!(
+            "error: Failed to format {}: {}{}",
+            path.display(),
+            format_error.message,
+            language
+        );
+    }
+
+    format!("{}: {}", path.display(), error)
 }
 
 fn print_format_summary(summary: &FormatSummary, check: bool) {
