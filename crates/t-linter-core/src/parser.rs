@@ -3841,10 +3841,14 @@ fn choose_non_raw_quote(content: &str, preferred_quote: char, use_triple: bool) 
 fn quote_escape_cost(content: &str, quote: char, use_triple: bool) -> usize {
     if use_triple {
         let delimiter = std::iter::repeat_n(quote, 3).collect::<String>();
-        content.matches(&delimiter).count() * 3
+        content.matches(&delimiter).count() * 3 + trailing_quote_run_len(content, quote)
     } else {
         content.matches(quote).count()
     }
+}
+
+fn trailing_quote_run_len(content: &str, quote: char) -> usize {
+    content.chars().rev().take_while(|&ch| ch == quote).count()
 }
 
 fn escape_python_literal_content(content: &str, quote: char, use_triple: bool) -> String {
@@ -3874,7 +3878,17 @@ fn escape_python_literal_content(content: &str, quote: char, use_triple: bool) -
         } else {
             "\\\"\\\"\\\""
         };
-        escaped.replace(&delimiter, escaped_delimiter)
+        let mut escaped = escaped.replace(&delimiter, escaped_delimiter);
+        let trailing_quotes = trailing_quote_run_len(&escaped, quote);
+        if trailing_quotes > 0 {
+            let split_at = escaped.len() - trailing_quotes;
+            let suffix = escaped[split_at..].to_string();
+            escaped.replace_range(
+                split_at..,
+                &format!("{}{}", "\\".repeat(trailing_quotes), suffix),
+            );
+        }
+        escaped
     } else {
         escaped
     }
@@ -4027,6 +4041,20 @@ html = t"""
             templates[0]
                 .formatted_literal(r#"<body><h1 style="color: #007acc">{heading}</h1></body>"#),
             r#"t"""<body><h1 style="color: #007acc">{heading}</h1></body>""""#
+        );
+    }
+
+    #[test]
+    fn test_formatted_literal_avoids_triple_quote_boundary_collision() {
+        let source = r#"payload = t"""placeholder""""#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(
+            templates[0]
+                .formatted_literal("[project]\nname = \"{project_name}\"\nversion = \"{version}\""),
+            "t'''[project]\nname = \"{project_name}\"\nversion = \"{version}\"'''"
         );
     }
 

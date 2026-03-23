@@ -844,6 +844,131 @@ render_thtml(t"""
 }
 
 #[test]
+fn format_keeps_triple_quoted_toml_templates_with_quoted_strings_idempotent() {
+    assert_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+type toml_config = Annotated[Template, "toml"]
+
+def load_toml(template: toml_config) -> None:
+    pass
+
+project_name = "demo-project"
+version = "0.1.0"
+
+load_toml(t"""
+[project]
+name = "{project_name}"
+version = "{version}"
+""")
+"#,
+        &[r#"name = "{project_name}""#, r#"version = "{version}""#],
+        &[r#"name = \"{project_name}\""#, r#"version = \"{version}\""#],
+    );
+}
+
+#[test]
+fn format_keeps_mixed_language_template_suite_idempotent() {
+    assert_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> None:
+    pass
+
+
+def run_sql(template: Annotated[Template, "sql"]) -> None:
+    pass
+
+
+type css = Annotated[Template, "css"]
+type yaml_config = Annotated[Template, "yaml"]
+type toml_config = Annotated[Template, "toml"]
+
+
+def load_styles(template: css) -> None:
+    pass
+
+
+def load_yaml(template: yaml_config) -> None:
+    pass
+
+
+def load_toml(template: toml_config) -> None:
+    pass
+
+
+title = "t-linter"
+heading = "Template strings with syntax highlighting"
+content = "Interpolations stay as normal Python expressions."
+
+render_html(t"""
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>{title}</title>
+    </head>
+    <body>
+        <h1 style="color: #007acc">{heading}</h1>
+        <p>{content}</p>
+    </body>
+</html>
+""")
+
+start_date = "2026-01-01"
+
+run_sql(t"""
+SELECT u.name, u.email, p.title
+FROM users u
+JOIN posts p ON u.id = p.author_id
+WHERE u.created_at > {start_date}
+ORDER BY u.name
+""")
+
+padding = 24
+
+load_styles(t"""
+.container {{
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: {padding}px;
+}}
+""")
+
+app_name = "demo-app"
+
+load_yaml(t"""
+app:
+  name: {app_name}
+  debug: true
+""")
+
+project_name = "demo-project"
+version = "0.1.0"
+
+load_toml(t"""
+[project]
+name = "{project_name}"
+version = "{version}"
+""")
+"#,
+        &[
+            r#"style="color: #007acc""#,
+            r#"WHERE u.created_at > {start_date}"#,
+            r#"padding: {padding}px;"#,
+            r#"name = "{project_name}""#,
+            r#"version = "{version}""#,
+        ],
+        &[
+            r#"style=\"color: #007acc\""#,
+            r#"name = \"{project_name}\""#,
+            r#"version = \"{version}\""#,
+        ],
+    );
+}
+
+#[test]
 fn format_handles_mixed_supported_and_unsupported_templates() {
     let dir = test_dir("mixed");
     let path = dir.join("example.py");
