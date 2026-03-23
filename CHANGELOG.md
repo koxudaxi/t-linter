@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 This changelog is generated from GitHub Releases and may include manual corrections when release metadata needs adjustment.
 
 ---
+## [0.5.1](https://github.com/koxudaxi/t-linter/releases/tag/0.5.1) - 2026-03-23
+
+## What's Changed
+* Fix 0.4.0 and 0.5.0 changelog entries by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/27
+* Resolve html_tstring type aliases inside unions by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/28
+
+
+**Full Changelog**: https://github.com/koxudaxi/t-linter/compare/0.5.0...0.5.1
+
+---
+
 ## [0.5.0](https://github.com/koxudaxi/t-linter/releases/tag/0.5.0) - 2026-03-23
 
 ## Fixed
