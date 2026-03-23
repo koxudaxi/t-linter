@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 This changelog is generated from GitHub Releases and may include manual corrections when release metadata needs adjustment.
 
 ---
+## [0.6.0](https://github.com/koxudaxi/t-linter/releases/tag/0.6.0) - 2026-03-23
+
+## Breaking Changes
+
+### CLI Changes
+* Error output format changed - Format error messages on stderr changed from `{path}: {message}` to `error: Failed to format {path}:{line}:{col}: {message} (language={lang})`. Tools or CI scripts that parse stderr error output may need to be updated to handle the new format. (#31)
+
+### Default Behavior Changes
+* Formatting output changed for triple-quoted template strings containing quotes - Plain quotes inside triple-quoted strings (e.g., `"""..."""`) are no longer unnecessarily escaped. For example, `\"` inside a triple-double-quoted string is now preserved as `"`. This is a correctness fix but changes the formatted output for affected files. (#31)
+
+## What's Changed
+* Improve format errors by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/31
+
+
+**Full Changelog**: https://github.com/koxudaxi/t-linter/compare/0.5.2...0.6.0
+
+---
+
 ## [0.5.2](https://github.com/koxudaxi/t-linter/releases/tag/0.5.2) - 2026-03-23
 
 ## What's Changed
