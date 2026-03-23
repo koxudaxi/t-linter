@@ -1573,7 +1573,7 @@ dependencies = [
 [[package]]
 name = "tstring-format-doc"
 version = "0.1.0"
-source = "git+https://github.com/koxudaxi/tstring-html.git?rev=70db53807b5ee1564edac813bccafa1ca2d9edea#70db53807b5ee1564edac813bccafa1ca2d9edea"
+source = "git+https://github.com/koxudaxi/tstring-html.git?tag=0.1.4#88264ad4b755ae6e71213b9c94458fa30cc1f203"
 dependencies = [
  "unicode-width",
 ]
@@ -1581,7 +1581,7 @@ dependencies = [
 [[package]]
 name = "tstring-html"
 version = "0.1.0"
-source = "git+https://github.com/koxudaxi/tstring-html.git?rev=70db53807b5ee1564edac813bccafa1ca2d9edea#70db53807b5ee1564edac813bccafa1ca2d9edea"
+source = "git+https://github.com/koxudaxi/tstring-html.git?tag=0.1.4#88264ad4b755ae6e71213b9c94458fa30cc1f203"
 dependencies = [
  "tstring-format-doc",
  "tstring-syntax",
@@ -1609,7 +1609,7 @@ dependencies = [
 [[package]]
 name = "tstring-thtml"
 version = "0.1.0"
-source = "git+https://github.com/koxudaxi/tstring-html.git?rev=70db53807b5ee1564edac813bccafa1ca2d9edea#70db53807b5ee1564edac813bccafa1ca2d9edea"
+source = "git+https://github.com/koxudaxi/tstring-html.git?tag=0.1.4#88264ad4b755ae6e71213b9c94458fa30cc1f203"
 dependencies = [
  "tstring-html",
  "tstring-syntax",
