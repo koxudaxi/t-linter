@@ -369,6 +369,81 @@ template: Annotated[Template, "html"] = t"<script>{code}</script>"
 }
 
 #[test]
+fn check_allows_title_interpolation_in_html_templates() {
+    let dir = test_dir("html-title");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+title = "Dashboard"
+template: Annotated[Template, "html"] = t"<title>{title}</title>"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_allows_title_interpolation_in_thtml_templates() {
+    let dir = test_dir("thtml-title");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+title = "Dashboard"
+template: Annotated[Template, "thtml"] = t"<title>{title}</title>"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_keeps_textarea_interpolation_rejected_for_html_templates() {
+    let dir = test_dir("html-textarea");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+value = "hello"
+template: Annotated[Template, "html"] = t"<textarea>{value}</textarea>"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Interpolations are not allowed inside <textarea>")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_reports_html_parse_errors_via_imported_function_annotation() {
     let dir = test_dir("html-imported-parse");
     write_file(
