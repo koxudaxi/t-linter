@@ -82,6 +82,23 @@ fn assert_format_round_trip_is_stable(
     expected_fragments: &[&str],
     unexpected_fragments: &[&str],
 ) {
+    assert_format_round_trip_is_stable_with_first_pass(source, expected_fragments, unexpected_fragments, true);
+}
+
+fn assert_format_round_trip_is_stable_allowing_noop_first_pass(
+    source: &str,
+    expected_fragments: &[&str],
+    unexpected_fragments: &[&str],
+) {
+    assert_format_round_trip_is_stable_with_first_pass(source, expected_fragments, unexpected_fragments, false);
+}
+
+fn assert_format_round_trip_is_stable_with_first_pass(
+    source: &str,
+    expected_fragments: &[&str],
+    unexpected_fragments: &[&str],
+    require_first_reformat: bool,
+) {
     let dir = test_dir("format-round-trip-stable");
     let path = dir.join("example.py");
     write_file(&path, source);
@@ -99,7 +116,15 @@ fn assert_format_round_trip_is_stable(
     assert_eq!(first.status.code(), Some(0));
     assert_eq!(second.status.code(), Some(0));
     assert_eq!(check.status.code(), Some(0));
-    assert!(first_stderr.contains("Reformatted example.py"));
+    if require_first_reformat {
+        assert!(first_stderr.contains("Reformatted example.py"));
+    } else {
+        assert!(
+            first_stderr.contains("Reformatted example.py")
+                || first_stderr
+                    .contains("0 files reformatted, 1 files left unchanged, 0 inputs failed")
+        );
+    }
     assert!(second_stderr.contains("0 files reformatted, 1 files left unchanged, 0 inputs failed"));
     assert!(check_stdout.is_empty());
     assert!(
@@ -118,15 +143,21 @@ fn assert_format_round_trip_is_stable(
 
 fn assert_stdin_format_round_trip_is_stable(
     source: &str,
-    stdin_filename: &str,
+    stdin_filename: Option<&str>,
     expected_fragments: &[&str],
     unexpected_fragments: &[&str],
 ) {
     let dir = test_dir("format-stdin-round-trip-stable");
 
+    let mut format_args = vec!["format"];
+    if let Some(stdin_filename) = stdin_filename {
+        format_args.extend(["--stdin-filename", stdin_filename]);
+    }
+    format_args.push("-");
+
     let first = run_t_linter(
         &dir,
-        &["format", "--stdin-filename", stdin_filename, "-"],
+        &format_args,
         Some(source.as_bytes()),
     );
     let first_stdout = String::from_utf8(first.stdout).unwrap();
@@ -134,15 +165,21 @@ fn assert_stdin_format_round_trip_is_stable(
 
     let second = run_t_linter(
         &dir,
-        &["format", "--stdin-filename", stdin_filename, "-"],
+        &format_args,
         Some(first_stdout.as_bytes()),
     );
     let second_stdout = String::from_utf8(second.stdout).unwrap();
     let second_stderr = String::from_utf8(second.stderr).unwrap();
 
+    let mut check_args = vec!["format", "--check"];
+    if let Some(stdin_filename) = stdin_filename {
+        check_args.extend(["--stdin-filename", stdin_filename]);
+    }
+    check_args.push("-");
+
     let check = run_t_linter(
         &dir,
-        &["format", "--check", "--stdin-filename", stdin_filename, "-"],
+        &check_args,
         Some(second_stdout.as_bytes()),
     );
     let check_stdout = String::from_utf8(check.stdout).unwrap();
@@ -813,7 +850,7 @@ render_html(t"""
 </html>
 """)
 "#,
-        "sample.py",
+        Some("sample.py"),
         &[r#"style="color: #007acc""#],
         &[r#"style=\"color: #007acc\""#],
     );
@@ -837,7 +874,7 @@ render_thtml(t"""
 </Card>
 """)
 "#,
-        "component.py",
+        Some("component.py"),
         &[r#"title="{title}""#, r#"tone="info""#, r#"label="status""#],
         &[r#"tone=\'info\'"#, r#"label=\"status\""#],
     );
@@ -865,6 +902,64 @@ version = "{version}"
 "#,
         &[r#"name = "{project_name}""#, r#"version = "{version}""#],
         &[r#"name = \"{project_name}\""#, r#"version = \"{version}\""#],
+    );
+}
+
+#[test]
+fn format_keeps_triple_quoted_html_templates_with_embedded_delimiters_idempotent() {
+    assert_format_round_trip_is_stable_allowing_noop_first_pass(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> str:
+    return ""
+
+render_html(t"""
+<div><p>Double delimiter: """</p><p>Single delimiter: '''</p></div>
+""")
+"#,
+        &[r#"Double delimiter: """"#, r#"Single delimiter: '''"#],
+        &[],
+    );
+}
+
+#[test]
+fn format_keeps_triple_single_quoted_html_templates_with_embedded_delimiters_idempotent() {
+    assert_format_round_trip_is_stable_allowing_noop_first_pass(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> str:
+    return ""
+
+render_html(t'''
+<div><p>Double delimiter: """</p><p>Single delimiter: '''</p></div>
+''')
+"#,
+        &[r#"Double delimiter: """"#, r#"Single delimiter: '''"#],
+        &[],
+    );
+}
+
+#[test]
+fn format_stdin_without_filename_keeps_triple_quoted_html_templates_idempotent() {
+    assert_stdin_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> str:
+    return ""
+
+render_html(t"""
+<div>
+  <p>Double delimiter: """</p>
+  <p>Single delimiter: '''</p>
+</div>
+""")
+"#,
+        None,
+        &[r#"Double delimiter: """"#, r#"Single delimiter: '''"#],
+        &[],
     );
 }
 
@@ -957,6 +1052,7 @@ version = "{version}"
             r#"style="color: #007acc""#,
             r#"WHERE u.created_at > {start_date}"#,
             r#"padding: {padding}px;"#,
+            r#"name: {app_name}"#,
             r#"name = "{project_name}""#,
             r#"version = "{version}""#,
         ],

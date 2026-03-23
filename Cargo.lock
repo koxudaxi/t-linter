@@ -1095,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "t-linter"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1108,7 +1108,7 @@ dependencies = [
 
 [[package]]
 name = "t-linter-cli"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1122,7 +1122,7 @@ dependencies = [
 
 [[package]]
 name = "t-linter-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "regex",
@@ -1151,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "t-linter-lsp"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "dashmap 6.1.0",
@@ -1581,9 +1581,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-html"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af9129049b25c2d1cd63a74977c2287625f1b82287d0e646f5954e7f20d68095"
+checksum = "3be409d983bc60d6fb2f0556fc6703f8d51deefe4fb2e5057a0218a82b6684c2"
 dependencies = [
  "tstring-format-doc",
  "tstring-syntax",
@@ -1610,9 +1610,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-thtml"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d523f8feefbff0d5ada6415f8ab25eef5cc19d17f3d10547c5139c9a3102039c"
+checksum = "35d23b271e50251fa9ad615ba3c02be8d5aee2dfb8c61a7650aa5468d162da53"
 dependencies = [
  "tstring-html",
  "tstring-syntax",
