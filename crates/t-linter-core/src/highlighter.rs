@@ -131,6 +131,11 @@ impl TemplateHighlighter {
         })
     }
 
+    pub fn supports_language(&self, language: &str) -> bool {
+        self.language_configs
+            .contains_key(language.to_ascii_lowercase().as_str())
+    }
+
     pub fn highlight_template(
         &mut self,
         template: &TemplateStringInfo,

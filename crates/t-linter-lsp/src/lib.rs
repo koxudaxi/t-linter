@@ -446,33 +446,39 @@ impl TLinterLanguageServer {
                 info!("Attempting to highlight {} template", lang);
 
                 let mut highlighter = self.highlighter.lock().await;
-                match highlighter.highlight_template(template) {
-                    Ok(ranges) => {
-                        info!("Successfully highlighted {} ranges", ranges.len());
+                if highlighter.supports_language(lang) {
+                    match highlighter.highlight_template(template) {
+                        Ok(ranges) => {
+                            info!("Successfully highlighted {} ranges", ranges.len());
 
-                        for (i, range) in ranges.iter().take(5).enumerate() {
-                            info!(
-                                "  Range {}: {}..{} type={}",
-                                i, range.start_byte, range.end_byte, range.highlight_name
-                            );
+                            for (i, range) in ranges.iter().take(5).enumerate() {
+                                info!(
+                                    "  Range {}: {}..{} type={}",
+                                    i, range.start_byte, range.end_byte, range.highlight_name
+                                );
+                            }
+
+                            let tokens = highlighter.to_lsp_tokens(ranges, template);
+                            info!("Converted to {} LSP tokens", tokens.len());
+
+                            all_tokens.extend(tokens);
                         }
+                        Err(e) => {
+                            self.client
+                                .log_message(
+                                    MessageType::ERROR,
+                                    format!("Failed to highlight {} template: {}", lang, e),
+                                )
+                                .await;
 
-                        let tokens = highlighter.to_lsp_tokens(ranges, template);
-                        info!("Converted to {} LSP tokens", tokens.len());
-
-                        all_tokens.extend(tokens);
+                            let tokens = self.generate_fallback_tokens(template, &text);
+                            all_tokens.extend(tokens);
+                        }
                     }
-                    Err(e) => {
-                        self.client
-                            .log_message(
-                                MessageType::ERROR,
-                                format!("Failed to highlight {} template: {}", lang, e),
-                            )
-                            .await;
-
-                        let tokens = self.generate_fallback_tokens(template, &text);
-                        all_tokens.extend(tokens);
-                    }
+                } else {
+                    info!("Unsupported highlight language {}, using fallback tokens", lang);
+                    let tokens = self.generate_fallback_tokens(template, &text);
+                    all_tokens.extend(tokens);
                 }
             } else {
                 info!("No language specified, using fallback tokens");
