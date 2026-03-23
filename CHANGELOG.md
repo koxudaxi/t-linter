@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 This changelog is generated from GitHub Releases and may include manual corrections when release metadata needs adjustment.
 
 ---
+## [0.5.2](https://github.com/koxudaxi/t-linter/releases/tag/0.5.2) - 2026-03-23
+
+## What's Changed
+* Refactor annotation type resolution by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/29
+* Allow title interpolation by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/30
+
+
+**Full Changelog**: https://github.com/koxudaxi/t-linter/compare/0.5.1...0.5.2
+
+---
+
 ## [0.5.1](https://github.com/koxudaxi/t-linter/releases/tag/0.5.1) - 2026-03-23
 
 ## What's Changed
