@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 This changelog is automatically generated from GitHub Releases.
 
 ---
+## [0.5.0](https://github.com/koxudaxi/t-linter/releases/tag/0.5.0) - 2026-03-23
+
+## Breaking Changes
+
+### CLI Changes
+* Removed `--line-length` flag from `format` command - The `t-linter format --line-length <N>` option has been removed as part of a version revert from 0.4.0 to 0.3.0. Users who relied on this flag will get an unrecognized argument error. (#26)
+
+### Configuration Changes
+* Removed `line-length` from `pyproject.toml` configuration - The `tool.t-linter.line-length` key is no longer recognized. Existing `pyproject.toml` files with this key will have it silently ignored. (#26)
+
+### LSP Protocol Changes
+* Removed `printWidth` and `lineLength` formatting options from LSP - The LSP server no longer reads custom `printWidth` or `lineLength` properties from `textDocument/formatting` requests. Editors configured to pass these options will have them silently ignored; HTML/T-HTML formatting now uses upstream library defaults. (#26)
+
+### Default Behavior Changes
+* HTML and T-HTML formatting no longer support configurable line length - The `FormatOptions` struct and all `*_with_options` formatting functions (`format_document_with_options`, `format_document_in_file_with_options`, `format_document_range_with_options`) have been removed from `t-linter-core`. The `project_config` module (`ProjectConfig`, `find_config_root`, `load_project_config`, `load_project_config_for_path`) has also been removed. Code depending on these `t-linter-core` Rust APIs will fail to compile. (#26)
+
+## What's Changed
+* Fix check hang with html_tstring imports by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/26
+
+
+**Full Changelog**: https://github.com/koxudaxi/t-linter/compare/0.4.0...0.5.0
+
+---
+
 ## [0.4.0](https://github.com/koxudaxi/t-linter/releases/tag/0.4.0) - 2026-03-23
 
 ## Breaking Changes
