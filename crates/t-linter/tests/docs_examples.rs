@@ -112,6 +112,11 @@ fn docs_index_quick_start_example_stays_lintable() {
 }
 
 #[test]
+fn llms_full_quick_start_example_stays_lintable() {
+    assert_doc_example_is_clean("docs/llms-full.txt", "## Quick Start Example", 5);
+}
+
+#[test]
 fn supported_languages_detection_example_stays_lintable() {
     assert_doc_example_is_clean("docs/supported-languages.md", "## Language Detection", 2);
 }
@@ -119,4 +124,9 @@ fn supported_languages_detection_example_stays_lintable() {
 #[test]
 fn supported_languages_examples_stay_lintable() {
     assert_doc_example_is_clean("docs/supported-languages.md", "## Examples", 8);
+}
+
+#[test]
+fn llms_full_supported_languages_examples_stay_lintable() {
+    assert_doc_example_is_clean("docs/llms-full.txt", "## Examples", 8);
 }
