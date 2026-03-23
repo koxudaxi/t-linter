@@ -308,70 +308,96 @@ t-linter stats src/  # Specific directory
 
 ## Quick Start Example
 
-Here's how to use template strings with automatic syntax highlighting:
+Here's a complete example you can run through `t-linter check` right away. Each
+helper function declares the embedded language once, and the interpolation
+values are defined next to the template usage:
 
 ```python
 from typing import Annotated
 from string.templatelib import Template
 
-# HTML template with syntax highlighting
-page: Annotated[Template, "html"] = t"""
+def render_html(template: Annotated[Template, "html"]) -> None:
+    pass
+
+
+def run_sql(template: Annotated[Template, "sql"]) -> None:
+    pass
+
+
+type css = Annotated[Template, "css"]
+type yaml_config = Annotated[Template, "yaml"]
+type toml_config = Annotated[Template, "toml"]
+
+
+def load_styles(template: css) -> None:
+    pass
+
+
+def load_yaml(template: yaml_config) -> None:
+    pass
+
+
+def load_toml(template: toml_config) -> None:
+    pass
+
+
+title = "t-linter"
+heading = "Template strings with syntax highlighting"
+content = "Interpolations stay as normal Python expressions."
+
+render_html(t"""
 <!DOCTYPE html>
 <html>
     <head>
         <title>{title}</title>
-        <style>
-            body { font-family: Arial, sans-serif; }
-            .highlight { color: #007acc; }
-        </style>
     </head>
     <body>
-        <h1 class="highlight">{heading}</h1>
+        <h1 style="color: #007acc">{heading}</h1>
         <p>{content}</p>
     </body>
 </html>
-"""
+""")
 
-# SQL query with syntax highlighting
-query: Annotated[Template, "sql"] = t"""
-SELECT u.name, u.email, p.title 
-FROM users u 
-JOIN posts p ON u.id = p.author_id 
+start_date = "2026-01-01"
+
+run_sql(t"""
+SELECT u.name, u.email, p.title
+FROM users u
+JOIN posts p ON u.id = p.author_id
 WHERE u.created_at > {start_date}
 ORDER BY u.name
-"""
+""")
 
-# T-HTML template with component syntax
-type thtml = Annotated[Template, "thtml"]
-card: thtml = t"""
-<Card title="{title}">
-    <Badge tone="success">{status}</Badge>
-</Card>
-"""
+padding = 24
 
-# Type aliases for reusable templates
-type css = Annotated[Template, "css"]
-type js = Annotated[Template, "javascript"]
-type yaml_config = Annotated[Template, "yaml"]
-type toml_config = Annotated[Template, "toml"]
-
-styles: css = t"""
-.container {
+load_styles(t"""
+.container {{
     max-width: 1200px;
     margin: 0 auto;
     padding: {padding}px;
-}
-"""
+}}
+""")
 
-settings: yaml_config = t"""
+app_name = "demo-app"
+
+load_yaml(t"""
 app:
   name: {app_name}
   debug: true
-"""
+""")
 
-pyproject: toml_config = t"""
+project_name = "demo-project"
+version = "0.1.0"
+
+load_toml(t"""
 [project]
 name = "{project_name}"
 version = "{version}"
-"""
+""")
 ```
+
+Use `{{` and `}}` when the embedded language needs literal braces, such as CSS
+or JSON objects.
+
+For `html`, `<title>{value}</title>` is allowed and treated as escaped text.
+`<script>`, `<style>`, and `<textarea>` still reject interpolations for safety.
