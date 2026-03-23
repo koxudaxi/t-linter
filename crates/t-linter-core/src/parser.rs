@@ -196,6 +196,7 @@ pub struct TemplateStringParser {
     runtime_python_search_roots: Option<Vec<PathBuf>>,
     last_module_context: ModuleContext,
     last_module_type_data: ModuleTypeData,
+    last_module_cache: HashMap<PathBuf, ModuleTypeData>,
     module_load_stack: Vec<ModuleCacheKey>,
     modules_with_incomplete_dependencies: HashSet<ModuleCacheKey>,
 }
@@ -214,6 +215,7 @@ impl TemplateStringParser {
             runtime_python_search_roots: None,
             last_module_context: ModuleContext::default(),
             last_module_type_data: ModuleTypeData::default(),
+            last_module_cache: HashMap::new(),
             module_load_stack: Vec::new(),
             modules_with_incomplete_dependencies: HashSet::new(),
         })
@@ -241,6 +243,7 @@ impl TemplateStringParser {
         search_root: Option<PathBuf>,
     ) -> Result<Vec<TemplateStringInfo>> {
         self.search_root = search_root;
+        self.last_module_cache.clear();
         self.module_load_stack.clear();
         self.modules_with_incomplete_dependencies.clear();
         if self.runtime_python_search_roots.is_none() {
@@ -316,6 +319,7 @@ impl TemplateStringParser {
         context.scoped_import_bindings = module_type_data.scoped_import_bindings.clone();
         context.type_aliases =
             self.resolve_module_type_aliases(&module_type_data, &mut module_cache)?;
+        self.last_module_cache = module_cache;
 
         Ok(module_type_data)
     }
@@ -774,7 +778,11 @@ impl TemplateStringParser {
         module_type_data: &mut ModuleTypeData,
         module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
     ) -> Result<()> {
-        for (alias, import_path) in module_type_data.imports.clone() {
+        let import_aliases = module_type_data.imports.keys().cloned().collect::<Vec<_>>();
+        for alias in import_aliases {
+            let Some(import_path) = module_type_data.imports.get(&alias).cloned() else {
+                continue;
+            };
             if !should_resolve_imported_signatures(&import_path) {
                 continue;
             }
@@ -806,7 +814,12 @@ impl TemplateStringParser {
             }
         }
 
-        for import_path in module_type_data.imported_module_paths.clone() {
+        let imported_module_paths = module_type_data
+            .imported_module_paths
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for import_path in imported_module_paths {
             if !should_resolve_imported_signatures(&import_path) {
                 continue;
             }
@@ -1529,16 +1542,16 @@ impl TemplateStringParser {
         type_node: Node,
         source: &str,
     ) -> Result<Option<String>> {
-        let mut module_cache = HashMap::new();
         let module_type_data = self.last_module_type_data.clone();
-        Ok(self
-            .resolve_type_info_from_type_node(
-                type_node,
-                source,
-                &module_type_data,
-                &mut module_cache,
-            )?
-            .template_language)
+        let mut module_cache = std::mem::take(&mut self.last_module_cache);
+        let resolved = self.resolve_type_info_from_type_node(
+            type_node,
+            source,
+            &module_type_data,
+            &mut module_cache,
+        );
+        self.last_module_cache = module_cache;
+        Ok(resolved?.template_language)
     }
 
     fn resolve_module_type_aliases(
