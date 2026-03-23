@@ -1171,7 +1171,7 @@ impl TemplateStringParser {
             self.extract_content_and_interpolations(&node, source)?;
 
         let mut language = if let Some(type_node) = type_annotation {
-            self.resolve_language_from_type_node(type_node, source, context)?
+            self.resolve_language_from_type_node(type_node, source)?
         } else if let Some(func) = func_name {
             self.infer_language_from_function_call(
                 func,
@@ -1528,7 +1528,6 @@ impl TemplateStringParser {
         &mut self,
         type_node: Node,
         source: &str,
-        _context: &ModuleContext,
     ) -> Result<Option<String>> {
         let mut module_cache = HashMap::new();
         let module_type_data = self.last_module_type_data.clone();
@@ -2420,10 +2419,17 @@ fn push_value_type(types: &mut Vec<CallableValueType>, value_type: CallableValue
 }
 
 fn is_int_literal(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_digit() || ch == '-' || ch == '+')
+    if value.is_empty() {
+        return false;
+    }
+
+    let digits = if let Some(rest) = value.strip_prefix(['+', '-']) {
+        rest
+    } else {
+        value
+    };
+
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn is_float_literal(value: &str) -> bool {
