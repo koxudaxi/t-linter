@@ -64,6 +64,108 @@ fn run_t_linter_with_pythonpath(
     child.wait_with_output().unwrap()
 }
 
+fn assert_ruff_style_format_failure(
+    stderr: &str,
+    path_label: &str,
+    line: usize,
+    column: usize,
+    language: &str,
+    message: &str,
+) {
+    assert!(stderr.contains(&format!(
+        "error: Failed to format {path_label}:{line}:{column}: {message} (language={language})"
+    )));
+}
+
+fn assert_format_round_trip_is_stable(
+    source: &str,
+    expected_fragments: &[&str],
+    unexpected_fragments: &[&str],
+) {
+    let dir = test_dir("format-round-trip-stable");
+    let path = dir.join("example.py");
+    write_file(&path, source);
+
+    let first = run_t_linter(&dir, &["format", "example.py"], None);
+    let second = run_t_linter(&dir, &["format", "example.py"], None);
+    let check = run_t_linter(&dir, &["format", "--check", "example.py"], None);
+
+    let first_stderr = String::from_utf8(first.stderr).unwrap();
+    let second_stderr = String::from_utf8(second.stderr).unwrap();
+    let check_stdout = String::from_utf8(check.stdout).unwrap();
+    let check_stderr = String::from_utf8(check.stderr).unwrap();
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(first.status.code(), Some(0));
+    assert_eq!(second.status.code(), Some(0));
+    assert_eq!(check.status.code(), Some(0));
+    assert!(first_stderr.contains("Reformatted example.py"));
+    assert!(second_stderr.contains("0 files reformatted, 1 files left unchanged, 0 inputs failed"));
+    assert!(check_stdout.is_empty());
+    assert!(
+        check_stderr
+            .contains("0 files would be reformatted, 1 files already formatted, 0 inputs failed")
+    );
+    for fragment in expected_fragments {
+        assert!(content.contains(fragment));
+    }
+    for fragment in unexpected_fragments {
+        assert!(!content.contains(fragment));
+    }
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn assert_stdin_format_round_trip_is_stable(
+    source: &str,
+    stdin_filename: &str,
+    expected_fragments: &[&str],
+    unexpected_fragments: &[&str],
+) {
+    let dir = test_dir("format-stdin-round-trip-stable");
+
+    let first = run_t_linter(
+        &dir,
+        &["format", "--stdin-filename", stdin_filename, "-"],
+        Some(source.as_bytes()),
+    );
+    let first_stdout = String::from_utf8(first.stdout).unwrap();
+    let first_stderr = String::from_utf8(first.stderr).unwrap();
+
+    let second = run_t_linter(
+        &dir,
+        &["format", "--stdin-filename", stdin_filename, "-"],
+        Some(first_stdout.as_bytes()),
+    );
+    let second_stdout = String::from_utf8(second.stdout).unwrap();
+    let second_stderr = String::from_utf8(second.stderr).unwrap();
+
+    let check = run_t_linter(
+        &dir,
+        &["format", "--check", "--stdin-filename", stdin_filename, "-"],
+        Some(second_stdout.as_bytes()),
+    );
+    let check_stdout = String::from_utf8(check.stdout).unwrap();
+    let check_stderr = String::from_utf8(check.stderr).unwrap();
+
+    assert_eq!(first.status.code(), Some(0));
+    assert_eq!(second.status.code(), Some(0));
+    assert_eq!(check.status.code(), Some(0));
+    assert!(first_stderr.is_empty());
+    assert!(second_stderr.is_empty());
+    assert!(check_stdout.is_empty());
+    assert!(check_stderr.is_empty());
+    assert_eq!(first_stdout, second_stdout);
+    for fragment in expected_fragments {
+        assert!(second_stdout.contains(fragment));
+    }
+    for fragment in unexpected_fragments {
+        assert!(!second_stdout.contains(fragment));
+    }
+
+    let _ = fs::remove_dir_all(dir);
+}
+
 #[test]
 fn format_rewrites_file_in_place() {
     let dir = test_dir("in-place");
@@ -360,7 +462,7 @@ fn format_leaves_file_untouched_when_formatter_fails() {
     let original = r#"from typing import Annotated
 from string.templatelib import Template
 
-payload: Annotated[Template, "toml"] = t'title ='
+payload: Annotated[Template, "html"] = t"<div><"
 "#;
     write_file(&path, original);
 
@@ -368,10 +470,377 @@ payload: Annotated[Template, "toml"] = t'title ='
     let stderr = String::from_utf8(output.stderr).unwrap();
 
     assert_eq!(output.status.code(), Some(2));
-    assert!(stderr.contains("example.py:"));
+    assert_ruff_style_format_failure(
+        &stderr,
+        "example.py",
+        4,
+        40,
+        "html",
+        "Expected a tag or attribute name.",
+    );
+    assert!(stderr.contains("0 files reformatted, 0 files left unchanged, 1 inputs failed"));
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
 
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_check_reports_ruff_style_failure_details() {
+    let dir = test_dir("formatter-error-check");
+    let path = dir.join("example.py");
+    write_file(
+        &path,
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "html"] = t"<div><"
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "--check", "example.py"], None);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_ruff_style_format_failure(
+        &stderr,
+        "example.py",
+        4,
+        40,
+        "html",
+        "Expected a tag or attribute name.",
+    );
+    assert!(
+        stderr.contains("0 files would be reformatted, 0 files already formatted, 1 inputs failed")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_stdin_reports_ruff_style_failure_details() {
+    let dir = test_dir("formatter-error-stdin");
+    let input = br#"from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "html"] = t"<div><"
+"#;
+
+    let output = run_t_linter(
+        &dir,
+        &["format", "--stdin-filename", "sample.py", "-"],
+        Some(input),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_ruff_style_format_failure(
+        &stderr,
+        "sample.py",
+        4,
+        40,
+        "html",
+        "Expected a tag or attribute name.",
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_reports_ruff_style_failure_details_for_thtml() {
+    let dir = test_dir("formatter-error-thtml");
+    let path = dir.join("example.py");
+    let original = r#"from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "thtml"] = t"<Card><"
+"#;
+    write_file(&path, original);
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_ruff_style_format_failure(
+        &stderr,
+        "example.py",
+        4,
+        41,
+        "thtml",
+        "Expected a tag or attribute name.",
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_reformats_valid_files_even_when_other_inputs_fail() {
+    let dir = test_dir("formatter-error-mixed");
+    let good = dir.join("good.py");
+    let bad = dir.join("bad.py");
+    write_file(
+        &good,
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "toml"] = t'title={title}'
+"#,
+    );
+    let bad_original = r#"from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "html"] = t"<div><"
+"#;
+    write_file(&bad, bad_original);
+
+    let output = run_t_linter(&dir, &["format", "good.py", "bad.py"], None);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr.contains("Reformatted good.py"));
+    assert_ruff_style_format_failure(
+        &stderr,
+        "bad.py",
+        4,
+        40,
+        "html",
+        "Expected a tag or attribute name.",
+    );
+    assert!(stderr.contains("1 files reformatted, 0 files left unchanged, 1 inputs failed"));
+    assert!(
+        fs::read_to_string(&good)
+            .unwrap()
+            .contains(r#"t'title = {title}'"#)
+    );
+    assert_eq!(fs::read_to_string(&bad).unwrap(), bad_original);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_check_reports_failures_alongside_reformat_candidates() {
+    let dir = test_dir("formatter-error-check-mixed");
+    let good = dir.join("good.py");
+    let bad = dir.join("bad.py");
+    write_file(
+        &good,
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "toml"] = t'title={title}'
+"#,
+    );
+    write_file(
+        &bad,
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "html"] = t"<div><"
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "--check", "good.py", "bad.py"], None);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr.contains("Would reformat good.py"));
+    assert_ruff_style_format_failure(
+        &stderr,
+        "bad.py",
+        4,
+        40,
+        "html",
+        "Expected a tag or attribute name.",
+    );
+    assert!(
+        stderr.contains("1 files would be reformatted, 0 files already formatted, 1 inputs failed")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_normalizes_yml_failure_language_to_yaml() {
+    let dir = test_dir("formatter-error-yml");
+    let path = dir.join("example.py");
+    let original = r#"from typing import Annotated
+from string.templatelib import Template
+
+payload: Annotated[Template, "yml"] = t"key: [1,,2]"
+"#;
+    write_file(&path, original);
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_ruff_style_format_failure(
+        &stderr,
+        "example.py",
+        4,
+        49,
+        "yaml",
+        "Expected a YAML value.",
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_keeps_triple_quoted_html_templates_idempotent() {
+    assert_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> str:
+    return ""
+
+title = "Title"
+heading = "Heading"
+content = "Content"
+
+render_html(t"""
+<!DOCTYPE html>
+<html>
+  <head><title>{title}</title></head>
+  <body><h1 style="color: #007acc">{heading}</h1>
+  <p>{content}</p></body>
+</html>
+""")
+"#,
+        &[r#"style="color: #007acc""#],
+        &[r#"style=\"color: #007acc\""#],
+    );
+}
+
+#[test]
+fn format_keeps_triple_single_quoted_html_templates_idempotent() {
+    assert_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> str:
+    return ""
+
+title = "Title"
+heading = "Heading"
+content = "Content"
+
+render_html(t'''
+<!DOCTYPE html>
+        <html>
+  <head><title>{title}</title></head>
+  <body><h1 data-tone='info'>{heading}</h1>
+  <p>{content}</p></body>
+</html>
+''')
+"#,
+        &[r#"data-tone="info""#],
+        &[r#"data-tone=\'info\'"#],
+    );
+}
+
+#[test]
+fn format_keeps_triple_quoted_html_templates_with_mixed_quotes_idempotent() {
+    assert_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> str:
+    return ""
+
+heading = "Heading"
+
+render_html(t"""
+<section class='hero' data-tone="info">
+  <h1 title='Greeting'>{heading}</h1>
+  <p>"Quoted" text and it's still valid.</p>
+</section>
+""")
+"#,
+        &[
+            r#"class="hero""#,
+            r#"data-tone="info""#,
+            r#""Quoted" text and it's still valid."#,
+        ],
+        &[r#"\"Quoted\""#, r#"it\'s"#, r#"title=\'Greeting\'"#],
+    );
+}
+
+#[test]
+fn format_keeps_triple_quoted_thtml_templates_idempotent() {
+    assert_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_thtml(template: Annotated[Template, "thtml"]) -> str:
+    return ""
+
+title = "Title"
+status = "Ready"
+
+render_thtml(t"""
+<Card title="{title}" tone='info'>
+  <Badge label="status">{status}</Badge>
+</Card>
+""")
+"#,
+        &[r#"title="{title}""#, r#"tone="info""#, r#"label="status""#],
+        &[r#"tone=\'info\'"#, r#"label=\"status\""#],
+    );
+}
+
+#[test]
+fn format_stdin_keeps_triple_quoted_html_templates_idempotent() {
+    assert_stdin_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> str:
+    return ""
+
+title = "Title"
+heading = "Heading"
+content = "Content"
+
+render_html(t"""
+<!DOCTYPE html>
+<html>
+  <head><title>{title}</title></head>
+  <body><h1 style="color: #007acc">{heading}</h1>
+  <p>{content}</p></body>
+</html>
+""")
+"#,
+        "sample.py",
+        &[r#"style="color: #007acc""#],
+        &[r#"style=\"color: #007acc\""#],
+    );
+}
+
+#[test]
+fn format_stdin_keeps_triple_quoted_thtml_templates_idempotent() {
+    assert_stdin_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_thtml(template: Annotated[Template, "thtml"]) -> str:
+    return ""
+
+title = "Title"
+status = "Ready"
+
+render_thtml(t"""
+<Card title="{title}" tone='info'>
+  <Badge label="status">{status}</Badge>
+</Card>
+""")
+"#,
+        "component.py",
+        &[r#"title="{title}""#, r#"tone="info""#, r#"label="status""#],
+        &[r#"tone=\'info\'"#, r#"label=\"status\""#],
+    );
 }
 
 #[test]
@@ -625,7 +1094,8 @@ render_yaml(config)
 "#;
     write_file(&path, original);
 
-    let output = run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
+    let output =
+        run_t_linter_with_pythonpath(&dir, &["format", "example.py"], None, Some(&site_packages));
     let content = fs::read_to_string(&path).unwrap();
 
     assert_eq!(output.status.code(), Some(0));
@@ -641,7 +1111,10 @@ fn format_rewrites_template_via_installed_package_parent_relative_reexport() {
     let path = dir.join("example.py");
     write_file(&site_packages.join("typed_api").join("__init__.py"), "");
     write_file(
-        &site_packages.join("typed_api").join("sub").join("__init__.py"),
+        &site_packages
+            .join("typed_api")
+            .join("sub")
+            .join("__init__.py"),
         "from ..impl import render_yaml\n",
     );
     write_file(
@@ -814,7 +1287,10 @@ def render_yaml(template: Annotated[Template, "yaml"]) -> object:
     return None
 "#,
     );
-    write_file(&site_packages.join("typed_api").join("submodule.py"), "value = 1\n");
+    write_file(
+        &site_packages.join("typed_api").join("submodule.py"),
+        "value = 1\n",
+    );
     write_file(
         &path,
         r#"import typed_api.submodule
@@ -841,7 +1317,10 @@ fn format_uses_intermediate_package_after_dotted_import_from_installed_package()
     let path = dir.join("example.py");
     write_file(&site_packages.join("typed_api").join("__init__.py"), "");
     write_file(
-        &site_packages.join("typed_api").join("subpkg").join("__init__.py"),
+        &site_packages
+            .join("typed_api")
+            .join("subpkg")
+            .join("__init__.py"),
         r#"from typing import Annotated
 from string.templatelib import Template
 
@@ -850,7 +1329,10 @@ def render_yaml(template: Annotated[Template, "yaml"]) -> object:
 "#,
     );
     write_file(
-        &site_packages.join("typed_api").join("subpkg").join("mod.py"),
+        &site_packages
+            .join("typed_api")
+            .join("subpkg")
+            .join("mod.py"),
         "value = 1\n",
     );
     write_file(
@@ -1038,7 +1520,10 @@ def render_yaml(template: Annotated[Template, "yaml"]) -> object:
     return None
 "#,
     );
-    write_file(&site_packages.join("typed_api").join("submodule.py"), "value = 1\n");
+    write_file(
+        &site_packages.join("typed_api").join("submodule.py"),
+        "value = 1\n",
+    );
     write_file(&path, original);
 
     let output =

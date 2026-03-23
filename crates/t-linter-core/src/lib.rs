@@ -7,8 +7,8 @@ pub mod parser;
 pub mod project_config;
 
 pub use formatting::{
-    FormatOptions, TemplateEdit, apply_template_edits, format_document, format_document_in_file,
-    format_document_in_file_with_options, format_document_range,
+    FormatError, FormatOptions, TemplateEdit, apply_template_edits, format_document,
+    format_document_in_file, format_document_in_file_with_options, format_document_range,
     format_document_range_with_options, format_document_with_options,
 };
 pub use highlighter::{HighlightedRange, TemplateHighlighter};

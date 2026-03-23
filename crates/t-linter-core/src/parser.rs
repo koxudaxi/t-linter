@@ -3860,8 +3860,8 @@ fn escape_python_literal_content(content: &str, quote: char, use_triple: bool) -
             '\0' => escaped.push_str("\\0"),
             '\u{0008}' => escaped.push_str("\\b"),
             '\u{000C}' => escaped.push_str("\\f"),
-            '\'' if quote == '\'' => escaped.push_str("\\'"),
-            '"' if quote == '"' => escaped.push_str("\\\""),
+            '\'' if quote == '\'' && !use_triple => escaped.push_str("\\'"),
+            '"' if quote == '"' && !use_triple => escaped.push_str("\\\""),
             ch if ch.is_control() => escaped.push_str(&format!("\\x{:02x}", ch as u32)),
             _ => escaped.push(ch),
         }
@@ -4013,6 +4013,20 @@ html = t"""
         assert_eq!(
             templates[0].formatted_literal(r#"{"name": {name}, "message": "Hello"}"#),
             r#"t'{"name": {name}, "message": "Hello"}'"#
+        );
+    }
+
+    #[test]
+    fn test_formatted_literal_keeps_plain_quotes_in_triple_quoted_strings() {
+        let source = r#"payload = t"""placeholder""""#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(
+            templates[0]
+                .formatted_literal(r#"<body><h1 style="color: #007acc">{heading}</h1></body>"#),
+            r#"t"""<body><h1 style="color: #007acc">{heading}</h1></body>""""#
         );
     }
 
