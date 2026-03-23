@@ -77,6 +77,32 @@ fn assert_ruff_style_format_failure(
     )));
 }
 
+fn assert_format_round_trip_is_stable(source: &str, expected_fragment: &str, unexpected: &str) {
+    let dir = test_dir("format-round-trip-stable");
+    let path = dir.join("example.py");
+    write_file(&path, source);
+
+    let first = run_t_linter(&dir, &["format", "example.py"], None);
+    let second = run_t_linter(&dir, &["format", "example.py"], None);
+    let check = run_t_linter(&dir, &["check", "example.py"], None);
+
+    let first_stderr = String::from_utf8(first.stderr).unwrap();
+    let second_stderr = String::from_utf8(second.stderr).unwrap();
+    let check_stdout = String::from_utf8(check.stdout).unwrap();
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(first.status.code(), Some(0));
+    assert_eq!(second.status.code(), Some(0));
+    assert_eq!(check.status.code(), Some(0));
+    assert!(first_stderr.contains("Reformatted example.py"));
+    assert!(second_stderr.contains("0 files reformatted, 1 files left unchanged, 0 inputs failed"));
+    assert!(check_stdout.contains("0 diagnostics"));
+    assert!(content.contains(expected_fragment));
+    assert!(!content.contains(unexpected));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
 #[test]
 fn format_rewrites_file_in_place() {
     let dir = test_dir("in-place");
@@ -596,6 +622,60 @@ payload: Annotated[Template, "yml"] = t"key: [1,,2]"
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
 
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_keeps_triple_quoted_html_templates_idempotent() {
+    assert_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> str:
+    return ""
+
+title = "Title"
+heading = "Heading"
+content = "Content"
+
+render_html(t"""
+<!DOCTYPE html>
+<html>
+  <head><title>{title}</title></head>
+  <body><h1 style="color: #007acc">{heading}</h1>
+  <p>{content}</p></body>
+</html>
+""")
+"#,
+        r#"style="color: #007acc""#,
+        r#"style=\"color: #007acc\""#,
+    );
+}
+
+#[test]
+fn format_keeps_triple_single_quoted_html_templates_idempotent() {
+    assert_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> str:
+    return ""
+
+title = "Title"
+heading = "Heading"
+content = "Content"
+
+render_html(t'''
+<!DOCTYPE html>
+        <html>
+  <head><title>{title}</title></head>
+  <body><h1 data-tone='info'>{heading}</h1>
+  <p>{content}</p></body>
+</html>
+''')
+"#,
+        r#"data-tone="info""#,
+        r#"data-tone=\'info\'"#,
+    );
 }
 
 #[test]
