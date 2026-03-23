@@ -3900,15 +3900,17 @@ fn escape_python_literal_content(content: &str, quote: char, use_triple: bool) -
         } else {
             "\\\"\\\"\\\""
         };
-        let mut escaped = escaped.replace(&delimiter, escaped_delimiter);
-        let trailing_quotes = trailing_quote_run_len(&escaped, quote);
+        let trailing_quotes = trailing_quote_run_len(content, quote);
         if trailing_quotes > 0 {
             let split_at = escaped.len() - trailing_quotes;
+            let mut escaped = escaped[..split_at].replace(&delimiter, escaped_delimiter);
             let replacement = std::iter::repeat_n(format!("\\{quote}"), trailing_quotes)
                 .collect::<String>();
-            escaped.replace_range(split_at.., &replacement);
+            escaped.push_str(&replacement);
+            escaped
+        } else {
+            escaped.replace(&delimiter, escaped_delimiter)
         }
-        escaped
     } else {
         escaped
     }
@@ -4093,6 +4095,23 @@ html = t"""
         let reparsed_templates = reparsed.find_template_strings(&reparsed_source).unwrap();
         assert_eq!(reparsed_templates.len(), 1);
         assert_eq!(reparsed_templates[0].content, "'''\"\"");
+    }
+
+    #[test]
+    fn test_formatted_literal_escapes_trailing_quotes_after_triple_delimiter_replacement() {
+        let source = "payload = t'''placeholder'''";
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+        let formatted = templates[0].formatted_literal(r#""""x"""x'''"#);
+
+        assert_eq!(formatted, r#"t'''"""x"""x\'\'\''''"#);
+
+        let reparsed_source = format!("payload = {formatted}");
+        let mut reparsed = TemplateStringParser::new().unwrap();
+        let reparsed_templates = reparsed.find_template_strings(&reparsed_source).unwrap();
+        assert_eq!(reparsed_templates.len(), 1);
+        assert_eq!(reparsed_templates[0].content, r#""""x"""x'''"#);
     }
 
     #[test]
