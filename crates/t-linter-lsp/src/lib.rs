@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use t_linter_core::{
-    LintDiagnostic, TemplateHighlighter, TemplateStringInfo, TemplateStringParser, format_document,
-    format_document_range, lint_source,
+    FormatOptions as CoreFormatOptions, LintDiagnostic, TemplateHighlighter, TemplateStringInfo,
+    TemplateStringParser, format_document_range_with_options, format_document_with_options,
+    lint_source, load_project_config_for_path,
 };
 use tower_lsp::jsonrpc::Result as JsonRpcResult;
 use tower_lsp::lsp_types::*;
@@ -217,7 +218,7 @@ impl LanguageServer for TLinterLanguageServer {
         &self,
         params: DocumentFormattingParams,
     ) -> JsonRpcResult<Option<Vec<TextEdit>>> {
-        self.format_uri(&params.text_document.uri, None)
+        self.format_uri(&params.text_document.uri, None, Some(&params.options))
             .await
             .map(Some)
     }
@@ -226,9 +227,13 @@ impl LanguageServer for TLinterLanguageServer {
         &self,
         params: DocumentRangeFormattingParams,
     ) -> JsonRpcResult<Option<Vec<TextEdit>>> {
-        self.format_uri(&params.text_document.uri, Some(params.range))
-            .await
-            .map(Some)
+        self.format_uri(
+            &params.text_document.uri,
+            Some(params.range),
+            Some(&params.options),
+        )
+        .await
+        .map(Some)
     }
 }
 
@@ -349,19 +354,27 @@ impl TLinterLanguageServer {
         self.diagnostic_tasks.insert(uri, handle);
     }
 
-    async fn format_uri(&self, uri: &Url, range: Option<Range>) -> JsonRpcResult<Vec<TextEdit>> {
+    async fn format_uri(
+        &self,
+        uri: &Url,
+        range: Option<Range>,
+        formatting_options: Option<&FormattingOptions>,
+    ) -> JsonRpcResult<Vec<TextEdit>> {
         let text = self
             .document_cache
             .get(uri)
             .ok_or_else(|| tower_lsp::jsonrpc::Error::invalid_params("Document not found"))?
             .clone();
+        let options =
+            resolve_lsp_format_options(uri, formatting_options).map_err(internal_error)?;
 
         let edits = match range {
             Some(range) => {
                 let location = lsp_range_to_location(&range);
-                format_document_range(&text, &location).map_err(internal_error)?
+                format_document_range_with_options(&text, &location, &options)
+                    .map_err(internal_error)?
             }
-            None => format_document(&text).map_err(internal_error)?,
+            None => format_document_with_options(&text, &options).map_err(internal_error)?,
         };
 
         Ok(edits
@@ -528,6 +541,45 @@ impl TLinterLanguageServer {
     }
 }
 
+fn resolve_lsp_format_options(
+    uri: &Url,
+    formatting_options: Option<&FormattingOptions>,
+) -> Result<CoreFormatOptions> {
+    let line_length = formatting_options
+        .and_then(extract_line_length_from_lsp_options)
+        .or_else(|| {
+            uri.to_file_path()
+                .ok()
+                .and_then(|path| load_project_config_for_path(&path).ok())
+                .and_then(|config| config.line_length)
+        })
+        .unwrap_or(80)
+        .max(1);
+
+    Ok(CoreFormatOptions { line_length })
+}
+
+fn extract_line_length_from_lsp_options(options: &FormattingOptions) -> Option<usize> {
+    options
+        .properties
+        .get("printWidth")
+        .and_then(json_value_to_usize)
+        .or_else(|| {
+            options
+                .properties
+                .get("lineLength")
+                .and_then(json_value_to_usize)
+        })
+}
+
+fn json_value_to_usize(value: &FormattingProperty) -> Option<usize> {
+    match value {
+        FormattingProperty::Number(value) => usize::try_from(*value).ok(),
+        FormattingProperty::String(value) => value.parse::<usize>().ok(),
+        FormattingProperty::Bool(_) => None,
+    }
+}
+
 fn lint_diagnostic_to_lsp(diagnostic: &LintDiagnostic) -> Diagnostic {
     Diagnostic {
         range: Range {
@@ -609,5 +661,43 @@ impl Default for TLinterConfig {
             pyright_path: None,
             highlight_untyped_templates: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn lsp_format_options_prefer_print_width_then_line_length() {
+        let mut options = FormattingOptions {
+            tab_size: 2,
+            insert_spaces: true,
+            ..Default::default()
+        };
+        options.properties = HashMap::from([
+            ("printWidth".to_string(), FormattingProperty::Number(40)),
+            ("lineLength".to_string(), FormattingProperty::Number(20)),
+        ]);
+
+        assert_eq!(extract_line_length_from_lsp_options(&options), Some(40));
+
+        options.properties.remove("printWidth");
+        assert_eq!(extract_line_length_from_lsp_options(&options), Some(20));
+    }
+
+    #[test]
+    fn lsp_format_options_fall_back_to_pyproject() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            temp.path().join("pyproject.toml"),
+            "[tool.t-linter]\nline-length = 88\n",
+        )
+        .expect("write pyproject");
+        let uri = Url::from_file_path(temp.path().join("example.py")).expect("file url");
+
+        let options = resolve_lsp_format_options(&uri, None).expect("resolve options");
+        assert_eq!(options.line_length, 88);
     }
 }

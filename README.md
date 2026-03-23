@@ -190,6 +190,9 @@ t-linter format src/
 # Check whether formatting would change any files
 t-linter format --check file.py
 
+# Override the formatter line length
+t-linter format --line-length 100 file.py
+
 # Format stdin
 cat file.py | t-linter format --stdin-filename file.py -
 ```
@@ -198,11 +201,13 @@ Configuration can be provided via `pyproject.toml`:
 
 ```toml
 [tool.t-linter]
+line-length = 80
 extend-exclude = ["generated", "vendor"]
 ignore-file = ".t-linterignore"
 ```
 
 Supported keys:
+- `line-length`: formatter print width for HTML and T-HTML templates only
 - `exclude`: override the built-in default excludes
 - `extend-exclude`: add more exclude patterns on top of the defaults
 - `ignore-file`: path to a gitignore-style ignore file, relative to the project root

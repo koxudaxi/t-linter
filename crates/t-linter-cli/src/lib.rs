@@ -8,8 +8,9 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use serde::Serialize;
 use t_linter_core::{
-    LintDiagnostic, LintFileResult, LintRunSummary, apply_template_edits, file_read_error,
-    format_document, format_document_in_file, lint_source,
+    FormatOptions as CoreFormatOptions, LintDiagnostic, LintFileResult, LintRunSummary,
+    apply_template_edits, file_read_error, format_document_in_file_with_options,
+    format_document_with_options, lint_source, load_project_config_for_path,
 };
 use tempfile::NamedTempFile;
 
@@ -39,6 +40,9 @@ pub enum Commands {
 
         #[arg(long)]
         stdin_filename: Option<String>,
+
+        #[arg(long)]
+        line_length: Option<usize>,
     },
     Stats {
         #[arg(default_value = ".")]
@@ -133,7 +137,12 @@ pub fn check(paths: Vec<String>, format: OutputFormat, error_on_issues: bool) ->
     }
 }
 
-pub fn format(paths: Vec<String>, check: bool, stdin_filename: Option<String>) -> Result<i32> {
+pub fn format(
+    paths: Vec<String>,
+    check: bool,
+    stdin_filename: Option<String>,
+    line_length: Option<usize>,
+) -> Result<i32> {
     let paths = if paths.is_empty() {
         vec![".".to_string()]
     } else {
@@ -145,7 +154,7 @@ pub fn format(paths: Vec<String>, check: bool, stdin_filename: Option<String>) -
         if paths.len() != 1 {
             return Err(anyhow::anyhow!("`-` must be the only format path operand"));
         }
-        return format_stdin(check, stdin_filename);
+        return format_stdin(check, stdin_filename, line_length);
     }
 
     if stdin_filename.is_some() {
@@ -154,7 +163,7 @@ pub fn format(paths: Vec<String>, check: bool, stdin_filename: Option<String>) -
         ));
     }
 
-    format_files(paths, check)
+    format_files(paths, check, line_length)
 }
 
 pub fn stats(path: String) -> Result<()> {
@@ -173,8 +182,19 @@ fn has_read_failure(result: &LintFileResult) -> bool {
         .any(|diagnostic| diagnostic.rule == "file-read-error")
 }
 
-fn format_stdin(check: bool, stdin_filename: Option<String>) -> Result<i32> {
-    let stdin_path = stdin_filename.as_ref().map(PathBuf::from);
+fn format_stdin(
+    check: bool,
+    stdin_filename: Option<String>,
+    cli_line_length: Option<usize>,
+) -> Result<i32> {
+    let current_dir = std::env::current_dir().context("Failed to resolve current directory")?;
+    let stdin_path = stdin_filename
+        .as_ref()
+        .map(|path| resolve_input_path(&current_dir, path));
+    let option_source = stdin_path
+        .as_deref()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| current_dir.clone());
     let label = stdin_filename.unwrap_or_else(|| "-".to_string());
     let mut bytes = Vec::new();
     std::io::stdin()
@@ -182,7 +202,8 @@ fn format_stdin(check: bool, stdin_filename: Option<String>) -> Result<i32> {
         .context("Failed to read stdin")?;
     let source =
         String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("stdin is not valid UTF-8"))?;
-    let formatted = format_source(&source, stdin_path.as_deref())?;
+    let options = resolve_format_options(cli_line_length, &option_source)?;
+    let formatted = format_source(&source, stdin_path.as_deref(), options)?;
     let changed = formatted != source;
 
     if check {
@@ -200,7 +221,7 @@ fn format_stdin(check: bool, stdin_filename: Option<String>) -> Result<i32> {
     Ok(0)
 }
 
-fn format_files(paths: Vec<String>, check: bool) -> Result<i32> {
+fn format_files(paths: Vec<String>, check: bool, cli_line_length: Option<usize>) -> Result<i32> {
     let walk_report = collect_python_files(&paths, DiscoveryMode::Format)?;
     let mut summary = FormatSummary::default();
 
@@ -228,7 +249,16 @@ fn format_files(paths: Vec<String>, check: bool) -> Result<i32> {
             }
         };
 
-        let formatted = match format_source(&source, Some(&file.display_path)) {
+        let options = match resolve_format_options(cli_line_length, &file.canonical_path) {
+            Ok(options) => options,
+            Err(error) => {
+                summary.failed += 1;
+                print_format_failure(&file.display_path, &error.to_string());
+                continue;
+            }
+        };
+
+        let formatted = match format_source(&source, Some(&file.canonical_path), options) {
             Ok(formatted) => formatted,
             Err(error) => {
                 summary.failed += 1;
@@ -269,12 +299,31 @@ fn format_files(paths: Vec<String>, check: bool) -> Result<i32> {
     }
 }
 
-fn format_source(source: &str, path: Option<&Path>) -> Result<String> {
+fn format_source(source: &str, path: Option<&Path>, options: CoreFormatOptions) -> Result<String> {
     let edits = match path {
-        Some(path) => format_document_in_file(source, path)?,
-        None => format_document(source)?,
+        Some(path) => format_document_in_file_with_options(source, path, &options)?,
+        None => format_document_with_options(source, &options)?,
     };
     apply_template_edits(source, &edits)
+}
+
+fn resolve_format_options(
+    cli_line_length: Option<usize>,
+    path: &Path,
+) -> Result<CoreFormatOptions> {
+    let config = load_project_config_for_path(path)?;
+    Ok(CoreFormatOptions {
+        line_length: cli_line_length.or(config.line_length).unwrap_or(80).max(1),
+    })
+}
+
+fn resolve_input_path(current_dir: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        current_dir.join(path)
+    }
 }
 
 fn write_formatted_file(path: &Path, contents: &[u8]) -> Result<()> {

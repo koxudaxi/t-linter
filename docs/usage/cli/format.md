@@ -23,6 +23,9 @@ t-linter format src/
 
 # Default target is the current directory
 t-linter format
+
+# Override the formatter line length
+t-linter format --line-length 100 file.py
 ```
 
 ## Check Mode
@@ -50,8 +53,18 @@ cat file.py | t-linter format -
 cat file.py | t-linter format --check --stdin-filename file.py -
 ```
 
-`--stdin-filename` only affects display labels in v1. It does not change config
-resolution or formatter behavior.
+When `--stdin-filename` is provided, `format` resolves `pyproject.toml` from that file's
+parent directory. Without it, stdin formatting resolves config from the current working
+directory.
+
+## Line Length
+
+HTML and T-HTML formatting uses the following precedence. JSON, YAML, and TOML
+formatters ignore `line-length`.
+
+1. `--line-length`
+2. `pyproject.toml` `tool.t-linter.line-length`
+3. default `80`
 
 ## Notes
 
