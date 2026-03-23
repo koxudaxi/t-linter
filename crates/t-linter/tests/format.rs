@@ -77,18 +77,23 @@ fn assert_ruff_style_format_failure(
     )));
 }
 
-fn assert_format_round_trip_is_stable(source: &str, expected_fragment: &str, unexpected: &str) {
+fn assert_format_round_trip_is_stable(
+    source: &str,
+    expected_fragments: &[&str],
+    unexpected_fragments: &[&str],
+) {
     let dir = test_dir("format-round-trip-stable");
     let path = dir.join("example.py");
     write_file(&path, source);
 
     let first = run_t_linter(&dir, &["format", "example.py"], None);
     let second = run_t_linter(&dir, &["format", "example.py"], None);
-    let check = run_t_linter(&dir, &["check", "example.py"], None);
+    let check = run_t_linter(&dir, &["format", "--check", "example.py"], None);
 
     let first_stderr = String::from_utf8(first.stderr).unwrap();
     let second_stderr = String::from_utf8(second.stderr).unwrap();
     let check_stdout = String::from_utf8(check.stdout).unwrap();
+    let check_stderr = String::from_utf8(check.stderr).unwrap();
     let content = fs::read_to_string(&path).unwrap();
 
     assert_eq!(first.status.code(), Some(0));
@@ -96,9 +101,67 @@ fn assert_format_round_trip_is_stable(source: &str, expected_fragment: &str, une
     assert_eq!(check.status.code(), Some(0));
     assert!(first_stderr.contains("Reformatted example.py"));
     assert!(second_stderr.contains("0 files reformatted, 1 files left unchanged, 0 inputs failed"));
-    assert!(check_stdout.contains("0 diagnostics"));
-    assert!(content.contains(expected_fragment));
-    assert!(!content.contains(unexpected));
+    assert!(check_stdout.is_empty());
+    assert!(
+        check_stderr
+            .contains("0 files would be reformatted, 1 files already formatted, 0 inputs failed")
+    );
+    for fragment in expected_fragments {
+        assert!(content.contains(fragment));
+    }
+    for fragment in unexpected_fragments {
+        assert!(!content.contains(fragment));
+    }
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn assert_stdin_format_round_trip_is_stable(
+    source: &str,
+    stdin_filename: &str,
+    expected_fragments: &[&str],
+    unexpected_fragments: &[&str],
+) {
+    let dir = test_dir("format-stdin-round-trip-stable");
+
+    let first = run_t_linter(
+        &dir,
+        &["format", "--stdin-filename", stdin_filename, "-"],
+        Some(source.as_bytes()),
+    );
+    let first_stdout = String::from_utf8(first.stdout).unwrap();
+    let first_stderr = String::from_utf8(first.stderr).unwrap();
+
+    let second = run_t_linter(
+        &dir,
+        &["format", "--stdin-filename", stdin_filename, "-"],
+        Some(first_stdout.as_bytes()),
+    );
+    let second_stdout = String::from_utf8(second.stdout).unwrap();
+    let second_stderr = String::from_utf8(second.stderr).unwrap();
+
+    let check = run_t_linter(
+        &dir,
+        &["format", "--check", "--stdin-filename", stdin_filename, "-"],
+        Some(second_stdout.as_bytes()),
+    );
+    let check_stdout = String::from_utf8(check.stdout).unwrap();
+    let check_stderr = String::from_utf8(check.stderr).unwrap();
+
+    assert_eq!(first.status.code(), Some(0));
+    assert_eq!(second.status.code(), Some(0));
+    assert_eq!(check.status.code(), Some(0));
+    assert!(first_stderr.is_empty());
+    assert!(second_stderr.is_empty());
+    assert!(check_stdout.is_empty());
+    assert!(check_stderr.is_empty());
+    assert_eq!(first_stdout, second_stdout);
+    for fragment in expected_fragments {
+        assert!(second_stdout.contains(fragment));
+    }
+    for fragment in unexpected_fragments {
+        assert!(!second_stdout.contains(fragment));
+    }
 
     let _ = fs::remove_dir_all(dir);
 }
@@ -646,8 +709,8 @@ render_html(t"""
 </html>
 """)
 "#,
-        r#"style="color: #007acc""#,
-        r#"style=\"color: #007acc\""#,
+        &[r#"style="color: #007acc""#],
+        &[r#"style=\"color: #007acc\""#],
     );
 }
 
@@ -673,8 +736,110 @@ render_html(t'''
 </html>
 ''')
 "#,
-        r#"data-tone="info""#,
-        r#"data-tone=\'info\'"#,
+        &[r#"data-tone="info""#],
+        &[r#"data-tone=\'info\'"#],
+    );
+}
+
+#[test]
+fn format_keeps_triple_quoted_html_templates_with_mixed_quotes_idempotent() {
+    assert_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> str:
+    return ""
+
+heading = "Heading"
+
+render_html(t"""
+<section class='hero' data-tone="info">
+  <h1 title='Greeting'>{heading}</h1>
+  <p>"Quoted" text and it's still valid.</p>
+</section>
+""")
+"#,
+        &[
+            r#"class="hero""#,
+            r#"data-tone="info""#,
+            r#""Quoted" text and it's still valid."#,
+        ],
+        &[r#"\"Quoted\""#, r#"it\'s"#, r#"title=\'Greeting\'"#],
+    );
+}
+
+#[test]
+fn format_keeps_triple_quoted_thtml_templates_idempotent() {
+    assert_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_thtml(template: Annotated[Template, "thtml"]) -> str:
+    return ""
+
+title = "Title"
+status = "Ready"
+
+render_thtml(t"""
+<Card title="{title}" tone='info'>
+  <Badge label="status">{status}</Badge>
+</Card>
+""")
+"#,
+        &[r#"title="{title}""#, r#"tone="info""#, r#"label="status""#],
+        &[r#"tone=\'info\'"#, r#"label=\"status\""#],
+    );
+}
+
+#[test]
+fn format_stdin_keeps_triple_quoted_html_templates_idempotent() {
+    assert_stdin_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_html(template: Annotated[Template, "html"]) -> str:
+    return ""
+
+title = "Title"
+heading = "Heading"
+content = "Content"
+
+render_html(t"""
+<!DOCTYPE html>
+<html>
+  <head><title>{title}</title></head>
+  <body><h1 style="color: #007acc">{heading}</h1>
+  <p>{content}</p></body>
+</html>
+""")
+"#,
+        "sample.py",
+        &[r#"style="color: #007acc""#],
+        &[r#"style=\"color: #007acc\""#],
+    );
+}
+
+#[test]
+fn format_stdin_keeps_triple_quoted_thtml_templates_idempotent() {
+    assert_stdin_format_round_trip_is_stable(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_thtml(template: Annotated[Template, "thtml"]) -> str:
+    return ""
+
+title = "Title"
+status = "Ready"
+
+render_thtml(t"""
+<Card title="{title}" tone='info'>
+  <Badge label="status">{status}</Badge>
+</Card>
+""")
+"#,
+        "component.py",
+        &[r#"title="{title}""#, r#"tone="info""#, r#"label="status""#],
+        &[r#"tone=\'info\'"#, r#"label=\"status\""#],
     );
 }
 
