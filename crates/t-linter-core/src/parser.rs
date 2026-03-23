@@ -1500,11 +1500,7 @@ impl TemplateStringParser {
         }
 
         let type_text = type_node.utf8_text(source.as_bytes())?;
-        if let Some(language) = context.type_aliases.get(type_text) {
-            return Ok(Some(language.clone()));
-        }
-
-        self.extract_language_from_type_string(type_text)
+        self.resolve_language_from_type_text(type_text, context)
     }
 
     fn resolve_value_types_from_type_node(
@@ -1527,6 +1523,55 @@ impl TemplateStringParser {
         }
 
         Ok(None)
+    }
+
+    fn resolve_language_from_type_text(
+        &self,
+        type_text: &str,
+        context: &ModuleContext,
+    ) -> Result<Option<String>> {
+        let type_text = type_text.trim();
+        if type_text.is_empty() {
+            return Ok(None);
+        }
+
+        if let Some(language) = context.type_aliases.get(type_text) {
+            return Ok(Some(language.clone()));
+        }
+
+        if let Some(language) = self.extract_language_from_type_string(type_text)? {
+            return Ok(Some(language));
+        }
+
+        if let Some(inner) = unwrap_generic(type_text, "Optional") {
+            return self.resolve_language_from_type_text(inner, context);
+        }
+
+        if let Some(inner) = unwrap_generic(type_text, "Union") {
+            for part in split_top_level(inner, ',') {
+                if let Some(language) = self.resolve_language_from_type_text(part, context)? {
+                    return Ok(Some(language));
+                }
+            }
+            return Ok(None);
+        }
+
+        let union_parts = split_top_level(type_text, '|');
+        if union_parts.len() > 1 {
+            for part in union_parts {
+                if let Some(language) = self.resolve_language_from_type_text(part, context)? {
+                    return Ok(Some(language));
+                }
+            }
+        }
+
+        let type_text = type_text
+            .strip_prefix('(')
+            .and_then(|value| value.strip_suffix(')'))
+            .unwrap_or(type_text)
+            .trim();
+
+        Ok(context.type_aliases.get(type_text).cloned())
     }
 }
 
