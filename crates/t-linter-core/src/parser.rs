@@ -125,11 +125,80 @@ struct NameBinding {
     kind: NameBindingKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ModuleCacheKey {
+    Current,
+    Path(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QualifiedName {
+    parts: Vec<String>,
+}
+
+impl QualifiedName {
+    fn as_string(&self) -> String {
+        self.parts.join(".")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypeExpr {
+    Name(QualifiedName),
+    StringLiteral(String),
+    NoneLiteral,
+    Generic {
+        base: QualifiedName,
+        args: Vec<TypeExpr>,
+    },
+    Union(Vec<TypeExpr>),
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ResolvedTypeInfo {
+    template_language: Option<String>,
+    value_types: Vec<CallableValueType>,
+    accepts_none: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ModuleTypeData {
+    module_key: ModuleCacheKey,
+    is_complete: bool,
+    imports: HashMap<String, String>,
+    alias_exprs: HashMap<String, TypeExpr>,
+    callable_signatures: HashMap<String, CallableSignature>,
+    local_callable_signature_names: HashSet<String>,
+    imported_module_paths: HashSet<String>,
+    scoped_import_bindings: Vec<ScopedImportBinding>,
+}
+
+impl Default for ModuleTypeData {
+    fn default() -> Self {
+        Self {
+            module_key: ModuleCacheKey::Current,
+            is_complete: true,
+            imports: HashMap::new(),
+            alias_exprs: HashMap::new(),
+            callable_signatures: HashMap::new(),
+            local_callable_signature_names: HashSet::new(),
+            imported_module_paths: HashSet::new(),
+            scoped_import_bindings: Vec::new(),
+        }
+    }
+}
+
 pub struct TemplateStringParser {
     parser: Parser,
     search_root: Option<PathBuf>,
+    current_file_path: Option<PathBuf>,
     runtime_python_search_roots: Option<Vec<PathBuf>>,
     last_module_context: ModuleContext,
+    last_module_type_data: ModuleTypeData,
+    last_module_cache: HashMap<PathBuf, ModuleTypeData>,
+    module_load_stack: Vec<ModuleCacheKey>,
+    modules_with_incomplete_dependencies: HashSet<ModuleCacheKey>,
 }
 
 impl TemplateStringParser {
@@ -142,13 +211,19 @@ impl TemplateStringParser {
         Ok(Self {
             parser,
             search_root: None,
+            current_file_path: None,
             runtime_python_search_roots: None,
             last_module_context: ModuleContext::default(),
+            last_module_type_data: ModuleTypeData::default(),
+            last_module_cache: HashMap::new(),
+            module_load_stack: Vec::new(),
+            modules_with_incomplete_dependencies: HashSet::new(),
         })
     }
 
     pub fn find_template_strings(&mut self, source: &str) -> Result<Vec<TemplateStringInfo>> {
         self.search_root = None;
+        self.current_file_path = None;
         self.find_template_strings_with_search_root(source, None)
     }
 
@@ -158,6 +233,7 @@ impl TemplateStringParser {
         path: &Path,
     ) -> Result<Vec<TemplateStringInfo>> {
         let search_root = path.parent().map(Path::to_path_buf);
+        self.current_file_path = Some(path.to_path_buf());
         self.find_template_strings_with_search_root(source, search_root)
     }
 
@@ -167,6 +243,9 @@ impl TemplateStringParser {
         search_root: Option<PathBuf>,
     ) -> Result<Vec<TemplateStringInfo>> {
         self.search_root = search_root;
+        self.last_module_cache.clear();
+        self.module_load_stack.clear();
+        self.modules_with_incomplete_dependencies.clear();
         if self.runtime_python_search_roots.is_none() {
             self.runtime_python_search_roots = Some(discover_runtime_python_search_roots());
         }
@@ -180,7 +259,7 @@ impl TemplateStringParser {
 
         let mut context = ModuleContext::default();
 
-        self.collect_module_context(&tree, source, &mut context)?;
+        let module_type_data = self.collect_module_context(&tree, source, &mut context)?;
         let variable_language_hints = self.collect_variable_language_hints(
             &tree,
             source,
@@ -190,6 +269,7 @@ impl TemplateStringParser {
             &name_bindings,
         )?;
         self.last_module_context = context.clone();
+        self.last_module_type_data = module_type_data;
 
         let mut templates = Vec::new();
         self.find_strings_with_query(
@@ -215,20 +295,79 @@ impl TemplateStringParser {
         tree: &Tree,
         source: &str,
         context: &mut ModuleContext,
-    ) -> Result<()> {
-        self.collect_type_aliases(tree, source, context)?;
-        self.collect_imports(tree, source, context, None, false)?;
-        self.collect_local_callable_signatures(tree, source, context)?;
+    ) -> Result<ModuleTypeData> {
         let mut module_cache = HashMap::new();
-        self.collect_imported_callable_signatures(context, &mut module_cache)?;
-        Ok(())
+        let current_module_key = self
+            .current_file_path
+            .clone()
+            .map(ModuleCacheKey::Path)
+            .unwrap_or(ModuleCacheKey::Current);
+        let module_type_data = self.build_module_type_data(
+            tree,
+            source,
+            None,
+            false,
+            current_module_key,
+            &mut module_cache,
+        )?;
+
+        context.imports = module_type_data.imports.clone();
+        context.callable_signatures = module_type_data.callable_signatures.clone();
+        context.local_callable_signature_names =
+            module_type_data.local_callable_signature_names.clone();
+        context.imported_module_paths = module_type_data.imported_module_paths.clone();
+        context.scoped_import_bindings = module_type_data.scoped_import_bindings.clone();
+        context.type_aliases =
+            self.resolve_module_type_aliases(&module_type_data, &mut module_cache)?;
+        self.last_module_cache = module_cache;
+
+        Ok(module_type_data)
+    }
+
+    fn build_module_type_data(
+        &mut self,
+        tree: &Tree,
+        source: &str,
+        current_module_name: Option<&str>,
+        current_module_is_package: bool,
+        module_key: ModuleCacheKey,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+    ) -> Result<ModuleTypeData> {
+        self.module_load_stack.push(module_key.clone());
+        let build_result = (|| -> Result<ModuleTypeData> {
+            let mut module_type_data = ModuleTypeData {
+                module_key: module_key.clone(),
+                ..ModuleTypeData::default()
+            };
+            self.collect_imports(
+                tree,
+                source,
+                &mut module_type_data,
+                current_module_name,
+                current_module_is_package,
+            )?;
+            self.collect_type_aliases(tree, source, &mut module_type_data)?;
+            self.collect_local_callable_signatures(
+                tree,
+                source,
+                &mut module_type_data,
+                module_cache,
+            )?;
+            self.collect_imported_callable_signatures(&mut module_type_data, module_cache)?;
+            module_type_data.is_complete = !self
+                .modules_with_incomplete_dependencies
+                .remove(&module_key);
+            Ok(module_type_data)
+        })();
+        self.module_load_stack.pop();
+        build_result
     }
 
     fn collect_type_aliases(
         &mut self,
         tree: &Tree,
         source: &str,
-        context: &mut ModuleContext,
+        module_type_data: &mut ModuleTypeData,
     ) -> Result<()> {
         let type_alias_query = r#"
         (type_alias_statement) @type_alias
@@ -259,17 +398,10 @@ impl TemplateStringParser {
                         if let (Some(name), Some(value)) = (name_node, value_node) {
                             let name_text = name.utf8_text(source.as_bytes())?;
 
-                            if let Some(lang) =
-                                self.extract_language_from_annotation(value, source, context)?
-                            {
-                                context.type_aliases.insert(name_text.to_string(), lang);
-                                info!(
-                                    "Found type alias: {} -> {}",
-                                    name_text,
-                                    value.utf8_text(source.as_bytes())?
-                                );
-                            } else {
-                            }
+                            module_type_data.alias_exprs.insert(
+                                name_text.to_string(),
+                                parse_type_expr(value.utf8_text(source.as_bytes())?),
+                            );
                         }
                     }
                 }
@@ -311,16 +443,10 @@ impl TemplateStringParser {
                     let type_text = type_node.utf8_text(source.as_bytes())?;
 
                     if type_text.contains("TypeAlias") {
-                        if let Some(lang) =
-                            self.extract_language_from_annotation(value_node, source, context)?
-                        {
-                            context.type_aliases.insert(name.to_string(), lang);
-                            info!(
-                                "Found TypeAlias style alias: {} -> {}",
-                                name,
-                                value_node.utf8_text(source.as_bytes())?
-                            );
-                        }
+                        module_type_data.alias_exprs.insert(
+                            name.to_string(),
+                            parse_type_expr(value_node.utf8_text(source.as_bytes())?),
+                        );
                     }
                 }
             }
@@ -333,7 +459,7 @@ impl TemplateStringParser {
         &mut self,
         tree: &Tree,
         source: &str,
-        context: &mut ModuleContext,
+        module_type_data: &mut ModuleTypeData,
         current_module_name: Option<&str>,
         current_module_is_package: bool,
     ) -> Result<()> {
@@ -425,26 +551,28 @@ impl TemplateStringParser {
 
                 if let Some(binding_node) = import_alias_node.or(import_name_node) {
                     let scope = enclosing_scope(binding_node);
-                    context.scoped_import_bindings.push(ScopedImportBinding {
-                        scope,
-                        name: key.clone(),
-                        binding_start: binding_node.start_byte(),
-                        import_target: value.clone(),
-                    });
+                    module_type_data
+                        .scoped_import_bindings
+                        .push(ScopedImportBinding {
+                            scope,
+                            name: key.clone(),
+                            binding_start: binding_node.start_byte(),
+                            import_target: value.clone(),
+                        });
                     if matches!(scope.kind, ScopeKind::Module) {
-                        context.imports.insert(key, value);
+                        module_type_data.imports.insert(key, value);
                     }
                 }
 
                 if !is_from_import {
                     for module_path in imported_module_paths_for(import) {
-                        context.imported_module_paths.insert(module_path);
+                        module_type_data.imported_module_paths.insert(module_path);
                     }
                 }
             }
         }
 
-        context
+        module_type_data
             .scoped_import_bindings
             .sort_by_key(|binding| binding.binding_start);
 
@@ -455,7 +583,8 @@ impl TemplateStringParser {
         &mut self,
         tree: &Tree,
         source: &str,
-        context: &mut ModuleContext,
+        module_type_data: &mut ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
     ) -> Result<()> {
         let root = tree.root_node();
         let mut cursor = root.walk();
@@ -470,11 +599,18 @@ impl TemplateStringParser {
                         continue;
                     };
                     let name = name_node.utf8_text(source.as_bytes())?.to_string();
-                    let signature =
-                        self.extract_callable_signature(params_node, source, context, false)?;
+                    let signature = self.extract_callable_signature(
+                        params_node,
+                        source,
+                        module_type_data,
+                        module_cache,
+                        false,
+                    )?;
                     if !signature.is_empty() {
-                        context.local_callable_signature_names.insert(name.clone());
-                        context.callable_signatures.insert(name, signature);
+                        module_type_data
+                            .local_callable_signature_names
+                            .insert(name.clone());
+                        module_type_data.callable_signatures.insert(name, signature);
                     }
                 }
                 "class_definition" => {
@@ -485,12 +621,17 @@ impl TemplateStringParser {
                         continue;
                     };
                     let name = name_node.utf8_text(source.as_bytes())?.to_string();
-                    if let Some(signature) =
-                        self.extract_class_constructor_languages(body_node, source, context)?
-                        && !signature.is_empty()
+                    if let Some(signature) = self.extract_class_constructor_languages(
+                        body_node,
+                        source,
+                        module_type_data,
+                        module_cache,
+                    )? && !signature.is_empty()
                     {
-                        context.local_callable_signature_names.insert(name.clone());
-                        context.callable_signatures.insert(name, signature);
+                        module_type_data
+                            .local_callable_signature_names
+                            .insert(name.clone());
+                        module_type_data.callable_signatures.insert(name, signature);
                     }
                 }
                 _ => {}
@@ -501,10 +642,11 @@ impl TemplateStringParser {
     }
 
     fn extract_class_constructor_languages(
-        &self,
+        &mut self,
         body_node: Node,
         source: &str,
-        context: &ModuleContext,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
     ) -> Result<Option<CallableSignature>> {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
@@ -522,7 +664,13 @@ impl TemplateStringParser {
             let Some(params_node) = child.child_by_field_name("parameters") else {
                 continue;
             };
-            let signature = self.extract_callable_signature(params_node, source, context, true)?;
+            let signature = self.extract_callable_signature(
+                params_node,
+                source,
+                module_type_data,
+                module_cache,
+                true,
+            )?;
             return Ok(Some(signature));
         }
 
@@ -530,10 +678,11 @@ impl TemplateStringParser {
     }
 
     fn extract_callable_signature(
-        &self,
+        &mut self,
         params_node: Node,
         source: &str,
-        context: &ModuleContext,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
         skip_receiver: bool,
     ) -> Result<CallableSignature> {
         let mut signature = CallableSignature::default();
@@ -593,21 +742,21 @@ impl TemplateStringParser {
 
                     let required = matches!(child.kind(), "typed_parameter" | "identifier");
                     let type_node = child.child_by_field_name("type");
-                    let template_language = if let Some(type_node) = type_node {
-                        self.resolve_language_from_type_node(type_node, source, context)?
-                    } else {
-                        None
-                    };
                     let type_hints = if let Some(type_node) = type_node {
-                        self.resolve_value_types_from_type_node(type_node, source)?
+                        self.resolve_type_info_from_type_node(
+                            type_node,
+                            source,
+                            module_type_data,
+                            module_cache,
+                        )?
                     } else {
-                        ParsedValueTypes::default()
+                        ResolvedTypeInfo::default()
                     };
 
                     signature.parameters.push(CallableParameter {
                         position,
                         name: parameter_name.to_string(),
-                        template_language,
+                        template_language: type_hints.template_language,
                         value_types: type_hints.value_types,
                         accepts_none: type_hints.accepts_none,
                         required,
@@ -626,10 +775,14 @@ impl TemplateStringParser {
 
     fn collect_imported_callable_signatures(
         &mut self,
-        context: &mut ModuleContext,
-        module_cache: &mut HashMap<String, HashMap<String, CallableSignature>>,
+        module_type_data: &mut ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
     ) -> Result<()> {
-        for (alias, import_path) in context.imports.clone() {
+        let import_aliases = module_type_data.imports.keys().cloned().collect::<Vec<_>>();
+        for alias in import_aliases {
+            let Some(import_path) = module_type_data.imports.get(&alias).cloned() else {
+                continue;
+            };
             if !should_resolve_imported_signatures(&import_path) {
                 continue;
             }
@@ -638,11 +791,11 @@ impl TemplateStringParser {
                 if let Some(signatures) =
                     self.resolve_imported_callable_signature(&import_path, module_cache)?
                 {
-                    context
+                    module_type_data
                         .callable_signatures
                         .entry(alias.clone())
                         .or_insert_with(|| signatures.clone());
-                    context
+                    module_type_data
                         .callable_signatures
                         .entry(import_path.clone())
                         .or_insert(signatures);
@@ -650,10 +803,10 @@ impl TemplateStringParser {
             }
 
             if let Some(module_signatures) =
-                self.load_imported_module_signatures(&import_path, module_cache)?
+                self.load_imported_module_type_data(&import_path, module_cache)?
             {
-                for (callable_name, signatures) in module_signatures {
-                    context
+                for (callable_name, signatures) in module_signatures.callable_signatures {
+                    module_type_data
                         .callable_signatures
                         .entry(format!("{import_path}.{callable_name}"))
                         .or_insert(signatures);
@@ -661,16 +814,21 @@ impl TemplateStringParser {
             }
         }
 
-        for import_path in context.imported_module_paths.clone() {
+        let imported_module_paths = module_type_data
+            .imported_module_paths
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for import_path in imported_module_paths {
             if !should_resolve_imported_signatures(&import_path) {
                 continue;
             }
 
             if let Some(module_signatures) =
-                self.load_imported_module_signatures(&import_path, module_cache)?
+                self.load_imported_module_type_data(&import_path, module_cache)?
             {
-                for (callable_name, signatures) in module_signatures {
-                    context
+                for (callable_name, signatures) in module_signatures.callable_signatures {
+                    module_type_data
                         .callable_signatures
                         .entry(format!("{import_path}.{callable_name}"))
                         .or_insert(signatures);
@@ -684,35 +842,56 @@ impl TemplateStringParser {
     fn resolve_imported_callable_signature(
         &mut self,
         import_path: &str,
-        module_cache: &mut HashMap<String, HashMap<String, CallableSignature>>,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
     ) -> Result<Option<CallableSignature>> {
         let Some((module_name, symbol_name)) = import_path.rsplit_once('.') else {
             return Ok(None);
         };
 
         let Some(module_signatures) =
-            self.load_imported_module_signatures(module_name, module_cache)?
+            self.load_imported_module_type_data(module_name, module_cache)?
         else {
             return Ok(None);
         };
 
-        Ok(module_signatures.get(symbol_name).cloned())
+        Ok(module_signatures
+            .callable_signatures
+            .get(symbol_name)
+            .cloned())
     }
 
-    fn load_imported_module_signatures(
+    fn load_imported_module_type_data(
         &mut self,
         module_name: &str,
-        module_cache: &mut HashMap<String, HashMap<String, CallableSignature>>,
-    ) -> Result<Option<HashMap<String, CallableSignature>>> {
-        if let Some(signatures) = module_cache.get(module_name) {
-            return Ok(Some(signatures.clone()));
-        }
-
-        module_cache.insert(module_name.to_string(), HashMap::new());
-
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+    ) -> Result<Option<ModuleTypeData>> {
         let Some(module_path) = self.resolve_python_module_path(module_name) else {
             return Ok(None);
         };
+
+        let module_key = ModuleCacheKey::Path(module_path.clone());
+        if self.module_load_stack.contains(&module_key) {
+            if let Some(current_module) = self.module_load_stack.last() {
+                self.modules_with_incomplete_dependencies
+                    .insert(current_module.clone());
+            }
+            return Ok(None);
+        }
+
+        if let Some(module_type_data) = module_cache.get(&module_path) {
+            if module_type_data.is_complete {
+                return Ok(Some(module_type_data.clone()));
+            }
+        }
+
+        module_cache.insert(
+            module_path.clone(),
+            ModuleTypeData {
+                module_key: module_key.clone(),
+                is_complete: false,
+                ..ModuleTypeData::default()
+            },
+        );
 
         let source = match fs::read_to_string(&module_path) {
             Ok(source) => source,
@@ -730,27 +909,23 @@ impl TemplateStringParser {
         let original_search_root = self.search_root.clone();
         self.search_root = module_path.parent().map(Path::to_path_buf);
 
-        let imported_signatures = (|| -> Result<HashMap<String, CallableSignature>> {
-            let mut imported_context = ModuleContext::default();
-            self.collect_type_aliases(&tree, &source, &mut imported_context)?;
-            self.collect_imports(
+        let imported_type_data = (|| -> Result<ModuleTypeData> {
+            self.build_module_type_data(
                 &tree,
                 &source,
-                &mut imported_context,
                 Some(module_name),
                 is_package_init_path(&module_path),
-            )?;
-            self.collect_local_callable_signatures(&tree, &source, &mut imported_context)?;
-            self.collect_imported_callable_signatures(&mut imported_context, module_cache)?;
-            Ok(imported_context.callable_signatures)
+                module_key,
+                module_cache,
+            )
         })();
 
         self.search_root = original_search_root;
 
-        let imported_signatures = imported_signatures?;
+        let imported_type_data = imported_type_data?;
 
-        module_cache.insert(module_name.to_string(), imported_signatures.clone());
-        Ok(Some(imported_signatures))
+        module_cache.insert(module_path, imported_type_data.clone());
+        Ok(Some(imported_type_data))
     }
 
     fn import_path_resolves_to_module(&self, import_path: &str) -> bool {
@@ -836,13 +1011,12 @@ impl TemplateStringParser {
                 ) else {
                     continue;
                 };
-                let Some(binding) =
-                    resolve_assignment_for_identifier(
-                        argument.value,
-                        source,
-                        &assignments,
-                        scope_directives,
-                    )?
+                let Some(binding) = resolve_assignment_for_identifier(
+                    argument.value,
+                    source,
+                    &assignments,
+                    scope_directives,
+                )?
                 else {
                     continue;
                 };
@@ -872,7 +1046,7 @@ impl TemplateStringParser {
     }
 
     fn find_strings_with_query(
-        &self,
+        &mut self,
         tree: &Tree,
         source: &str,
         templates: &mut Vec<TemplateStringInfo>,
@@ -976,7 +1150,7 @@ impl TemplateStringParser {
     }
 
     fn extract_template_info(
-        &self,
+        &mut self,
         node: Node,
         source: &str,
         var_name: Option<&str>,
@@ -1010,12 +1184,7 @@ impl TemplateStringParser {
             self.extract_content_and_interpolations(&node, source)?;
 
         let mut language = if let Some(type_node) = type_annotation {
-            if let Some(lang) = self.extract_language_from_annotation(type_node, source, context)? {
-                Some(lang)
-            } else {
-                let type_text = type_node.utf8_text(source.as_bytes())?;
-                self.resolve_language_from_type_text(type_text, context)?
-            }
+            self.resolve_language_from_type_node(type_node, source)?
         } else if let Some(func) = func_name {
             self.infer_language_from_function_call(
                 func,
@@ -1226,127 +1395,6 @@ impl TemplateStringParser {
             }))
     }
 
-    fn extract_language_from_annotation(
-        &self,
-        node: Node,
-        source: &str,
-        context: &ModuleContext,
-    ) -> Result<Option<String>> {
-        let subscript_node = if node.kind() == "subscript" {
-            Some(node)
-        } else if node.kind() == "type" {
-            let node_text = node.utf8_text(source.as_bytes())?;
-            if node_text.contains('[') && node_text.contains(']') {
-                Some(node)
-            } else {
-                let cursor = node.walk();
-                node.children(&mut cursor.clone())
-                    .find(|child| child.kind() == "subscript")
-            }
-        } else {
-            None
-        };
-
-        if let Some(subscript) = subscript_node {
-            if subscript.kind() == "type" {
-                let text = subscript.utf8_text(source.as_bytes())?;
-                if let Some(bracket_start) = text.find('[') {
-                    let base_name = &text[..bracket_start];
-
-                    let is_annotated = base_name == "Annotated"
-                        || context.imports.get(base_name).map_or(false, |v| {
-                            v == "typing.Annotated" || v.ends_with(".Annotated")
-                        });
-
-                    if is_annotated {
-                        if let Some(bracket_end) = text.rfind(']') {
-                            let args = &text[bracket_start + 1..bracket_end];
-
-                            let parts: Vec<&str> = args.split(',').map(|s| s.trim()).collect();
-                            if parts.len() >= 2 {
-                                let template_part = parts[0];
-                                let lang_part = parts[1].trim_matches(|c| c == '"' || c == '\'');
-
-                                let is_template = template_part == "Template"
-                                    || context.imports.get(template_part).map_or(false, |v| {
-                                        v == "string.templatelib.Template"
-                                            || v == "templatelib.Template"
-                                            || v.ends_with(".Template")
-                                    });
-
-                                if is_template {
-                                    return Ok(Some(lang_part.to_string()));
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                if let Some(value_node) = subscript.child_by_field_name("value") {
-                    let value_text = value_node.utf8_text(source.as_bytes())?;
-
-                    let is_annotated = value_text == "Annotated"
-                        || context.imports.get(value_text).map_or(false, |v| {
-                            v == "typing.Annotated" || v.ends_with(".Annotated")
-                        });
-
-                    if is_annotated {
-                        if let Some(slice_node) = subscript.child_by_field_name("slice") {
-                            let mut cursor = slice_node.walk();
-                            let mut found_template = false;
-
-                            for child in slice_node.children(&mut cursor) {
-                                match child.kind() {
-                                    "identifier" => {
-                                        let text = child.utf8_text(source.as_bytes())?;
-                                        found_template = text == "Template"
-                                            || context.imports.get(text).map_or(false, |v| {
-                                                v == "string.templatelib.Template"
-                                                    || v == "templatelib.Template"
-                                                    || v.ends_with(".Template")
-                                            });
-                                    }
-                                    "attribute" => {
-                                        let text = child.utf8_text(source.as_bytes())?;
-                                        let attr_name = text.split('.').last().unwrap_or(text);
-                                        found_template = attr_name == "Template"
-                                            || context.imports.get(attr_name).map_or(false, |v| {
-                                                v == "string.templatelib.Template"
-                                                    || v == "templatelib.Template"
-                                                    || v.ends_with(".Template")
-                                            });
-                                    }
-                                    "string" => {
-                                        if found_template {
-                                            let string_content =
-                                                child.utf8_text(source.as_bytes())?;
-                                            let lang = string_content
-                                                .trim_matches(|c| c == '"' || c == '\'');
-                                            return Ok(Some(lang.to_string()));
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let annotation_text = node.utf8_text(source.as_bytes())?;
-        let re =
-            regex::Regex::new(r#"Annotated\s*\[\s*Template\s*,\s*["']([A-Za-z0-9_.-]+)["']\s*]"#)?;
-
-        if let Some(captures) = re.captures(annotation_text) {
-            if let Some(lang) = captures.get(1) {
-                return Ok(Some(lang.as_str().to_string()));
-            }
-        }
-
-        Ok(None)
-    }
-
     fn infer_language_from_function_call(
         &self,
         func_name: &str,
@@ -1490,95 +1538,730 @@ impl TemplateStringParser {
     }
 
     fn resolve_language_from_type_node(
-        &self,
+        &mut self,
         type_node: Node,
         source: &str,
-        context: &ModuleContext,
     ) -> Result<Option<String>> {
-        if let Some(language) = self.extract_language_from_annotation(type_node, source, context)? {
-            return Ok(Some(language));
+        let module_type_data = self.last_module_type_data.clone();
+        let mut module_cache = std::mem::take(&mut self.last_module_cache);
+        let resolved = self.resolve_type_info_from_type_node(
+            type_node,
+            source,
+            &module_type_data,
+            &mut module_cache,
+        );
+        self.last_module_cache = module_cache;
+        Ok(resolved?.template_language)
+    }
+
+    fn resolve_module_type_aliases(
+        &mut self,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+    ) -> Result<HashMap<String, String>> {
+        let mut resolved = HashMap::new();
+        for name in module_type_data.alias_exprs.keys() {
+            let mut visited = HashSet::new();
+            let Some(info) = self.resolve_module_alias_type_info(
+                module_type_data,
+                name,
+                module_cache,
+                &mut visited,
+            )?
+            else {
+                continue;
+            };
+            if let Some(language) = info.template_language {
+                resolved.insert(name.clone(), language);
+            }
+        }
+        Ok(resolved)
+    }
+
+    fn resolve_type_info_from_type_node(
+        &mut self,
+        type_node: Node,
+        source: &str,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+    ) -> Result<ResolvedTypeInfo> {
+        let type_text = type_node.utf8_text(source.as_bytes())?;
+        self.resolve_type_info_from_text(type_text, module_type_data, module_cache)
+    }
+
+    fn resolve_type_info_from_text(
+        &mut self,
+        type_text: &str,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+    ) -> Result<ResolvedTypeInfo> {
+        let expr = parse_type_expr(type_text);
+        let mut visited = HashSet::new();
+        self.resolve_type_expr(&expr, module_type_data, module_cache, &mut visited)
+    }
+
+    fn resolve_type_expr(
+        &mut self,
+        expr: &TypeExpr,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        visited: &mut HashSet<(ModuleCacheKey, String)>,
+    ) -> Result<ResolvedTypeInfo> {
+        match expr {
+            TypeExpr::Name(name) => {
+                self.resolve_name_type_info(name, module_type_data, module_cache, visited)
+            }
+            TypeExpr::StringLiteral(_) => Ok(ResolvedTypeInfo::default()),
+            TypeExpr::NoneLiteral => Ok(ResolvedTypeInfo {
+                template_language: None,
+                value_types: Vec::new(),
+                accepts_none: true,
+            }),
+            TypeExpr::Union(parts) => {
+                let mut merged = ResolvedTypeInfo::default();
+                for part in parts {
+                    merge_resolved_type_info(
+                        &mut merged,
+                        self.resolve_type_expr(part, module_type_data, module_cache, visited)?,
+                    );
+                }
+                Ok(merged)
+            }
+            TypeExpr::Generic { base, args } => {
+                match self.resolve_special_type_name(
+                    base,
+                    module_type_data,
+                    module_cache,
+                    visited,
+                )? {
+                    Some("Annotated") => self.resolve_annotated_type_info(
+                        args,
+                        module_type_data,
+                        module_cache,
+                        visited,
+                    ),
+                    Some("Optional") => {
+                        let mut resolved = args
+                            .first()
+                            .map(|arg| {
+                                self.resolve_type_expr(arg, module_type_data, module_cache, visited)
+                            })
+                            .transpose()?
+                            .unwrap_or_default();
+                        resolved.accepts_none = true;
+                        Ok(resolved)
+                    }
+                    Some("Union") => {
+                        let mut merged = ResolvedTypeInfo::default();
+                        for arg in args {
+                            merge_resolved_type_info(
+                                &mut merged,
+                                self.resolve_type_expr(
+                                    arg,
+                                    module_type_data,
+                                    module_cache,
+                                    visited,
+                                )?,
+                            );
+                        }
+                        Ok(merged)
+                    }
+                    Some("Literal") => Ok(resolve_literal_type_info(args)),
+                    _ => Ok(ResolvedTypeInfo::default()),
+                }
+            }
+            TypeExpr::Unknown(_) => Ok(ResolvedTypeInfo::default()),
+        }
+    }
+
+    fn resolve_special_type_name(
+        &mut self,
+        name: &QualifiedName,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        visited: &mut HashSet<(ModuleCacheKey, String)>,
+    ) -> Result<Option<&'static str>> {
+        if name.parts.len() == 1 {
+            let alias_name = &name.parts[0];
+            let has_local_binding = module_type_data.alias_exprs.contains_key(alias_name)
+                || module_type_data.imports.contains_key(alias_name);
+            if let Some(alias_expr) = module_type_data.alias_exprs.get(alias_name) {
+                let visit_key = (module_type_data.module_key.clone(), alias_name.to_string());
+                if !visited.insert(visit_key.clone()) {
+                    return Ok(None);
+                }
+                let kind = self.resolve_special_type_expr(
+                    alias_expr,
+                    module_type_data,
+                    module_cache,
+                    visited,
+                )?;
+                visited.remove(&visit_key);
+                if kind.is_some() {
+                    return Ok(kind);
+                }
+            }
+            if let Some(import_target) = module_type_data.imports.get(alias_name) {
+                let kind =
+                    self.resolve_special_import_target(import_target, module_cache, visited)?;
+                if kind.is_some() {
+                    return Ok(kind);
+                }
+            }
+            if has_local_binding {
+                return Ok(None);
+            }
+        } else if let Some(import_target) = expand_qualified_name(name, &module_type_data.imports) {
+            let kind = self.resolve_special_import_target(&import_target, module_cache, visited)?;
+            if kind.is_some() {
+                return Ok(kind);
+            }
         }
 
-        let type_text = type_node.utf8_text(source.as_bytes())?;
-        self.resolve_language_from_type_text(type_text, context)
-    }
-
-    fn resolve_value_types_from_type_node(
-        &self,
-        type_node: Node,
-        source: &str,
-    ) -> Result<ParsedValueTypes> {
-        let type_text = type_node.utf8_text(source.as_bytes())?;
-        Ok(parse_callable_value_types(type_text))
-    }
-
-    fn extract_language_from_type_string(&self, type_str: &str) -> Result<Option<String>> {
-        let re =
-            regex::Regex::new(r#"Annotated\s*\[\s*Template\s*,\s*["']([A-Za-z0-9_.-]+)["']\s*]"#)?;
-
-        if let Some(captures) = re.captures(type_str) {
-            if let Some(lang) = captures.get(1) {
-                return Ok(Some(lang.as_str().to_string()));
-            }
+        let raw_name = name.as_string();
+        if let Some(kind) = canonical_special_name(&raw_name) {
+            return Ok(Some(kind));
         }
 
         Ok(None)
     }
 
-    fn resolve_language_from_type_text(
-        &self,
-        type_text: &str,
-        context: &ModuleContext,
-    ) -> Result<Option<String>> {
-        let normalized = type_text.trim();
-        if normalized.is_empty() {
-            return Ok(None);
-        }
-
-        let normalized = normalized
-            .strip_prefix("typing.")
-            .unwrap_or(normalized)
-            .trim();
-
-        if let Some(language) = context.type_aliases.get(normalized) {
-            return Ok(Some(language.clone()));
-        }
-
-        if let Some(language) = self.extract_language_from_type_string(normalized)? {
-            return Ok(Some(language));
-        }
-
-        if let Some(inner) = unwrap_generic(normalized, "Optional") {
-            return self.resolve_language_from_type_text(inner, context);
-        }
-
-        if let Some(inner) = unwrap_generic(normalized, "Union") {
-            for part in split_top_level(inner, ',') {
-                if let Some(language) = self.resolve_language_from_type_text(part, context)? {
-                    return Ok(Some(language));
-                }
+    fn resolve_special_type_expr(
+        &mut self,
+        expr: &TypeExpr,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        visited: &mut HashSet<(ModuleCacheKey, String)>,
+    ) -> Result<Option<&'static str>> {
+        match expr {
+            TypeExpr::Name(name) => {
+                self.resolve_special_type_name(name, module_type_data, module_cache, visited)
             }
-            return Ok(None);
+            _ => Ok(None),
         }
-
-        let union_parts = split_top_level(normalized, '|');
-        if union_parts.len() > 1 {
-            for part in union_parts {
-                if let Some(language) = self.resolve_language_from_type_text(part, context)? {
-                    return Ok(Some(language));
-                }
-            }
-        }
-
-        if let Some(inner) = normalized
-            .strip_prefix('(')
-            .and_then(|value| value.strip_suffix(')'))
-        {
-            return self.resolve_language_from_type_text(inner, context);
-        }
-
-        Ok(context.type_aliases.get(normalized).cloned())
     }
+
+    fn resolve_special_import_target(
+        &mut self,
+        import_target: &str,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        visited: &mut HashSet<(ModuleCacheKey, String)>,
+    ) -> Result<Option<&'static str>> {
+        if let Some(kind) = canonical_special_name(import_target) {
+            return Ok(Some(kind));
+        }
+        if self.import_path_resolves_to_module(import_target) {
+            return Ok(None);
+        }
+        let Some((module_name, symbol_name)) = import_target.rsplit_once('.') else {
+            return Ok(None);
+        };
+        let Some(imported_module) =
+            self.load_imported_module_type_data(module_name, module_cache)?
+        else {
+            return Ok(None);
+        };
+        if let Some(kind) = canonical_special_name(symbol_name) {
+            return Ok(Some(kind));
+        }
+        if let Some(alias_expr) = imported_module.alias_exprs.get(symbol_name) {
+            let visit_key = (imported_module.module_key.clone(), symbol_name.to_string());
+            if !visited.insert(visit_key.clone()) {
+                return Ok(None);
+            }
+            let kind = self.resolve_special_type_expr(
+                alias_expr,
+                &imported_module,
+                module_cache,
+                visited,
+            )?;
+            visited.remove(&visit_key);
+            if kind.is_some() {
+                return Ok(kind);
+            }
+        }
+        if let Some(reexport_target) = imported_module.imports.get(symbol_name) {
+            return self.resolve_special_import_target(reexport_target, module_cache, visited);
+        }
+        Ok(None)
+    }
+
+    fn resolve_name_type_info(
+        &mut self,
+        name: &QualifiedName,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        visited: &mut HashSet<(ModuleCacheKey, String)>,
+    ) -> Result<ResolvedTypeInfo> {
+        if let Some(kind) =
+            self.resolve_special_type_name(name, module_type_data, module_cache, visited)?
+        {
+            return Ok(resolved_type_info_for_special_name(kind));
+        }
+
+        if name.parts.len() == 1 {
+            let alias_name = &name.parts[0];
+            if let Some(resolved) = self.resolve_module_alias_type_info(
+                module_type_data,
+                alias_name,
+                module_cache,
+                visited,
+            )? {
+                return Ok(resolved);
+            }
+        }
+
+        if let Some(import_target) = expand_qualified_name(name, &module_type_data.imports) {
+            return self.resolve_import_target_type_info(&import_target, module_cache, visited);
+        }
+
+        Ok(ResolvedTypeInfo::default())
+    }
+
+    fn resolve_module_alias_type_info(
+        &mut self,
+        module_type_data: &ModuleTypeData,
+        alias_name: &str,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        visited: &mut HashSet<(ModuleCacheKey, String)>,
+    ) -> Result<Option<ResolvedTypeInfo>> {
+        let Some(expr) = module_type_data.alias_exprs.get(alias_name) else {
+            return Ok(None);
+        };
+        let visit_key = (module_type_data.module_key.clone(), alias_name.to_string());
+        if !visited.insert(visit_key.clone()) {
+            return Ok(None);
+        }
+        let resolved = self.resolve_type_expr(expr, module_type_data, module_cache, visited)?;
+        visited.remove(&visit_key);
+        Ok(Some(resolved))
+    }
+
+    fn resolve_import_target_type_info(
+        &mut self,
+        import_target: &str,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        visited: &mut HashSet<(ModuleCacheKey, String)>,
+    ) -> Result<ResolvedTypeInfo> {
+        if let Some(kind) = canonical_special_name(import_target) {
+            return Ok(resolved_type_info_for_special_name(kind));
+        }
+
+        if self.import_path_resolves_to_module(import_target) {
+            return Ok(ResolvedTypeInfo::default());
+        }
+
+        let Some((module_name, symbol_name)) = import_target.rsplit_once('.') else {
+            return Ok(ResolvedTypeInfo::default());
+        };
+        let Some(imported_module) =
+            self.load_imported_module_type_data(module_name, module_cache)?
+        else {
+            return Ok(ResolvedTypeInfo::default());
+        };
+
+        self.resolve_symbol_in_module(&imported_module, symbol_name, module_cache, visited)
+    }
+
+    fn resolve_symbol_in_module(
+        &mut self,
+        module_type_data: &ModuleTypeData,
+        symbol_name: &str,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        visited: &mut HashSet<(ModuleCacheKey, String)>,
+    ) -> Result<ResolvedTypeInfo> {
+        if let Some(kind) = canonical_special_name(symbol_name) {
+            return Ok(resolved_type_info_for_special_name(kind));
+        }
+
+        if let Some(resolved) = self.resolve_module_alias_type_info(
+            module_type_data,
+            symbol_name,
+            module_cache,
+            visited,
+        )? {
+            return Ok(resolved);
+        }
+
+        if let Some(import_target) = module_type_data.imports.get(symbol_name) {
+            return self.resolve_import_target_type_info(import_target, module_cache, visited);
+        }
+
+        Ok(ResolvedTypeInfo::default())
+    }
+
+    fn resolve_annotated_type_info(
+        &mut self,
+        args: &[TypeExpr],
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        visited: &mut HashSet<(ModuleCacheKey, String)>,
+    ) -> Result<ResolvedTypeInfo> {
+        let mut resolved = args
+            .first()
+            .map(|arg| self.resolve_type_expr(arg, module_type_data, module_cache, visited))
+            .transpose()?
+            .unwrap_or_default();
+
+        if args.len() >= 2
+            && self.is_template_expr(&args[0], module_type_data, module_cache, visited)?
+            && let TypeExpr::StringLiteral(language) = &args[1]
+        {
+            resolved.template_language = Some(language.clone());
+        }
+
+        Ok(resolved)
+    }
+
+    fn is_template_expr(
+        &mut self,
+        expr: &TypeExpr,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        visited: &mut HashSet<(ModuleCacheKey, String)>,
+    ) -> Result<bool> {
+        match expr {
+            TypeExpr::Name(name) => {
+                let expanded = expand_qualified_name(name, &module_type_data.imports)
+                    .unwrap_or_else(|| name.as_string());
+                if canonical_special_name(&expanded) == Some("Template") {
+                    return Ok(true);
+                }
+
+                if name.parts.len() == 1 {
+                    let Some(alias_name) = name.parts.first() else {
+                        return Ok(false);
+                    };
+                    if let Some(alias_expr) = module_type_data.alias_exprs.get(alias_name) {
+                        let visit_key = (module_type_data.module_key.clone(), alias_name.clone());
+                        if !visited.insert(visit_key.clone()) {
+                            return Ok(false);
+                        }
+                        let is_template = self.is_template_expr(
+                            alias_expr,
+                            module_type_data,
+                            module_cache,
+                            visited,
+                        )?;
+                        visited.remove(&visit_key);
+                        return Ok(is_template);
+                    }
+                }
+
+                if let Some(import_target) = expand_qualified_name(name, &module_type_data.imports)
+                {
+                    return self.import_target_is_template(&import_target, module_cache, visited);
+                }
+
+                Ok(false)
+            }
+            TypeExpr::Generic { .. }
+            | TypeExpr::Union(_)
+            | TypeExpr::StringLiteral(_)
+            | TypeExpr::NoneLiteral
+            | TypeExpr::Unknown(_) => Ok(false),
+        }
+    }
+
+    fn import_target_is_template(
+        &mut self,
+        import_target: &str,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        visited: &mut HashSet<(ModuleCacheKey, String)>,
+    ) -> Result<bool> {
+        if canonical_special_name(import_target) == Some("Template") {
+            return Ok(true);
+        }
+        if self.import_path_resolves_to_module(import_target) {
+            return Ok(false);
+        }
+        let Some((module_name, symbol_name)) = import_target.rsplit_once('.') else {
+            return Ok(false);
+        };
+        let Some(imported_module) =
+            self.load_imported_module_type_data(module_name, module_cache)?
+        else {
+            return Ok(false);
+        };
+        if let Some(alias_expr) = imported_module.alias_exprs.get(symbol_name) {
+            let visit_key = (imported_module.module_key.clone(), symbol_name.to_string());
+            if !visited.insert(visit_key.clone()) {
+                return Ok(false);
+            }
+            let is_template =
+                self.is_template_expr(alias_expr, &imported_module, module_cache, visited)?;
+            visited.remove(&visit_key);
+            return Ok(is_template);
+        }
+        if let Some(reexport_target) = imported_module.imports.get(symbol_name) {
+            return self.import_target_is_template(reexport_target, module_cache, visited);
+        }
+        Ok(false)
+    }
+}
+
+fn parse_type_expr(type_text: &str) -> TypeExpr {
+    let type_text = type_text.trim();
+    if type_text.is_empty() {
+        return TypeExpr::Unknown(String::new());
+    }
+
+    if let Some(inner) = strip_wrapping_parens(type_text) {
+        return parse_type_expr(inner);
+    }
+
+    let union_parts = split_top_level_tokens(type_text, '|');
+    if union_parts.len() > 1 {
+        return TypeExpr::Union(union_parts.into_iter().map(parse_type_expr).collect());
+    }
+
+    if matches!(type_text, "None" | "NoneType" | "builtins.NoneType") {
+        return TypeExpr::NoneLiteral;
+    }
+
+    if let Some(string_literal) = parse_string_literal(type_text) {
+        return TypeExpr::StringLiteral(string_literal);
+    }
+
+    if let Some((base, args_text)) = split_generic_expr(type_text) {
+        return TypeExpr::Generic {
+            base: parse_qualified_name(base).unwrap_or(QualifiedName {
+                parts: vec![base.trim().to_string()],
+            }),
+            args: split_top_level_tokens(args_text, ',')
+                .into_iter()
+                .map(parse_type_expr)
+                .collect(),
+        };
+    }
+
+    if let Some(name) = parse_qualified_name(type_text) {
+        return TypeExpr::Name(name);
+    }
+
+    TypeExpr::Unknown(type_text.to_string())
+}
+
+fn parse_qualified_name(type_text: &str) -> Option<QualifiedName> {
+    let parts = type_text
+        .split('.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty()
+        || parts.iter().any(|part| {
+            let mut chars = part.chars();
+            let Some(first) = chars.next() else {
+                return true;
+            };
+            if !(first.is_ascii_alphabetic() || first == '_') {
+                return true;
+            }
+            !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+    {
+        return None;
+    }
+    Some(QualifiedName {
+        parts: parts.into_iter().map(str::to_string).collect(),
+    })
+}
+
+fn split_generic_expr(type_text: &str) -> Option<(&str, &str)> {
+    let bracket_start = type_text.find('[')?;
+    if !type_text.ends_with(']') {
+        return None;
+    }
+    let base = type_text[..bracket_start].trim();
+    if base.is_empty() || !is_balanced_delimited(&type_text[bracket_start..], '[', ']') {
+        return None;
+    }
+    Some((base, &type_text[bracket_start + 1..type_text.len() - 1]))
+}
+
+fn strip_wrapping_parens(type_text: &str) -> Option<&str> {
+    if !(type_text.starts_with('(') && type_text.ends_with(')')) {
+        return None;
+    }
+    if !is_balanced_delimited(type_text, '(', ')') {
+        return None;
+    }
+    Some(type_text[1..type_text.len() - 1].trim())
+}
+
+fn is_balanced_delimited(input: &str, open: char, close: char) -> bool {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (index, ch) in input.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            _ if ch == open => depth += 1,
+            _ if ch == close => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+                if depth == 0 && index + ch.len_utf8() != input.len() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    depth == 0 && quote.is_none()
+}
+
+fn parse_string_literal(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let quote = bytes[0];
+    if !matches!(quote, b'\'' | b'"') || bytes[bytes.len() - 1] != quote {
+        return None;
+    }
+    Some(input[1..input.len() - 1].to_string())
+}
+
+fn split_top_level_tokens(input: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (index, ch) in input.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ if ch == separator && bracket_depth == 0 && paren_depth == 0 && brace_depth == 0 => {
+                parts.push(input[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    parts.push(input[start..].trim());
+    parts
+}
+
+fn expand_qualified_name(
+    name: &QualifiedName,
+    imports: &HashMap<String, String>,
+) -> Option<String> {
+    let first = name.parts.first()?;
+    let import_target = imports.get(first)?;
+    if name.parts.len() == 1 {
+        return Some(import_target.clone());
+    }
+    Some(format!("{import_target}.{}", name.parts[1..].join(".")))
+}
+
+fn canonical_special_name(name: &str) -> Option<&'static str> {
+    match name.trim() {
+        "Annotated" | "typing.Annotated" | "typing_extensions.Annotated" => Some("Annotated"),
+        "Optional" | "typing.Optional" => Some("Optional"),
+        "Union" | "typing.Union" => Some("Union"),
+        "Literal" | "typing.Literal" => Some("Literal"),
+        "Template" | "templatelib.Template" | "string.templatelib.Template" => Some("Template"),
+        "bool" | "builtins.bool" => Some("bool"),
+        "int" | "builtins.int" => Some("int"),
+        "float" | "builtins.float" => Some("float"),
+        "str" | "builtins.str" => Some("str"),
+        "None" | "NoneType" | "builtins.NoneType" => Some("None"),
+        _ => None,
+    }
+}
+
+fn resolved_type_info_for_special_name(kind: &str) -> ResolvedTypeInfo {
+    let mut resolved = ResolvedTypeInfo::default();
+    match kind {
+        "bool" => push_value_type(&mut resolved.value_types, CallableValueType::Bool),
+        "int" => push_value_type(&mut resolved.value_types, CallableValueType::Int),
+        "float" => push_value_type(&mut resolved.value_types, CallableValueType::Float),
+        "str" => push_value_type(&mut resolved.value_types, CallableValueType::String),
+        "None" => resolved.accepts_none = true,
+        _ => {}
+    }
+    resolved
+}
+
+fn resolve_literal_type_info(args: &[TypeExpr]) -> ResolvedTypeInfo {
+    let mut resolved = ResolvedTypeInfo::default();
+    for arg in args {
+        match arg {
+            TypeExpr::StringLiteral(_) => {
+                push_value_type(&mut resolved.value_types, CallableValueType::String)
+            }
+            TypeExpr::NoneLiteral => resolved.accepts_none = true,
+            TypeExpr::Name(name) => {
+                let literal = name.as_string();
+                if matches!(literal.as_str(), "True" | "False") {
+                    push_value_type(&mut resolved.value_types, CallableValueType::Bool);
+                }
+            }
+            TypeExpr::Unknown(value) => {
+                if is_float_literal(value) {
+                    push_value_type(&mut resolved.value_types, CallableValueType::Float);
+                } else if is_int_literal(value) {
+                    push_value_type(&mut resolved.value_types, CallableValueType::Int);
+                }
+            }
+            TypeExpr::Generic { .. } | TypeExpr::Union(_) => {}
+        }
+    }
+    resolved
+}
+
+fn merge_resolved_type_info(target: &mut ResolvedTypeInfo, other: ResolvedTypeInfo) {
+    if target.template_language.is_none() {
+        target.template_language = other.template_language;
+    }
+    for value_type in other.value_types {
+        push_value_type(&mut target.value_types, value_type);
+    }
+    target.accepts_none |= other.accepts_none;
 }
 
 fn resolve_import_module_name(
@@ -1742,147 +2425,24 @@ fn resolve_callable_parameter<'a>(
         .find(|parameter| parameter.position == position && !parameter.keyword_only)
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ParsedValueTypes {
-    value_types: Vec<CallableValueType>,
-    accepts_none: bool,
-}
-
-fn parse_callable_value_types(type_text: &str) -> ParsedValueTypes {
-    parse_callable_value_types_inner(&strip_type_prefixes(type_text))
-}
-
-fn parse_callable_value_types_inner(type_text: &str) -> ParsedValueTypes {
-    let type_text = type_text.trim();
-    if type_text.is_empty() {
-        return ParsedValueTypes::default();
-    }
-    if matches!(type_text, "None" | "NoneType") {
-        return ParsedValueTypes {
-            value_types: Vec::new(),
-            accepts_none: true,
-        };
-    }
-
-    if let Some(inner) = unwrap_generic(type_text, "Annotated") {
-        if let Some(first) = split_top_level(inner, ',').into_iter().next() {
-            return parse_callable_value_types_inner(first);
-        }
-    }
-
-    if let Some(inner) = unwrap_generic(type_text, "Optional") {
-        let mut parsed = parse_callable_value_types_inner(inner);
-        parsed.accepts_none = true;
-        return parsed;
-    }
-
-    if let Some(inner) = unwrap_generic(type_text, "Union") {
-        let mut merged = ParsedValueTypes::default();
-        for part in split_top_level(inner, ',') {
-            merge_parsed_value_types(&mut merged, parse_callable_value_types_inner(part));
-        }
-        return merged;
-    }
-
-    if let Some(inner) = unwrap_generic(type_text, "Literal") {
-        let mut merged = ParsedValueTypes::default();
-        for part in split_top_level(inner, ',') {
-            match part.trim() {
-                "True" | "False" => {
-                    push_value_type(&mut merged.value_types, CallableValueType::Bool)
-                }
-                "None" | "NoneType" => merged.accepts_none = true,
-                literal if is_string_literal(literal) => {
-                    push_value_type(&mut merged.value_types, CallableValueType::String);
-                }
-                literal if is_float_literal(literal) => {
-                    push_value_type(&mut merged.value_types, CallableValueType::Float);
-                }
-                literal if is_int_literal(literal) => {
-                    push_value_type(&mut merged.value_types, CallableValueType::Int);
-                }
-                _ => {}
-            }
-        }
-        return merged;
-    }
-
-    let union_parts = split_top_level(type_text, '|');
-    if union_parts.len() > 1 {
-        let mut merged = ParsedValueTypes::default();
-        for part in union_parts {
-            merge_parsed_value_types(&mut merged, parse_callable_value_types_inner(part));
-        }
-        return merged;
-    }
-
-    let mut parsed = ParsedValueTypes::default();
-    match type_text {
-        "bool" => push_value_type(&mut parsed.value_types, CallableValueType::Bool),
-        "int" => push_value_type(&mut parsed.value_types, CallableValueType::Int),
-        "float" => push_value_type(&mut parsed.value_types, CallableValueType::Float),
-        "str" => push_value_type(&mut parsed.value_types, CallableValueType::String),
-        _ => {}
-    }
-    parsed
-}
-
-fn strip_type_prefixes(type_text: &str) -> String {
-    type_text
-        .replace("typing.", "")
-        .replace("builtins.", "")
-        .replace(' ', "")
-}
-
-fn unwrap_generic<'a>(type_text: &'a str, name: &str) -> Option<&'a str> {
-    let prefix = format!("{name}[");
-    type_text
-        .strip_prefix(&prefix)
-        .and_then(|rest| rest.strip_suffix(']'))
-}
-
-fn split_top_level(input: &str, separator: char) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0usize;
-    for (index, ch) in input.char_indices() {
-        match ch {
-            '[' | '(' | '{' => depth += 1,
-            ']' | ')' | '}' => depth = depth.saturating_sub(1),
-            _ if ch == separator && depth == 0 => {
-                parts.push(&input[start..index]);
-                start = index + ch.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(&input[start..]);
-    parts
-}
-
-fn merge_parsed_value_types(target: &mut ParsedValueTypes, other: ParsedValueTypes) {
-    for value_type in other.value_types {
-        push_value_type(&mut target.value_types, value_type);
-    }
-    target.accepts_none |= other.accepts_none;
-}
-
 fn push_value_type(types: &mut Vec<CallableValueType>, value_type: CallableValueType) {
     if !types.contains(&value_type) {
         types.push(value_type);
     }
 }
 
-fn is_string_literal(value: &str) -> bool {
-    (value.starts_with('"') && value.ends_with('"'))
-        || (value.starts_with('\'') && value.ends_with('\''))
-}
-
 fn is_int_literal(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_digit() || ch == '-' || ch == '+')
+    if value.is_empty() {
+        return false;
+    }
+
+    let digits = if let Some(rest) = value.strip_prefix(['+', '-']) {
+        rest
+    } else {
+        value
+    };
+
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn is_float_literal(value: &str) -> bool {
@@ -1912,9 +2472,11 @@ fn collect_variable_assignments(
         for capture in match_.captures {
             match query.capture_names()[capture.index as usize] {
                 "var_name" => {
-                    if let Some(key) =
-                        assignment_key_for_node_with_directives(capture.node, source, scope_directives)
-                    {
+                    if let Some(key) = assignment_key_for_node_with_directives(
+                        capture.node,
+                        source,
+                        scope_directives,
+                    ) {
                         assignments.push(VariableAssignment { key });
                     }
                 }
@@ -4257,7 +4819,10 @@ render_yaml(config)
         let site_packages = project_site_packages(&dir);
         write_file(&site_packages.join("typed_api").join("__init__.py"), "");
         write_file(
-            &site_packages.join("typed_api").join("sub").join("__init__.py"),
+            &site_packages
+                .join("typed_api")
+                .join("sub")
+                .join("__init__.py"),
             "from ..impl import render_yaml\n",
         );
         write_file(
@@ -4431,7 +4996,10 @@ typed_api.render_yaml(config)
         let site_packages = project_site_packages(&dir);
         write_file(&site_packages.join("typed_api").join("__init__.py"), "");
         write_file(
-            &site_packages.join("typed_api").join("subpkg").join("__init__.py"),
+            &site_packages
+                .join("typed_api")
+                .join("subpkg")
+                .join("__init__.py"),
             r#"from typing import Annotated
 from string.templatelib import Template
 
@@ -4440,7 +5008,10 @@ def render_yaml(template: Annotated[Template, "yaml"]) -> object:
 "#,
         );
         write_file(
-            &site_packages.join("typed_api").join("subpkg").join("mod.py"),
+            &site_packages
+                .join("typed_api")
+                .join("subpkg")
+                .join("mod.py"),
             "value = 1\n",
         );
 
@@ -4907,7 +5478,6 @@ except Exception as api:
         assert_eq!(templates[0].variable_name, Some("config".to_string()));
         assert_eq!(templates[0].language, None);
     }
-
 
     #[test]
     fn test_function_parameter_shadows_installed_package_module_alias() {
@@ -5651,6 +6221,298 @@ content: Ann[Tmpl, "html"] = t"<p>Hello</p>"
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("html".to_string()));
+    }
+
+    #[test]
+    fn test_module_context_type_aliases_preserve_public_resolution() {
+        let source = r#"
+from typing_extensions import Annotated
+from string.templatelib import Template
+
+type HtmlTemplate = Annotated[Template, "html"]
+type MaybeHtml = HtmlTemplate | Renderable
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert!(templates.is_empty());
+        assert_eq!(
+            parser.module_context().type_aliases.get("HtmlTemplate"),
+            Some(&"html".to_string())
+        );
+        assert_eq!(
+            parser.module_context().type_aliases.get("MaybeHtml"),
+            Some(&"html".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cyclic_alias_chain_safely_falls_back_to_unknown_language() {
+        let source = r#"
+type HtmlTemplate = AliasTemplate
+type AliasTemplate = HtmlTemplate
+
+page: HtmlTemplate = t"<div><"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, None);
+        assert!(parser.module_context().type_aliases.is_empty());
+    }
+
+    #[test]
+    fn test_imported_alias_reexport_annotation_propagates_to_template_variable() {
+        let dir = parser_test_dir("imported-alias-reexport");
+        fs::write(
+            dir.join("bindings.py"),
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+type HtmlTemplate = Annotated[Template, "html"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("typed_api.py"),
+            r#"from bindings import HtmlTemplate
+"#,
+        )
+        .unwrap();
+
+        let source = r#"
+from typed_api import HtmlTemplate
+
+page: HtmlTemplate | Renderable = t"<div><"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("broken.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("html".to_string()));
+    }
+
+    #[test]
+    fn test_annotated_metadata_with_nested_commas_keeps_language() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+type HtmlTemplate = Annotated[Template, "html", Meta(x, y)]
+page: HtmlTemplate = t"<div><"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("html".to_string()));
+    }
+
+    #[test]
+    fn test_typing_extensions_annotated_alias_detection() {
+        let source = r#"
+from typing_extensions import Annotated
+from string.templatelib import Template
+
+page: Annotated[Template, "html"] = t"<div><"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("html".to_string()));
+    }
+
+    #[test]
+    fn test_generic_base_alias_to_annotated_resolves_template_language() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+type Ann = Annotated
+page: Ann[Template, "html"] = t"<div><"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("html".to_string()));
+    }
+
+    #[test]
+    fn test_alias_named_like_special_type_still_resolves_local_template_alias() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+type Literal = Annotated[Template, "html"]
+page: Literal = t"<div><"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("html".to_string()));
+    }
+
+    #[test]
+    fn test_cyclic_import_reexport_rebuilds_incomplete_module_cache() {
+        let dir = parser_test_dir("cyclic-alias-reexport");
+        fs::write(
+            dir.join("bindings_a.py"),
+            r#"from bindings_b import Marker
+from typing import Annotated
+from string.templatelib import Template
+
+type HtmlTemplate = Annotated[Template, "html"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("bindings_b.py"),
+            r#"from bindings_a import HtmlTemplate
+
+type Marker = HtmlTemplate
+"#,
+        )
+        .unwrap();
+
+        let source = r#"
+from bindings_b import Marker
+
+page: Marker = t"<div><"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("broken.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("html".to_string()));
+    }
+
+    #[test]
+    fn test_entry_file_back_edge_short_circuits_cycle_without_losing_alias_resolution() {
+        let dir = parser_test_dir("entry-file-back-edge");
+        fs::write(
+            dir.join("helper.py"),
+            r#"from app import page
+from typing import Annotated
+from string.templatelib import Template
+
+type HtmlTemplate = Annotated[Template, "html"]
+"#,
+        )
+        .unwrap();
+
+        let source = r#"
+from helper import HtmlTemplate
+
+page: HtmlTemplate = t"<div><"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("html".to_string()));
+    }
+
+    #[test]
+    fn test_cycle_tracking_state_is_cleared_between_parses() {
+        let dir = parser_test_dir("cycle-state-reset");
+        fs::write(
+            dir.join("helper.py"),
+            r#"from app import page
+from typing import Annotated
+from string.templatelib import Template
+
+type HtmlTemplate = Annotated[Template, "html"]
+"#,
+        )
+        .unwrap();
+
+        let cyclic_source = r#"
+from helper import HtmlTemplate
+
+page: HtmlTemplate = t"<div><"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let first_templates = parser
+            .find_template_strings_in_file(cyclic_source, &dir.join("app.py"))
+            .unwrap();
+        assert_eq!(first_templates[0].language, Some("html".to_string()));
+
+        let second_templates = parser
+            .find_template_strings(
+                r#"
+from typing import Annotated
+from string.templatelib import Template
+
+page: Annotated[Template, "yaml"] = t"name: {name}"
+"#,
+            )
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(second_templates.len(), 1);
+        assert_eq!(second_templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_literal_value_type_inference_uses_shared_type_parser() {
+        let source = r#"
+from typing import Literal
+
+def render(flag: Literal[True, False] | None, value: Literal[1, 1.5, "x", None]) -> None:
+    return None
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert!(templates.is_empty());
+
+        let signature = parser
+            .module_context()
+            .callable_signatures
+            .get("render")
+            .unwrap();
+        assert_eq!(
+            signature.parameters[0].value_types,
+            vec![CallableValueType::Bool]
+        );
+        assert!(signature.parameters[0].accepts_none);
+        assert_eq!(
+            signature.parameters[1].value_types,
+            vec![
+                CallableValueType::Int,
+                CallableValueType::Float,
+                CallableValueType::String
+            ]
+        );
+        assert!(signature.parameters[1].accepts_none);
     }
 
     #[test]
