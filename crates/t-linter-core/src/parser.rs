@@ -1014,7 +1014,7 @@ impl TemplateStringParser {
                 Some(lang)
             } else {
                 let type_text = type_node.utf8_text(source.as_bytes())?;
-                context.type_aliases.get(type_text).cloned()
+                self.resolve_language_from_type_text(type_text, context)?
             }
         } else if let Some(func) = func_name {
             self.infer_language_from_function_call(
@@ -1500,11 +1500,7 @@ impl TemplateStringParser {
         }
 
         let type_text = type_node.utf8_text(source.as_bytes())?;
-        if let Some(language) = context.type_aliases.get(type_text) {
-            return Ok(Some(language.clone()));
-        }
-
-        self.extract_language_from_type_string(type_text)
+        self.resolve_language_from_type_text(type_text, context)
     }
 
     fn resolve_value_types_from_type_node(
@@ -1527,6 +1523,61 @@ impl TemplateStringParser {
         }
 
         Ok(None)
+    }
+
+    fn resolve_language_from_type_text(
+        &self,
+        type_text: &str,
+        context: &ModuleContext,
+    ) -> Result<Option<String>> {
+        let normalized = type_text.trim();
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+
+        let normalized = normalized
+            .strip_prefix("typing.")
+            .unwrap_or(normalized)
+            .trim();
+
+        if let Some(language) = context.type_aliases.get(normalized) {
+            return Ok(Some(language.clone()));
+        }
+
+        if let Some(language) = self.extract_language_from_type_string(normalized)? {
+            return Ok(Some(language));
+        }
+
+        if let Some(inner) = unwrap_generic(normalized, "Optional") {
+            return self.resolve_language_from_type_text(inner, context);
+        }
+
+        if let Some(inner) = unwrap_generic(normalized, "Union") {
+            for part in split_top_level(inner, ',') {
+                if let Some(language) = self.resolve_language_from_type_text(part, context)? {
+                    return Ok(Some(language));
+                }
+            }
+            return Ok(None);
+        }
+
+        let union_parts = split_top_level(normalized, '|');
+        if union_parts.len() > 1 {
+            for part in union_parts {
+                if let Some(language) = self.resolve_language_from_type_text(part, context)? {
+                    return Ok(Some(language));
+                }
+            }
+        }
+
+        if let Some(inner) = normalized
+            .strip_prefix('(')
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            return self.resolve_language_from_type_text(inner, context);
+        }
+
+        Ok(context.type_aliases.get(normalized).cloned())
     }
 }
 
@@ -3479,6 +3530,43 @@ query: sql = t"SELECT * FROM users WHERE id = {user_id}"
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("sql".to_string()));
         assert_eq!(templates[0].variable_name, Some("query".to_string()));
+    }
+
+    #[test]
+    fn test_type_alias_detection_inside_union_annotation() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+type html = Annotated[Template, "html"]
+
+page: html | Renderable = t"<div><"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("html".to_string()));
+    }
+
+    #[test]
+    fn test_typing_optional_parenthesized_union_alias_detection() {
+        let source = r#"
+import typing
+from typing import Annotated
+from string.templatelib import Template
+
+type HtmlTemplate = Annotated[Template, "html"]
+
+page: typing.Optional[(HtmlTemplate | Renderable)] = t"<div><"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("html".to_string()));
     }
 
     #[test]

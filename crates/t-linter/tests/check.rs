@@ -586,7 +586,9 @@ from string.templatelib import Template
 from . import _bindings
 from ._bindings import Renderable
 
-def render_html(template: Annotated[Template, "html"] | Renderable) -> str:
+type HtmlTemplate = Annotated[Template, "html"]
+
+def render_html(template: HtmlTemplate | Renderable) -> str:
     return ""
 "#,
     );
