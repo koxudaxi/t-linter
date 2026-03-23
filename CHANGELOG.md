@@ -1,24 +1,14 @@
 # Changelog
 
 All notable changes to this project are documented in this file.
-This changelog is automatically generated from GitHub Releases.
+This changelog is generated from GitHub Releases and may include manual corrections when release metadata needs adjustment.
 
 ---
 ## [0.5.0](https://github.com/koxudaxi/t-linter/releases/tag/0.5.0) - 2026-03-23
 
-## Breaking Changes
-
-### CLI Changes
-* Removed `--line-length` flag from `format` command - The `t-linter format --line-length <N>` option has been removed as part of a version revert from 0.4.0 to 0.3.0. Users who relied on this flag will get an unrecognized argument error. (#26)
-
-### Configuration Changes
-* Removed `line-length` from `pyproject.toml` configuration - The `tool.t-linter.line-length` key is no longer recognized. Existing `pyproject.toml` files with this key will have it silently ignored. (#26)
-
-### LSP Protocol Changes
-* Removed `printWidth` and `lineLength` formatting options from LSP - The LSP server no longer reads custom `printWidth` or `lineLength` properties from `textDocument/formatting` requests. Editors configured to pass these options will have them silently ignored; HTML/T-HTML formatting now uses upstream library defaults. (#26)
-
-### Default Behavior Changes
-* HTML and T-HTML formatting no longer support configurable line length - The `FormatOptions` struct and all `*_with_options` formatting functions (`format_document_with_options`, `format_document_in_file_with_options`, `format_document_range_with_options`) have been removed from `t-linter-core`. The `project_config` module (`ProjectConfig`, `find_config_root`, `load_project_config`, `load_project_config_for_path`) has also been removed. Code depending on these `t-linter-core` Rust APIs will fail to compile. (#26)
+## Fixed
+* Fix `check` hanging when resolving `html_tstring` imports that combine package re-exports and module imports. (#26)
+* Update `tstring-html` and `tstring-thtml` to `0.1.4` as part of the `html_tstring` integration fix. (#26)
 
 ## What's Changed
 * Fix check hang with html_tstring imports by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/26
@@ -33,26 +23,30 @@ This changelog is automatically generated from GitHub Releases.
 ## Breaking Changes
 
 ### Language Detection Changes
-* HTML validation backend switched from tree-sitter to `tstring-html` - HTML templates annotated with `"html"` are now validated through the `tstring-html` Rust backend instead of tree-sitter parsing. This may produce different diagnostics (different error messages, positions, or severity) for existing HTML templates that previously passed or failed validation. (#21)
+* HTML validation backend switched from tree-sitter to `tstring-html` - HTML templates annotated with `"html"` are now validated through the `tstring-html` Rust backend instead of tree-sitter parsing. This may produce different diagnostics, messages, or source locations for existing templates. (#21)
 
 ### Default Behavior Changes
-* HTML formatting now applied where previously none existed - The `format` command now formats HTML templates via `tstring_html::format_template`. Previously, HTML templates were not formatted (no match arm existed). Users running `t-linter format` may see unexpected changes to their HTML template strings. (#21)
-* HTML and T-HTML formatting no longer support configurable line length - The `FormatOptions` struct and all `*_with_options` formatting functions (`format_document_with_options`, `format_document_in_file_with_options`, `format_document_range_with_options`) have been removed from `t-linter-core`. HTML and T-HTML templates are now formatted using the upstream `tstring_html::format_template` default behavior. Code depending on the `t-linter-core` Rust API for these functions will fail to compile. (#25)
-* Removed `project_config` module from `t-linter-core` public API - The `ProjectConfig`, `find_config_root`, `load_project_config`, and `load_project_config_for_path` exports have been removed. The config-loading logic for discovery (exclude/extend-exclude/ignore-file) has been inlined into the CLI crate. External consumers of these APIs will fail to compile. (#25)
+* `t-linter format` now pretty-formats HTML and T-HTML templates by default. Projects that previously saw no formatting changes for these templates may now get rewrites. (#24)
+* Installed package inference was generalized, so more imported annotations can influence template language detection during `check` and `format`. Previously untyped templates may now produce diagnostics or formatting changes. (#25)
 
 ### CLI Changes
-* Removed `--line-length` flag from `format` command - The `t-linter format --line-length <N>` option has been removed. Users who relied on this flag to control HTML/T-HTML formatter print width will get an unrecognized argument error. (#25)
+* Added `--line-length <N>` to `t-linter format` for HTML and T-HTML formatting. CLI precedence is `--line-length > pyproject.toml > default 80`. (#24)
 
 ### Configuration Changes
-* Removed `line-length` from `pyproject.toml` configuration - The `tool.t-linter.line-length` key is no longer recognized by the core library. Existing `pyproject.toml` files with this key will silently ignore it (the discovery module uses `serde(default)` deserialization). (#25)
+* Added `tool.t-linter.line-length` support in `pyproject.toml` for HTML and T-HTML formatting. (#24)
 
 ### LSP Protocol Changes
-* Removed `printWidth` and `lineLength` formatting options from LSP - The LSP server no longer reads custom `printWidth` or `lineLength` properties from `textDocument/formatting` requests. Editors configured to pass these options will have them silently ignored; HTML/T-HTML formatting now uses upstream library defaults. (#25)
+* Added HTML and T-HTML formatting line-length support through LSP custom properties, with precedence `printWidth > lineLength > pyproject.toml > default 80`. (#24)
+
+### Rust API Changes
+* `t-linter-core` added `FormatOptions` plus `format_document_with_options`, `format_document_in_file_with_options`, and `format_document_range_with_options` so HTML and T-HTML formatting can be configured explicitly. (#24)
+* `project_config` remained available and now includes `line_length` loading from `pyproject.toml`. (#24)
 
 ## What's Changed
 * Add html thtml backend support by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/21
-* docs: add HTML and T-HTML references across all documentation by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/23
 * Add backend regression tests by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/22
+* docs: add HTML and T-HTML references across all documentation by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/23
+* Add formatter line length support by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/24
 * Generalize installed package inference by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/25
 
 
@@ -207,4 +201,3 @@ This changelog is automatically generated from GitHub Releases.
 **Full Changelog**: https://github.com/koxudaxi/t-linter/compare/vscode-v0.1.3...0.2.0
 
 ---
-
