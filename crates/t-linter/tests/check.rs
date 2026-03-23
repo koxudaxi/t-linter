@@ -562,6 +562,58 @@ render_yaml(config)
 }
 
 #[test]
+fn check_handles_installed_package_module_reexports_without_hanging() {
+    let dir = test_dir("installed-package-module-reexports-check");
+    let site_packages = dir.join("site-packages");
+    write_file(
+        &site_packages.join("html_tstring").join("__init__.py"),
+        r#"from ._bindings import Renderable
+from ._runtime import render_html
+"#,
+    );
+    write_file(
+        &site_packages.join("html_tstring").join("_bindings.py"),
+        r#"class Renderable:
+    def render(self) -> str:
+        return ""
+"#,
+    );
+    write_file(
+        &site_packages.join("html_tstring").join("_runtime.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+from . import _bindings
+from ._bindings import Renderable
+
+def render_html(template: Annotated[Template, "html"] | Renderable) -> str:
+    return ""
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from html_tstring import render_html
+
+page = render_html(t"<div><")
+"#,
+    );
+
+    let output = run_check_with_pythonpath(
+        &dir,
+        &["check", "broken.py", "--format", "json"],
+        Some(&site_packages),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "html");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_unresolved_relative_import_does_not_infer_language() {
     let dir = test_dir("unresolved-relative-import-check");
     write_file(

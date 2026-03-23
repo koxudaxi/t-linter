@@ -219,7 +219,8 @@ impl TemplateStringParser {
         self.collect_type_aliases(tree, source, context)?;
         self.collect_imports(tree, source, context, None, false)?;
         self.collect_local_callable_signatures(tree, source, context)?;
-        self.collect_imported_callable_signatures(context)?;
+        let mut module_cache = HashMap::new();
+        self.collect_imported_callable_signatures(context, &mut module_cache)?;
         Ok(())
     }
 
@@ -623,29 +624,33 @@ impl TemplateStringParser {
         Ok(signature)
     }
 
-    fn collect_imported_callable_signatures(&mut self, context: &mut ModuleContext) -> Result<()> {
-        let mut module_cache = HashMap::new();
-
+    fn collect_imported_callable_signatures(
+        &mut self,
+        context: &mut ModuleContext,
+        module_cache: &mut HashMap<String, HashMap<String, CallableSignature>>,
+    ) -> Result<()> {
         for (alias, import_path) in context.imports.clone() {
             if !should_resolve_imported_signatures(&import_path) {
                 continue;
             }
 
-            if let Some(signatures) =
-                self.resolve_imported_callable_signature(&import_path, &mut module_cache)?
-            {
-                context
-                    .callable_signatures
-                    .entry(alias.clone())
-                    .or_insert_with(|| signatures.clone());
-                context
-                    .callable_signatures
-                    .entry(import_path.clone())
-                    .or_insert(signatures);
+            if !self.import_path_resolves_to_module(&import_path) {
+                if let Some(signatures) =
+                    self.resolve_imported_callable_signature(&import_path, module_cache)?
+                {
+                    context
+                        .callable_signatures
+                        .entry(alias.clone())
+                        .or_insert_with(|| signatures.clone());
+                    context
+                        .callable_signatures
+                        .entry(import_path.clone())
+                        .or_insert(signatures);
+                }
             }
 
             if let Some(module_signatures) =
-                self.load_imported_module_signatures(&import_path, &mut module_cache)?
+                self.load_imported_module_signatures(&import_path, module_cache)?
             {
                 for (callable_name, signatures) in module_signatures {
                     context
@@ -662,7 +667,7 @@ impl TemplateStringParser {
             }
 
             if let Some(module_signatures) =
-                self.load_imported_module_signatures(&import_path, &mut module_cache)?
+                self.load_imported_module_signatures(&import_path, module_cache)?
             {
                 for (callable_name, signatures) in module_signatures {
                     context
@@ -736,7 +741,7 @@ impl TemplateStringParser {
                 is_package_init_path(&module_path),
             )?;
             self.collect_local_callable_signatures(&tree, &source, &mut imported_context)?;
-            self.collect_imported_callable_signatures(&mut imported_context)?;
+            self.collect_imported_callable_signatures(&mut imported_context, module_cache)?;
             Ok(imported_context.callable_signatures)
         })();
 
@@ -746,6 +751,10 @@ impl TemplateStringParser {
 
         module_cache.insert(module_name.to_string(), imported_signatures.clone());
         Ok(Some(imported_signatures))
+    }
+
+    fn import_path_resolves_to_module(&self, import_path: &str) -> bool {
+        self.resolve_python_module_path(import_path).is_some()
     }
 
     fn resolve_python_module_path(&self, module_name: &str) -> Option<PathBuf> {
