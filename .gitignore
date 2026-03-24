@@ -11,6 +11,10 @@ target/
 
 # MkDocs / Zensical build output
 site/
+editors/vscode/bin/
+editors/vscode/node_modules/
+editors/vscode/out/
+editors/vscode/*.vsix
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

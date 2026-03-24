@@ -24,44 +24,20 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 
 ## Requirements
 
-- Visual Studio Code 1.74.0 or higher
-- Python 3.9+ (PEP 750 template strings require Python 3.14+)
-- `t-linter` language server (must be installed via PyPI)
+- Visual Studio Code 1.110.0 or higher
+- Python projects that use PEP 750 template strings still require Python 3.14+
 
 ## Installation
 
-**⚠️ Important**: This extension requires the t-linter language server to be installed separately.
-
-### Step 1: Install the t-linter language server
-Install t-linter as a project dependency (recommended):
-```bash
-pip install t-linter
-```
-
-For better project isolation, add it to your project's requirements:
-```bash
-# Using pip with requirements.txt
-echo "t-linter" >> requirements.txt
-pip install -r requirements.txt
-
-# Or using uv (recommended for faster installs)
-uv add t-linter
-
-# Or manually add to pyproject.toml
-[project]
-dependencies = [
-    "t-linter",
-    # other dependencies...
-]
-```
-
-### Step 2: Install the VSCode extension
+### Step 1: Install the VSCode extension
 1. Open VSCode
 2. Go to Extensions (Ctrl+Shift+X)
 3. Search for "t-linter"
 4. Click Install on "T-Linter - Python Template Strings Highlighter & Linter" by koxudaxi
 
-### Step 3: Disable Python Language Server
+The extension bundles `t-linter` binaries for Linux x64, macOS x64/arm64, and Windows x64, so those platforms do not need a separate CLI installation. On other platforms, install an external `t-linter` binary and set `t-linter.serverPath`.
+
+### Step 2: Disable Python Language Server
 To prevent conflicts with t-linter's syntax highlighting, you need to disable the Python language server:
 
 1. Open VSCode Settings (Ctrl+, / Cmd+,)
@@ -77,8 +53,12 @@ Alternatively, add to your settings.json:
 
 [Learn more about Python language server settings](https://code.visualstudio.com/docs/python/settings-reference#_intellisense-engine-settings)
 
-### Step 4: Configure server path (if needed)
-If the extension can't find the t-linter binary automatically:
+### Step 3: Configure server path (optional)
+If you want to override the bundled binary, or if you are on an unsupported platform:
+
+```bash
+pip install t-linter
+```
 
 1. **Find your t-linter path**:
    ```bash
@@ -187,19 +167,20 @@ This extension contributes the following commands:
 ### Language server not found
 If you see "t-linter binary not found":
 
-1. **Ensure t-linter is installed in your project**:
+1. **Reinstall the extension** to restore the bundled binary
+2. **If you are using a custom binary, ensure it is installed**:
    ```bash
    pip install t-linter
    # Or if using requirements.txt:
    pip install -r requirements.txt
    ```
 
-2. **Verify installation**:
+3. **Verify installation**:
    ```bash
    t-linter --version
    ```
 
-3. **Configure server path manually**:
+4. **Configure server path manually**:
    - Find the path: `which t-linter` (macOS/Linux) or `where t-linter` (Windows)
    - Common installation paths:
      - **Windows**: `C:\Users\YourName\AppData\Local\Programs\Python\Python3xx\Scripts\t-linter.exe`
@@ -209,7 +190,7 @@ If you see "t-linter binary not found":
    - Restart VSCode
 
 ### No syntax highlighting
-1. Ensure both the PyPI package AND VSCode extension are installed
+1. Ensure the VSCode extension is installed
 2. **Verify that Python language server is disabled**: `python.languageServer` should be set to "None"
 3. Check that Python semantic highlighting is enabled in VSCode
 4. Verify your template strings use the `t"..."` syntax

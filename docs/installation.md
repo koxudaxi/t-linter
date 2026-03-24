@@ -42,11 +42,9 @@ This provides the `t-linter` command-line tool and LSP server.
 
 If you use VSCode, install the extension for seamless editor integration:
 
-**Step 1: Install the t-linter binary**
+The extension bundles `t-linter` binaries for Linux x64, macOS x64/arm64, and Windows x64, so those platforms do not need a separate CLI installation.
 
-Install t-linter via PyPI (see Option 1 above).
-
-**Step 2: Install the VSCode extension**
+**Step 1: Install the VSCode extension**
 
 Install the extension from the Visual Studio Code Marketplace:
 
@@ -56,6 +54,13 @@ Install the extension from the Visual Studio Code Marketplace:
 4. Click Install on "T-Linter - Python Template Strings Highlighter & Linter" by koxudaxi
 
 **[Install from VSCode Marketplace](https://marketplace.visualstudio.com/items?itemName=koxudaxi.t-linter)**
+
+### Optional: Use a custom t-linter binary
+
+If you want to override the bundled binary, or if you are on an unsupported platform, install `t-linter` separately and set `t-linter.serverPath`:
+
+- `uv`: `uv add t-linter`
+- `pip`: `pip install t-linter`
 
 ## Option 3: Build from Source
 

@@ -1,6 +1,8 @@
 # VSCode Extension
 
-After installing both the PyPI package and VSCode extension, t-linter will automatically provide syntax highlighting for Python template strings.
+On Linux x64, macOS x64/arm64, and Windows x64, the VSCode extension bundles `t-linter`; other platforms require `t-linter.serverPath`.
+
+After installation, t-linter provides syntax highlighting for Python template strings.
 
 ## Setup
 
@@ -22,9 +24,15 @@ Alternatively, add to your `settings.json`:
 
 ### Configure the Server Path (if needed)
 
-If t-linter is not in your PATH, configure the server path in VSCode settings:
+If you want to override the bundled binary, or if you are on an unsupported platform, configure the server path in VSCode settings:
 
-1. **Find your t-linter path** by running in terminal:
+1. **Install and find your t-linter path**:
+
+    ```bash
+    pip install t-linter
+    ```
+
+2. Find your `t-linter` path by running in terminal:
 
     === "macOS/Linux"
 
@@ -38,9 +46,9 @@ If t-linter is not in your PATH, configure the server path in VSCode settings:
         where t-linter
         ```
 
-2. Open VSCode Settings (Ctrl+, / Cmd+,)
-3. Search for "t-linter.serverPath"
-4. Set the full path to your t-linter executable
+3. Open VSCode Settings (Ctrl+, / Cmd+,)
+4. Search for "t-linter.serverPath"
+5. Set the full path to your t-linter executable
 
 Common paths:
 
@@ -54,7 +62,7 @@ Common paths:
 
 If syntax highlighting doesn't work:
 
-1. **Ensure t-linter is installed**: Run `t-linter --version` in terminal
+1. **Reinstall the extension** to restore the bundled binary
 2. **Check that Python language server is disabled**: `python.languageServer` should be set to `"None"`
-3. **Check the server path**: Verify `t-linter.serverPath` in VSCode settings
+3. **Check the server path**: If you use an external binary, verify `t-linter.serverPath` in VSCode settings
 4. **Restart VSCode** after making changes

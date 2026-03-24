@@ -78,10 +78,11 @@ This provides the `t-linter` CLI tool and LSP server.
 
 If you use VSCode, install the extension for seamless editor integration:
 
-1. Install the `t-linter` binary via PyPI (see above)
-2. Open VSCode → Extensions (Ctrl+Shift+X / Cmd+Shift+X)
-3. Search for "t-linter" → Install "T-Linter" by koxudaxi
-4. To avoid conflicts with t-linter's semantic highlighting, set the Python language server to `"None"` in your workspace settings. This disables features like auto-complete and go-to-definition from the Python language server in that workspace:
+1. Open VSCode → Extensions (Ctrl+Shift+X / Cmd+Shift+X)
+2. Search for "t-linter" → Install "T-Linter" by koxudaxi
+3. On Linux x64, macOS x64/arm64, and Windows x64, the extension bundles the `t-linter` binary, so no separate PyPI install is required.
+4. On unsupported platforms, or if you want to override the bundled binary, install `t-linter` via PyPI (see above) and set `t-linter.serverPath` to the full executable path.
+5. To avoid conflicts with t-linter's semantic highlighting, set the Python language server to `"None"` in your workspace settings. This disables features like auto-complete and go-to-definition from the Python language server in that workspace:
    ```json
    {
        "python.languageServer": "None"
@@ -89,7 +90,7 @@ If you use VSCode, install the extension for seamless editor integration:
    ```
    If you need those features, you can keep the Python language server enabled — t-linter will still provide template string diagnostics and formatting, though semantic highlighting may conflict.
 
-If `t-linter` is not in your PATH, set `t-linter.serverPath` in VSCode settings to the full path of the executable.
+If you use an external `t-linter` binary and it is not in your PATH, set `t-linter.serverPath` in VSCode settings to the full path of the executable.
 
 **[→ Install from VSCode Marketplace](https://marketplace.visualstudio.com/items?itemName=koxudaxi.t-linter)**
 
