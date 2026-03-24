@@ -2,17 +2,15 @@
 
 t-linter can be installed in three ways depending on your use case.
 
-## Option 1: VSCode Extension (Recommended for VSCode users)
+## Option 1: PyPI Package (Recommended)
 
-**Step 1: Install the t-linter binary**
-
-Install t-linter as a project dependency (recommended):
+Install t-linter for CLI usage and LSP server integration:
 
 ```bash
 pip install t-linter
 ```
 
-For better project isolation, add it to your project's requirements:
+For better project isolation, add it to your project's dependencies:
 
 === "uv (recommended)"
 
@@ -27,6 +25,27 @@ For better project isolation, add it to your project's requirements:
     pip install -r requirements.txt
     ```
 
+=== "pyproject.toml"
+
+    ```toml
+    [project]
+    dependencies = [
+        "t-linter",
+    ]
+    ```
+
+This provides the `t-linter` command-line tool and LSP server.
+
+**[View on PyPI](https://pypi.org/project/t-linter/)**
+
+## Option 2: VSCode Extension
+
+If you use VSCode, install the extension for seamless editor integration:
+
+**Step 1: Install the t-linter binary**
+
+Install t-linter via PyPI (see Option 1 above).
+
 **Step 2: Install the VSCode extension**
 
 Install the extension from the Visual Studio Code Marketplace:
@@ -37,41 +56,6 @@ Install the extension from the Visual Studio Code Marketplace:
 4. Click Install on "T-Linter - Python Template Strings Highlighter & Linter" by koxudaxi
 
 **[Install from VSCode Marketplace](https://marketplace.visualstudio.com/items?itemName=koxudaxi.t-linter)**
-
-## Option 2: PyPI Package Only (CLI tool and LSP server)
-
-For command-line usage or integration with other editors:
-
-```bash
-pip install t-linter
-```
-
-Or add to your project's dependencies:
-
-=== "uv"
-
-    ```bash
-    uv add t-linter
-    ```
-
-=== "pip"
-
-    ```bash
-    pip install t-linter
-    ```
-
-=== "pyproject.toml"
-
-    ```toml
-    [project]
-    dependencies = [
-        "t-linter",
-    ]
-    ```
-
-This provides the `t-linter` command-line tool and LSP server without the VSCode extension.
-
-**[View on PyPI](https://pypi.org/project/t-linter/)**
 
 ## Option 3: Build from Source
 
