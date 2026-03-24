@@ -1,6 +1,7 @@
 use anyhow::Result;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +18,8 @@ use tracing::{debug, info};
 const TOKEN_TYPE_MACRO: u32 = 14;
 const TOKEN_MODIFIER_NONE: u32 = 0;
 const DIAGNOSTIC_DEBOUNCE_MS: u64 = 250;
+const SOURCE_FIX_ALL_T_LINTER: &str = "source.fixAll.t-linter";
+const REFACTOR_REWRITE_T_LINTER: &str = "refactor.rewrite.t-linter";
 
 pub struct TLinterLanguageServer {
     client: Client,
@@ -89,6 +92,14 @@ impl TLinterLanguageServer {
 
         tokens
     }
+
+    fn source_fix_all_kind() -> CodeActionKind {
+        CodeActionKind::from(SOURCE_FIX_ALL_T_LINTER)
+    }
+
+    fn refactor_rewrite_kind() -> CodeActionKind {
+        CodeActionKind::from(REFACTOR_REWRITE_T_LINTER)
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -149,6 +160,17 @@ impl LanguageServer for TLinterLanguageServer {
                 ),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 document_range_formatting_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![
+                            Self::source_fix_all_kind(),
+                            Self::refactor_rewrite_kind(),
+                        ]),
+                        resolve_provider: Some(false),
+                        ..Default::default()
+                    }
+                    .into(),
+                ),
                 ..Default::default()
             },
             ..Default::default()
@@ -235,69 +257,76 @@ impl LanguageServer for TLinterLanguageServer {
         .await
         .map(Some)
     }
-}
 
-impl TLinterLanguageServer {
-    async fn debug_template_positions(&self, uri: &Url) -> Result<()> {
-        let text = self
-            .document_cache
-            .get(uri)
-            .ok_or_else(|| anyhow::anyhow!("Document not found in cache"))?
-            .clone();
+    async fn code_action(
+        &self,
+        params: CodeActionParams,
+    ) -> JsonRpcResult<Option<CodeActionResponse>> {
+        let mut actions = Vec::new();
+        let requested_kinds = params.context.only.as_deref();
+        let source_fix_all_kind = Self::source_fix_all_kind();
+        let rewrite_kind = Self::refactor_rewrite_kind();
 
-        let lines: Vec<&str> = text.lines().collect();
-        let mut parser = self.parser.lock().await;
-        let templates = parser.find_template_strings(&text)?;
+        if requested_code_action_kinds_include(requested_kinds, &source_fix_all_kind) {
+            let edits = self
+                .collect_document_format_edits(&params.text_document.uri, None)
+                .await?;
 
-        info!("=== TEMPLATE POSITION DEBUG ===");
-
-        for (idx, template) in templates.iter().enumerate() {
-            info!("\n--- Template {} ---", idx);
-            info!("Raw content: {:?}", template.raw_content);
-            info!("Processed content: {:?}", template.content);
-            info!(
-                "Document position: line {} col {} to line {} col {}",
-                template.location.start_line,
-                template.location.start_column,
-                template.location.end_line,
-                template.location.end_column
-            );
-
-            let start_line_idx = template.location.start_line - 1;
-            let start_col_idx = template.location.start_column - 1;
-            let end_line_idx = template.location.end_line - 1;
-            let end_col_idx = template.location.end_column - 1;
-
-            if start_line_idx < lines.len() {
-                let line = lines[start_line_idx];
-                info!("Line {}: '{}'", template.location.start_line, line);
-
-                if start_col_idx < line.len() {
-                    let template_text = if start_line_idx == end_line_idx {
-                        &line[start_col_idx..end_col_idx.min(line.len())]
-                    } else {
-                        &line[start_col_idx..]
-                    };
-                    info!("Extracted template text: '{}'", template_text);
-                }
-            }
-
-            for (i, expr) in template.expressions.iter().enumerate() {
-                info!(
-                    "  Expression {}: '{}' at {}:{}-{}:{}",
-                    i,
-                    expr.content,
-                    expr.location.start_line,
-                    expr.location.start_column,
-                    expr.location.end_line,
-                    expr.location.end_column
+            if !edits.is_empty() {
+                actions.push(
+                    CodeAction {
+                        title: "Format template strings with t-linter".to_string(),
+                        kind: Some(source_fix_all_kind),
+                        edit: Some(workspace_edit_for_uri(&params.text_document.uri, edits)),
+                        is_preferred: Some(true),
+                        ..Default::default()
+                    }
+                    .into(),
                 );
             }
         }
 
-        info!("=== END POSITION DEBUG ===\n");
-        Ok(())
+        if requested_code_action_kinds_include(requested_kinds, &rewrite_kind) {
+            match self
+                .collect_single_template_selection_format_edits(
+                    &params.text_document.uri,
+                    &params.range,
+                    None,
+                )
+                .await?
+            {
+                SelectionFormatEdits::Edits(edits) if !edits.is_empty() => {
+                    actions.push(
+                        CodeAction {
+                            title: "Rewrite template string with t-linter".to_string(),
+                            kind: Some(rewrite_kind),
+                            edit: Some(workspace_edit_for_uri(&params.text_document.uri, edits)),
+                            ..Default::default()
+                        }
+                        .into(),
+                    );
+                }
+                SelectionFormatEdits::NoTemplate
+                | SelectionFormatEdits::MultipleTemplates
+                | SelectionFormatEdits::Edits(_) => {}
+            }
+        }
+
+        if actions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(actions))
+        }
     }
+}
+
+enum SelectionFormatEdits {
+    NoTemplate,
+    MultipleTemplates,
+    Edits(Vec<TextEdit>),
+}
+
+impl TLinterLanguageServer {
     fn schedule_diagnostics(&self, uri: Url) {
         if let Some((_, handle)) = self.diagnostic_tasks.remove(&uri) {
             handle.abort();
@@ -354,10 +383,9 @@ impl TLinterLanguageServer {
         self.diagnostic_tasks.insert(uri, handle);
     }
 
-    async fn format_uri(
+    async fn collect_document_format_edits(
         &self,
         uri: &Url,
-        range: Option<Range>,
         formatting_options: Option<&FormattingOptions>,
     ) -> JsonRpcResult<Vec<TextEdit>> {
         let text = self
@@ -367,50 +395,77 @@ impl TLinterLanguageServer {
             .clone();
         let options =
             resolve_lsp_format_options(uri, formatting_options).map_err(internal_error)?;
+        let edits = format_document_with_options(&text, &options).map_err(internal_error)?;
 
-        let edits = match range {
-            Some(range) => {
-                let location = lsp_range_to_location(&range);
-                format_document_range_with_options(&text, &location, &options)
-                    .map_err(internal_error)?
-            }
-            None => format_document_with_options(&text, &options).map_err(internal_error)?,
-        };
-
-        Ok(edits
-            .into_iter()
-            .map(|edit| TextEdit {
-                range: location_to_lsp_range(&edit.location),
-                new_text: edit.replacement,
-            })
-            .collect())
+        Ok(template_edits_to_lsp(edits))
     }
 
-    fn generate_basic_template_tokens(
+    async fn collect_single_template_selection_format_edits(
         &self,
-        template: &TemplateStringInfo,
-    ) -> Vec<(u32, u32, u32, u32, u32)> {
-        let mut tokens = Vec::new();
+        uri: &Url,
+        range: &Range,
+        formatting_options: Option<&FormattingOptions>,
+    ) -> JsonRpcResult<SelectionFormatEdits> {
+        let text = self
+            .document_cache
+            .get(uri)
+            .ok_or_else(|| tower_lsp::jsonrpc::Error::invalid_params("Document not found"))?
+            .clone();
+        let options =
+            resolve_lsp_format_options(uri, formatting_options).map_err(internal_error)?;
+        let location = lsp_range_to_location(range);
+        let mut parser = self.parser.lock().await;
+        let templates = parser
+            .find_template_strings(&text)
+            .map_err(internal_error)?;
+        drop(parser);
 
-        let line = (template.location.start_line - 1) as u32;
-        let start_col = (template.location.start_column - 1) as u32;
+        let matches = templates
+            .iter()
+            .filter(|template| locations_overlap(&template.location, &location))
+            .count();
 
-        let end_col = (template.location.end_column - 1) as u32;
-        let length = if template.location.start_line == template.location.end_line {
-            end_col - start_col
-        } else {
-            template
-                .raw_content
-                .lines()
-                .next()
-                .map(|l| l.len())
-                .unwrap_or(0) as u32
-        };
+        if matches == 0 {
+            return Ok(SelectionFormatEdits::NoTemplate);
+        }
 
-        tokens.push((line, start_col, length, 18, 0));
+        if matches > 1 {
+            return Ok(SelectionFormatEdits::MultipleTemplates);
+        }
 
-        tokens
+        let edits = format_document_range_with_options(&text, &location, &options)
+            .map_err(internal_error)?;
+        Ok(SelectionFormatEdits::Edits(template_edits_to_lsp(edits)))
     }
+
+    async fn format_uri(
+        &self,
+        uri: &Url,
+        range: Option<Range>,
+        formatting_options: Option<&FormattingOptions>,
+    ) -> JsonRpcResult<Vec<TextEdit>> {
+        match range {
+            Some(range) => {
+                match self
+                    .collect_single_template_selection_format_edits(uri, &range, formatting_options)
+                    .await?
+                {
+                    SelectionFormatEdits::NoTemplate => Ok(Vec::new()),
+                    SelectionFormatEdits::MultipleTemplates => {
+                        Err(internal_error(anyhow::anyhow!(
+                            "Range formatting must target exactly one template string."
+                        )))
+                    }
+                    SelectionFormatEdits::Edits(edits) => Ok(edits),
+                }
+            }
+            None => {
+                self.collect_document_format_edits(uri, formatting_options)
+                    .await
+            }
+        }
+    }
+
     async fn generate_semantic_tokens(&self, uri: &Url) -> Result<SemanticTokens> {
         let text = self
             .document_cache
@@ -476,7 +531,10 @@ impl TLinterLanguageServer {
                         }
                     }
                 } else {
-                    info!("Unsupported highlight language {}, using fallback tokens", lang);
+                    info!(
+                        "Unsupported highlight language {}, using fallback tokens",
+                        lang
+                    );
                     let tokens = self.generate_fallback_tokens(template, &text);
                     all_tokens.extend(tokens);
                 }
@@ -626,6 +684,50 @@ fn uri_to_path(uri: &Url) -> Option<PathBuf> {
     uri.to_file_path().ok()
 }
 
+fn template_edits_to_lsp(edits: Vec<t_linter_core::TemplateEdit>) -> Vec<TextEdit> {
+    edits
+        .into_iter()
+        .map(|edit| TextEdit {
+            range: location_to_lsp_range(&edit.location),
+            new_text: edit.replacement,
+        })
+        .collect()
+}
+
+fn workspace_edit_for_uri(uri: &Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
+    WorkspaceEdit::new(HashMap::from([(uri.clone(), edits)]))
+}
+
+fn requested_code_action_kinds_include(
+    requested_kinds: Option<&[CodeActionKind]>,
+    action_kind: &CodeActionKind,
+) -> bool {
+    requested_kinds.is_none_or(|requested_kinds| {
+        requested_kinds
+            .iter()
+            .any(|requested_kind| code_action_kind_matches(requested_kind, action_kind))
+    })
+}
+
+fn code_action_kind_matches(requested_kind: &CodeActionKind, action_kind: &CodeActionKind) -> bool {
+    let requested = requested_kind.as_str();
+    let action = action_kind.as_str();
+
+    action == requested
+        || action
+            .strip_prefix(requested)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
+fn locations_overlap(left: &t_linter_core::Location, right: &t_linter_core::Location) -> bool {
+    let left_start = (left.start_line, left.start_column);
+    let left_end = (left.end_line, left.end_column);
+    let right_start = (right.start_line, right.start_column);
+    let right_end = (right.end_line, right.end_column);
+
+    left_start <= right_end && right_start <= left_end
+}
+
 fn internal_error(err: anyhow::Error) -> tower_lsp::jsonrpc::Error {
     tower_lsp::jsonrpc::Error {
         code: tower_lsp::jsonrpc::ErrorCode::InternalError,
@@ -667,7 +769,8 @@ impl Default for TLinterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use tempfile::TempDir;
+    use tower_lsp::LspService;
 
     #[test]
     fn lsp_format_options_prefer_print_width_then_line_length() {
@@ -699,5 +802,302 @@ mod tests {
 
         let options = resolve_lsp_format_options(&uri, None).expect("resolve options");
         assert_eq!(options.line_length, 88);
+    }
+
+    #[test]
+    fn requested_code_action_kinds_match_specific_and_parent_kinds() {
+        assert!(code_action_kind_matches(
+            &CodeActionKind::SOURCE_FIX_ALL,
+            &TLinterLanguageServer::source_fix_all_kind()
+        ));
+        assert!(code_action_kind_matches(
+            &CodeActionKind::REFACTOR_REWRITE,
+            &TLinterLanguageServer::refactor_rewrite_kind()
+        ));
+        assert!(code_action_kind_matches(
+            &TLinterLanguageServer::source_fix_all_kind(),
+            &TLinterLanguageServer::source_fix_all_kind()
+        ));
+        assert!(!code_action_kind_matches(
+            &CodeActionKind::QUICKFIX,
+            &TLinterLanguageServer::source_fix_all_kind()
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initialize_advertises_code_actions_and_formatting_capabilities() {
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+
+        let result = service
+            .inner()
+            .initialize(InitializeParams::default())
+            .await
+            .expect("initialize");
+
+        assert_eq!(
+            result.capabilities.document_formatting_provider,
+            Some(OneOf::Left(true))
+        );
+        assert_eq!(
+            result.capabilities.document_range_formatting_provider,
+            Some(OneOf::Left(true))
+        );
+
+        let code_action_provider = result
+            .capabilities
+            .code_action_provider
+            .expect("code action provider");
+        let CodeActionProviderCapability::Options(options) = code_action_provider else {
+            panic!("expected code action options");
+        };
+        assert_eq!(
+            options.code_action_kinds,
+            Some(vec![
+                TLinterLanguageServer::source_fix_all_kind(),
+                TLinterLanguageServer::refactor_rewrite_kind()
+            ])
+        );
+        assert_eq!(options.resolve_provider, Some(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn source_fix_all_code_action_matches_formatting_endpoint_edits() {
+        let temp = tempdir_with_pyproject(20);
+        let source = sample_python_document();
+        let uri = write_source_file(temp.path(), "example.py", source);
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+        open_cached_document(server, &uri, source).await;
+
+        let formatting_edits = server
+            .formatting(DocumentFormattingParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                options: FormattingOptions {
+                    tab_size: 4,
+                    insert_spaces: true,
+                    ..Default::default()
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .expect("formatting response")
+            .expect("formatting edits");
+
+        let actions = server
+            .code_action(code_action_params(
+                uri.clone(),
+                full_document_range(),
+                Some(vec![TLinterLanguageServer::source_fix_all_kind()]),
+            ))
+            .await
+            .expect("code action response")
+            .expect("code action");
+
+        assert_eq!(actions.len(), 1);
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected code action");
+        };
+        assert_eq!(
+            action.kind,
+            Some(TLinterLanguageServer::source_fix_all_kind())
+        );
+        let edit = action.edit.as_ref().expect("workspace edit");
+        assert_eq!(
+            edit.changes
+                .as_ref()
+                .and_then(|changes| changes.get(&uri))
+                .cloned()
+                .expect("edits for uri"),
+            formatting_edits
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rewrite_code_action_requires_single_template_selection() {
+        let temp = tempdir_with_pyproject(20);
+        let source = sample_python_document();
+        let uri = write_source_file(temp.path(), "example.py", source);
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+        open_cached_document(server, &uri, source).await;
+
+        let actions = server
+            .code_action(code_action_params(
+                uri.clone(),
+                Range {
+                    start: Position {
+                        line: 3,
+                        character: 50,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 55,
+                    },
+                },
+                Some(vec![CodeActionKind::REFACTOR_REWRITE]),
+            ))
+            .await
+            .expect("code action response")
+            .expect("rewrite action");
+        assert_eq!(actions.len(), 1);
+
+        let no_template = server
+            .code_action(code_action_params(
+                uri.clone(),
+                Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 4,
+                    },
+                },
+                Some(vec![TLinterLanguageServer::refactor_rewrite_kind()]),
+            ))
+            .await
+            .expect("code action response");
+        assert!(no_template.is_none());
+
+        let multiple_templates = server
+            .code_action(code_action_params(
+                uri,
+                Range {
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 60,
+                    },
+                },
+                Some(vec![TLinterLanguageServer::refactor_rewrite_kind()]),
+            ))
+            .await
+            .expect("code action response");
+        assert!(multiple_templates.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn code_action_kind_filtering_and_noop_behavior_work() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
+"#;
+        let uri = write_source_file(temp.path(), "query.py", source);
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+        open_cached_document(server, &uri, source).await;
+
+        let no_fix_all = server
+            .code_action(code_action_params(
+                uri.clone(),
+                full_document_range(),
+                Some(vec![CodeActionKind::SOURCE_FIX_ALL]),
+            ))
+            .await
+            .expect("code action response");
+        assert!(no_fix_all.is_none());
+
+        let no_rewrite_from_fix_all_filter = server
+            .code_action(code_action_params(
+                uri,
+                Range {
+                    start: Position {
+                        line: 3,
+                        character: 40,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 50,
+                    },
+                },
+                Some(vec![TLinterLanguageServer::source_fix_all_kind()]),
+            ))
+            .await
+            .expect("code action response");
+        assert!(no_rewrite_from_fix_all_filter.is_none());
+    }
+
+    fn tempdir_with_pyproject(line_length: usize) -> TempDir {
+        let temp = TempDir::new().expect("tempdir");
+        std::fs::write(
+            temp.path().join("pyproject.toml"),
+            format!("[tool.t-linter]\nline-length = {line_length}\n"),
+        )
+        .expect("write pyproject");
+        temp
+    }
+
+    fn write_source_file(dir: &std::path::Path, file_name: &str, source: &str) -> Url {
+        let file_path = dir.join(file_name);
+        std::fs::write(&file_path, source).expect("write source");
+        Url::from_file_path(file_path).expect("file url")
+    }
+
+    async fn open_cached_document(server: &TLinterLanguageServer, uri: &Url, source: &str) {
+        server
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "python".to_string(),
+                    version: 1,
+                    text: source.to_string(),
+                },
+            })
+            .await;
+    }
+
+    fn code_action_params(
+        uri: Url,
+        range: Range,
+        only: Option<Vec<CodeActionKind>>,
+    ) -> CodeActionParams {
+        CodeActionParams {
+            text_document: TextDocumentIdentifier { uri },
+            range,
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only,
+                trigger_kind: None,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        }
+    }
+
+    fn full_document_range() -> Range {
+        Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 10,
+                character: 0,
+            },
+        }
+    }
+
+    fn sample_python_document() -> &'static str {
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+html_template: Annotated[Template, "html"] = t'<div data-a="12345" data-b="67890"></div>'
+query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
+payload: Annotated[Template, "json"] = t'{"b": 2, "a": 1}'
+"#
     }
 }

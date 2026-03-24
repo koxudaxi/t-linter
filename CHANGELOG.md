@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 This changelog is generated from GitHub Releases and may include manual corrections when release metadata needs adjustment.
 
 ---
+## [Unreleased]
+
+### Added
+* Add `textDocument/codeAction` support with `source.fixAll.t-linter` and `refactor.rewrite.t-linter` for VSCode save-time formatting and manual single-template rewrites.
+
+### Changed
+* Keep `textDocument/formatting` and `textDocument/rangeFormatting` for backward compatibility while documenting Ruff coexistence mode for VSCode.
+* Make multiline template rewrites prefer triple-double-quoted output when promoting a single-line literal, which keeps Ruff and t-linter save pipelines convergent.
+
+---
 ## [0.6.2](https://github.com/koxudaxi/t-linter/releases/tag/0.6.2) - 2026-03-24
 
 ## What's Changed

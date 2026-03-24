@@ -1066,10 +1066,23 @@ impl TemplateStringParser {
             type: (_) @type_annotation
             right: (string) @string
         )
+
+        (assignment
+            left: (identifier) @var_name
+            type: (_) @type_annotation
+            right: (parenthesized_expression
+                (string) @string)
+        )
         
         (assignment
             left: (identifier) @var_name
             right: (string) @string
+        )
+
+        (assignment
+            left: (identifier) @var_name
+            right: (parenthesized_expression
+                (string) @string)
         )
         
         (call
@@ -1236,6 +1249,7 @@ impl TemplateStringParser {
                 end_line: end_position.row + 1,
                 end_column: end_position.column + 1,
             },
+            formatting_wrapper_location: formatting_wrapper_location(node),
             expressions,
             parts,
             flags,
@@ -3512,6 +3526,7 @@ pub struct TemplateStringInfo {
     pub string_start: String,
     pub string_end: String,
     pub location: Location,
+    pub formatting_wrapper_location: Option<Location>,
     pub expressions: Vec<Expression>,
     pub parts: Vec<TemplatePart>,
     pub flags: TemplateStringFlags,
@@ -3596,7 +3611,9 @@ impl TemplateStringInfo {
     }
 
     pub fn formatted_literal(&self, content: &str) -> String {
-        let preferred_quote = if self.string_start.contains('\'') {
+        let preferred_quote = if !self.flags.is_triple && content.contains('\n') {
+            '"'
+        } else if self.string_start.contains('\'') {
             '\''
         } else {
             '"'
@@ -3621,6 +3638,16 @@ impl TemplateStringInfo {
         let escaped_content = escape_python_literal_content(content, quote, use_triple);
 
         format!("{normalized_prefix}{delimiter}{escaped_content}{delimiter}")
+    }
+
+    pub fn formatting_location(&self, content: &str) -> &Location {
+        if content.contains('\n') {
+            self.formatting_wrapper_location
+                .as_ref()
+                .unwrap_or(&self.location)
+        } else {
+            &self.location
+        }
     }
 
     fn token_position_to_content_offset(&self, position: &SourcePosition) -> usize {
@@ -3682,6 +3709,23 @@ impl TemplateStringInfo {
     }
 }
 
+fn formatting_wrapper_location(node: Node) -> Option<Location> {
+    let parent = node.parent()?;
+    if parent.kind() != "parenthesized_expression" || parent.named_child_count() != 1 {
+        return None;
+    }
+
+    let start = parent.start_position();
+    let end = parent.end_position();
+
+    Some(Location {
+        start_line: start.row + 1,
+        start_column: start.column + 1,
+        end_line: end.row + 1,
+        end_column: end.column + 1,
+    })
+}
+
 fn push_static_part(content_parts: &mut Vec<String>, parts: &mut Vec<TemplatePart>, text: &str) {
     if text.is_empty() {
         return;
@@ -3697,7 +3741,8 @@ fn unescape_template_text(text: &str, is_raw: bool) -> String {
     let mut chars = text.chars();
 
     while let Some(ch) = chars.next() {
-        if !is_raw && ch == '\\'
+        if !is_raw
+            && ch == '\\'
             && let Some(next_ch) = chars.next()
         {
             match next_ch {
@@ -3904,8 +3949,8 @@ fn escape_python_literal_content(content: &str, quote: char, use_triple: bool) -
         if trailing_quotes > 0 {
             let split_at = escaped.len() - trailing_quotes;
             let mut escaped = escaped[..split_at].replace(&delimiter, escaped_delimiter);
-            let replacement = std::iter::repeat_n(format!("\\{quote}"), trailing_quotes)
-                .collect::<String>();
+            let replacement =
+                std::iter::repeat_n(format!("\\{quote}"), trailing_quotes).collect::<String>();
             escaped.push_str(&replacement);
             escaped
         } else {
@@ -4067,6 +4112,19 @@ html = t"""
     }
 
     #[test]
+    fn test_formatted_literal_prefers_triple_double_quotes_when_promoting_multiline_output() {
+        let source = "payload = t'placeholder'";
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(
+            templates[0].formatted_literal("<div>\n  <span>{value}</span>\n</div>"),
+            "t\"\"\"<div>\n  <span>{value}</span>\n</div>\"\"\""
+        );
+    }
+
+    #[test]
     fn test_formatted_literal_avoids_triple_quote_boundary_collision() {
         let source = "payload = t\"\"\"placeholder\"\"\"";
 
@@ -4129,6 +4187,27 @@ html_content: Annotated[Template, "html"] = t"<h1>{title}</h1>"
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("html".to_string()));
         assert_eq!(templates[0].variable_name, Some("html_content".to_string()));
+        assert!(templates[0].formatting_wrapper_location.is_none());
+    }
+
+    #[test]
+    fn test_parenthesized_annotated_template_string() {
+        let source = r#"
+from typing import Annotated
+from templatelib import Template
+
+html_content: Annotated[Template, "html"] = (
+    t"<h1>{title}</h1>"
+)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("html".to_string()));
+        assert_eq!(templates[0].variable_name, Some("html_content".to_string()));
+        assert!(templates[0].formatting_wrapper_location.is_some());
     }
 
     #[test]

@@ -82,13 +82,36 @@ If you use VSCode, install the extension for seamless editor integration:
 2. Search for "t-linter" → Install "T-Linter" by koxudaxi
 3. On Linux x64, macOS x64/arm64, and Windows x64, the extension bundles the `t-linter` binary, so no separate PyPI install is required.
 4. On unsupported platforms, or if you want to override the bundled binary, install `t-linter` via PyPI (see above) and set `t-linter.serverPath` to the full executable path.
-5. To avoid conflicts with t-linter's semantic highlighting, set the Python language server to `"None"` in your workspace settings. This disables features like auto-complete and go-to-definition from the Python language server in that workspace:
+5. Choose one save-time formatting mode:
+   - **Ruff coexistence mode** keeps Ruff as the Python formatter and runs t-linter through `source.fixAll.t-linter`:
+     ```json
+     {
+       "[python]": {
+         "editor.defaultFormatter": "charliermarsh.ruff",
+         "editor.formatOnSave": true,
+         "editor.codeActionsOnSave": [
+           "source.fixAll.t-linter"
+         ]
+       }
+     }
+     ```
+   - **t-linter formatter mode** keeps the existing formatter-only workflow:
+     ```json
+     {
+       "[python]": {
+         "editor.defaultFormatter": "koxudaxi.t-linter",
+         "editor.formatOnSave": true
+       }
+     }
+     ```
+   VSCode only allows one default formatter per language, which is why t-linter also exposes a save-time code action lane for template-string formatting.
+6. If semantic highlighting conflicts with another Python extension, set the Python language server to `"None"` in your workspace settings:
    ```json
    {
        "python.languageServer": "None"
    }
    ```
-   If you need those features, you can keep the Python language server enabled — t-linter will still provide template string diagnostics and formatting, though semantic highlighting may conflict.
+   If you need those features, you can keep the Python language server enabled. t-linter will still provide template-string diagnostics, code actions, and formatting, though semantic highlighting may conflict.
 
 If you use an external `t-linter` binary and it is not in your PATH, set `t-linter.serverPath` in VSCode settings to the full path of the executable.
 
@@ -173,6 +196,7 @@ The LSP server provides:
 - **Semantic Tokens** — syntax highlighting for embedded languages
 - **Diagnostics** — real-time validation with 250ms debouncing
 - **Document Formatting** — full document and range formatting
+- **Code Actions** — `source.fixAll.t-linter` for document-level rewrites and `refactor.rewrite.t-linter` for single-template selection rewrites
 
 #### Claude Code
 

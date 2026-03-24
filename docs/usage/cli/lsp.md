@@ -18,6 +18,7 @@ The LSP server provides:
 - **Diagnostics** — real-time validation of embedded language syntax (debounced at 250ms)
 - **Document Formatting** — full document formatting of template literals
 - **Range Formatting** — format a single template literal by selecting its range
+- **Code Actions** — save-time and manual rewrite actions for VSCode and other editors
 
 ### Feature Support by Language
 
@@ -35,7 +36,20 @@ The LSP server provides:
 For HTML, T-HTML, JSON, YAML, and TOML templates:
 
 - Diagnostics are published from the dedicated Rust backends for strict validation
-- Formatting requests rewrite the whole template literal using the backend formatter
+- Formatting requests and code actions rewrite the whole template literal using the backend formatter
+
+## Code Action Kinds
+
+The server advertises `textDocument/codeAction` support with two t-linter-specific kinds:
+
+- **`source.fixAll.t-linter`** — document-level formatting for all format-capable template literals in the file
+- **`refactor.rewrite.t-linter`** — selection-based rewrite for exactly one template literal
+
+`source.fixAll.t-linter` returns a direct `WorkspaceEdit` instead of a follow-up command so save-time execution stays deterministic.
+
+`refactor.rewrite.t-linter` is returned only when the requested range maps to exactly one template literal. If the selection hits no templates, or spans multiple templates, the server returns no action.
+
+The existing `textDocument/formatting` and `textDocument/rangeFormatting` endpoints remain available for backward compatibility.
 
 ### Line Length Resolution
 
@@ -45,6 +59,8 @@ For HTML and T-HTML formatting, line length is resolved in this order:
 2. custom option `lineLength`
 3. `pyproject.toml` `tool.t-linter.line-length`
 4. default `80`
+
+Code actions do not carry formatting options, so they use steps 3 and 4 only.
 
 ## Editor Integration
 
@@ -90,6 +106,22 @@ To integrate into your development workflow, add t-linter checks to your project
 ### VSCode
 
 The [VSCode extension](../vscode.md) uses this server automatically. No additional LSP configuration is needed.
+
+Recommended Ruff coexistence settings:
+
+```json
+{
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": [
+      "source.fixAll.t-linter"
+    ]
+  }
+}
+```
+
+VSCode supports only one default formatter per language, which is why t-linter exposes save-time template formatting through `source.fixAll.t-linter` instead of asking you to replace Ruff.
 
 ### Neovim
 
