@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file.
 This changelog is generated from GitHub Releases and may include manual corrections when release metadata needs adjustment.
 
 ---
+## [0.7.0](https://github.com/koxudaxi/t-linter/releases/tag/0.7.0) - 2026-03-24
+
+## Breaking Changes
+
+
+### Default Behavior Changes
+* Multiline formatting now prefers triple-double-quotes over triple-single-quotes - When formatting promotes a single-quoted template string (`t'...'`) to a triple-quoted literal due to multiline output, the formatter now emits `t"""..."""` instead of `t'''...'''`. This affects any workflow that snapshots or compares formatter output. (#37)
+
+### LSP Protocol Changes
+* Range formatting now rejects selections containing multiple template strings - Previously, range formatting would silently format all templates within the selected range. It now returns a JSON-RPC internal error when more than one template string overlaps the requested range, requiring exactly one template to be targeted. LSP clients relying on multi-template range formatting will need to issue separate requests per template or use the new `source.fixAll.t-linter` code action for document-wide formatting. (#37)
+
+## What's Changed
+* Add VSCode code action formatting by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/37
+* Add tdom support by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/38
+
+
+**Full Changelog**: https://github.com/koxudaxi/t-linter/compare/0.6.2...0.7.0
+
+---
+
 ## [Unreleased]
 
 ### Added
