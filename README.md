@@ -89,9 +89,9 @@ If you use VSCode, install the extension for seamless editor integration:
        "[python]": {
          "editor.defaultFormatter": "charliermarsh.ruff",
          "editor.formatOnSave": true,
-         "editor.codeActionsOnSave": [
-           "source.fixAll.t-linter"
-         ]
+         "editor.codeActionsOnSave": {
+           "source.fixAll.t-linter": "explicit"
+         }
        }
      }
      ```

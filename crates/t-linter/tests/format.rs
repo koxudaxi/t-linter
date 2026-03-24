@@ -33,8 +33,10 @@ fn run_t_linter(dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
 }
 
 fn run_ruff_format(dir: &Path, path: &str) -> Output {
-    Command::new("uvx")
+    Command::new("uv")
         .args([
+            "tool",
+            "run",
             "--from",
             &format!("ruff=={PINNED_RUFF_VERSION}"),
             "ruff",

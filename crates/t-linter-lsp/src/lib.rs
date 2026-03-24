@@ -725,7 +725,11 @@ fn locations_overlap(left: &t_linter_core::Location, right: &t_linter_core::Loca
     let right_start = (right.start_line, right.start_column);
     let right_end = (right.end_line, right.end_column);
 
-    left_start <= right_end && right_start <= left_end
+    if right_start == right_end {
+        left_start <= right_start && right_start < left_end
+    } else {
+        left_start < right_end && right_start < left_end
+    }
 }
 
 fn internal_error(err: anyhow::Error) -> tower_lsp::jsonrpc::Error {
@@ -822,6 +826,40 @@ mod tests {
             &CodeActionKind::QUICKFIX,
             &TLinterLanguageServer::source_fix_all_kind()
         ));
+    }
+
+    #[test]
+    fn locations_overlap_uses_half_open_ranges() {
+        let template = t_linter_core::Location {
+            start_line: 1,
+            start_column: 5,
+            end_line: 1,
+            end_column: 10,
+        };
+
+        let inside_cursor = t_linter_core::Location {
+            start_line: 1,
+            start_column: 9,
+            end_line: 1,
+            end_column: 9,
+        };
+        assert!(locations_overlap(&template, &inside_cursor));
+
+        let end_cursor = t_linter_core::Location {
+            start_line: 1,
+            start_column: 10,
+            end_line: 1,
+            end_column: 10,
+        };
+        assert!(!locations_overlap(&template, &end_cursor));
+
+        let adjacent_range = t_linter_core::Location {
+            start_line: 1,
+            start_column: 10,
+            end_line: 1,
+            end_column: 12,
+        };
+        assert!(!locations_overlap(&template, &adjacent_range));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -10,9 +10,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v7
     
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
+
+    - name: Run Rust tests
+      run: cargo test --workspace
     
     - name: Build wheel
       uses: PyO3/maturin-action@v1

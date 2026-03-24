@@ -1,6 +1,6 @@
 # VSCode Extension
 
-t-linter now supports two save-time formatting modes in VSCode:
+VSCode supports two t-linter save-time formatting modes: Ruff coexistence mode and t-linter formatter mode.
 
 - **Ruff coexistence mode** keeps `Ruff` as the Python formatter and runs t-linter as a save-time code action for template literals.
 - **t-linter formatter mode** keeps the existing formatter-only workflow for users who want t-linter to own formatting directly.
@@ -18,9 +18,9 @@ Use this when you want Ruff to format Python code and t-linter to format the con
   "[python]": {
     "editor.defaultFormatter": "charliermarsh.ruff",
     "editor.formatOnSave": true,
-    "editor.codeActionsOnSave": [
-      "source.fixAll.t-linter"
-    ]
+    "editor.codeActionsOnSave": {
+      "source.fixAll.t-linter": "explicit"
+    }
   }
 }
 ```
@@ -99,7 +99,7 @@ If you previously followed the formatter-only guide:
 
 1. Leave `Ruff` as `editor.defaultFormatter`.
 2. Keep `editor.formatOnSave = true`.
-3. Add `editor.codeActionsOnSave = ["source.fixAll.t-linter"]`.
+3. Add `editor.codeActionsOnSave = { "source.fixAll.t-linter": "explicit" }`.
 4. Remove `koxudaxi.t-linter` from `editor.defaultFormatter` only if you want Ruff coexistence mode.
 
 If you prefer the old workflow, you can keep t-linter formatter mode unchanged.

@@ -51,9 +51,9 @@ Use Ruff for Python formatting and t-linter for template literals:
   "[python]": {
     "editor.defaultFormatter": "charliermarsh.ruff",
     "editor.formatOnSave": true,
-    "editor.codeActionsOnSave": [
-      "source.fixAll.t-linter"
-    ]
+    "editor.codeActionsOnSave": {
+      "source.fixAll.t-linter": "explicit"
+    }
   }
 }
 ```
@@ -197,7 +197,7 @@ If you previously used t-linter only as `editor.defaultFormatter`, you can switc
 
 1. Changing `editor.defaultFormatter` to `charliermarsh.ruff`
 2. Keeping `editor.formatOnSave = true`
-3. Adding `editor.codeActionsOnSave = ["source.fixAll.t-linter"]`
+3. Adding `editor.codeActionsOnSave = { "source.fixAll.t-linter": "explicit" }`
 
 If you prefer the previous setup, t-linter formatter mode remains supported.
 

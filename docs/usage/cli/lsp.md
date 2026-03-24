@@ -114,9 +114,9 @@ Recommended Ruff coexistence settings:
   "[python]": {
     "editor.defaultFormatter": "charliermarsh.ruff",
     "editor.formatOnSave": true,
-    "editor.codeActionsOnSave": [
-      "source.fixAll.t-linter"
-    ]
+    "editor.codeActionsOnSave": {
+      "source.fixAll.t-linter": "explicit"
+    }
   }
 }
 ```
