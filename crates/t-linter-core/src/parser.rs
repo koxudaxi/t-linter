@@ -1181,7 +1181,7 @@ impl TemplateStringParser {
         let flags = self.parse_string_flags(start_text);
 
         let (content, expressions, parts) =
-            self.extract_content_and_interpolations(&node, source)?;
+            self.extract_content_and_interpolations(&node, source, flags.is_raw)?;
 
         let mut language = if let Some(type_node) = type_annotation {
             self.resolve_language_from_type_node(type_node, source)?
@@ -1259,6 +1259,7 @@ impl TemplateStringParser {
         &self,
         string_node: &Node,
         source: &str,
+        is_raw: bool,
     ) -> Result<(String, Vec<Expression>, Vec<TemplatePart>)> {
         let mut content_parts = Vec::new();
         let mut expressions = Vec::new();
@@ -1279,7 +1280,7 @@ impl TemplateStringParser {
                     }
 
                     let text = child.utf8_text(source.as_bytes())?;
-                    let processed_content = unescape_template_text(text);
+                    let processed_content = unescape_template_text(text, is_raw);
                     push_static_part(&mut content_parts, &mut parts, &processed_content);
                     last_end_byte = end_byte;
                 }
@@ -3691,11 +3692,32 @@ fn push_static_part(content_parts: &mut Vec<String>, parts: &mut Vec<TemplatePar
     parts.push(TemplatePart::Static(StaticTextSegment { text }));
 }
 
-fn unescape_template_text(text: &str) -> String {
+fn unescape_template_text(text: &str, is_raw: bool) -> String {
     let mut processed_content = String::new();
     let mut chars = text.chars();
 
     while let Some(ch) = chars.next() {
+        if !is_raw && ch == '\\'
+            && let Some(next_ch) = chars.next()
+        {
+            match next_ch {
+                '\\' => processed_content.push('\\'),
+                '\'' => processed_content.push('\''),
+                '"' => processed_content.push('"'),
+                'n' => processed_content.push('\n'),
+                'r' => processed_content.push('\r'),
+                't' => processed_content.push('\t'),
+                '0' => processed_content.push('\0'),
+                'b' => processed_content.push('\u{0008}'),
+                'f' => processed_content.push('\u{000C}'),
+                _ => {
+                    processed_content.push('\\');
+                    processed_content.push(next_ch);
+                }
+            }
+            continue;
+        }
+
         if ch == '{' {
             if let Some(next_ch) = chars.clone().next()
                 && next_ch == '{'
@@ -3841,10 +3863,14 @@ fn choose_non_raw_quote(content: &str, preferred_quote: char, use_triple: bool) 
 fn quote_escape_cost(content: &str, quote: char, use_triple: bool) -> usize {
     if use_triple {
         let delimiter = std::iter::repeat_n(quote, 3).collect::<String>();
-        content.matches(&delimiter).count() * 3
+        content.matches(&delimiter).count() * 3 + trailing_quote_run_len(content, quote)
     } else {
         content.matches(quote).count()
     }
+}
+
+fn trailing_quote_run_len(content: &str, quote: char) -> usize {
+    content.chars().rev().take_while(|&ch| ch == quote).count()
 }
 
 fn escape_python_literal_content(content: &str, quote: char, use_triple: bool) -> String {
@@ -3874,7 +3900,17 @@ fn escape_python_literal_content(content: &str, quote: char, use_triple: bool) -
         } else {
             "\\\"\\\"\\\""
         };
-        escaped.replace(&delimiter, escaped_delimiter)
+        let trailing_quotes = trailing_quote_run_len(content, quote);
+        if trailing_quotes > 0 {
+            let split_at = escaped.len() - trailing_quotes;
+            let mut escaped = escaped[..split_at].replace(&delimiter, escaped_delimiter);
+            let replacement = std::iter::repeat_n(format!("\\{quote}"), trailing_quotes)
+                .collect::<String>();
+            escaped.push_str(&replacement);
+            escaped
+        } else {
+            escaped.replace(&delimiter, escaped_delimiter)
+        }
     } else {
         escaped
     }
@@ -4018,7 +4054,7 @@ html = t"""
 
     #[test]
     fn test_formatted_literal_keeps_plain_quotes_in_triple_quoted_strings() {
-        let source = r#"payload = t"""placeholder""""#;
+        let source = "payload = t\"\"\"placeholder\"\"\"";
 
         let mut parser = TemplateStringParser::new().unwrap();
         let templates = parser.find_template_strings(source).unwrap();
@@ -4028,6 +4064,54 @@ html = t"""
                 .formatted_literal(r#"<body><h1 style="color: #007acc">{heading}</h1></body>"#),
             r#"t"""<body><h1 style="color: #007acc">{heading}</h1></body>""""#
         );
+    }
+
+    #[test]
+    fn test_formatted_literal_avoids_triple_quote_boundary_collision() {
+        let source = "payload = t\"\"\"placeholder\"\"\"";
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(
+            templates[0]
+                .formatted_literal("[project]\nname = \"{project_name}\"\nversion = \"{version}\""),
+            "t'''[project]\nname = \"{project_name}\"\nversion = \"{version}\"'''"
+        );
+    }
+
+    #[test]
+    fn test_formatted_literal_escapes_trailing_quotes_individually() {
+        let source = "payload = t\"\"\"placeholder\"\"\"";
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+        let formatted = templates[0].formatted_literal("'''\"\"");
+
+        assert_eq!(formatted, r#"t"""'''\"\"""""#);
+
+        let reparsed_source = format!("payload = {formatted}");
+        let mut reparsed = TemplateStringParser::new().unwrap();
+        let reparsed_templates = reparsed.find_template_strings(&reparsed_source).unwrap();
+        assert_eq!(reparsed_templates.len(), 1);
+        assert_eq!(reparsed_templates[0].content, "'''\"\"");
+    }
+
+    #[test]
+    fn test_formatted_literal_escapes_trailing_quotes_after_triple_delimiter_replacement() {
+        let source = "payload = t'''placeholder'''";
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+        let formatted = templates[0].formatted_literal(r#""""x"""x'''"#);
+
+        assert_eq!(formatted, r#"t'''"""x"""x\'\'\''''"#);
+
+        let reparsed_source = format!("payload = {formatted}");
+        let mut reparsed = TemplateStringParser::new().unwrap();
+        let reparsed_templates = reparsed.find_template_strings(&reparsed_source).unwrap();
+        assert_eq!(reparsed_templates.len(), 1);
+        assert_eq!(reparsed_templates[0].content, r#""""x"""x'''"#);
     }
 
     #[test]
