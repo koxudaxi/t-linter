@@ -760,7 +760,10 @@ fn check_reports_diagnostics_via_installed_package_parent_relative_reexport() {
     let site_packages = dir.join("site-packages");
     write_file(&site_packages.join("typed_api").join("__init__.py"), "");
     write_file(
-        &site_packages.join("typed_api").join("sub").join("__init__.py"),
+        &site_packages
+            .join("typed_api")
+            .join("sub")
+            .join("__init__.py"),
         "from ..impl import render_yaml\n",
     );
     write_file(
@@ -1285,7 +1288,10 @@ def render_yaml(template: Annotated[Template, "yaml"]) -> object:
     return None
 "#,
     );
-    write_file(&site_packages.join("typed_api").join("submodule.py"), "value = 1\n");
+    write_file(
+        &site_packages.join("typed_api").join("submodule.py"),
+        "value = 1\n",
+    );
     write_file(
         &dir.join("broken.py"),
         r#"import typed_api.submodule
@@ -1316,7 +1322,10 @@ fn check_uses_intermediate_package_after_dotted_import_from_installed_package() 
     let site_packages = dir.join("site-packages");
     write_file(&site_packages.join("typed_api").join("__init__.py"), "");
     write_file(
-        &site_packages.join("typed_api").join("subpkg").join("__init__.py"),
+        &site_packages
+            .join("typed_api")
+            .join("subpkg")
+            .join("__init__.py"),
         r#"from typing import Annotated
 from string.templatelib import Template
 
@@ -1325,7 +1334,10 @@ def render_yaml(template: Annotated[Template, "yaml"]) -> object:
 "#,
     );
     write_file(
-        &site_packages.join("typed_api").join("subpkg").join("mod.py"),
+        &site_packages
+            .join("typed_api")
+            .join("subpkg")
+            .join("mod.py"),
         "value = 1\n",
     );
     write_file(
@@ -1365,7 +1377,10 @@ def render_yaml(template: Annotated[Template, "yaml"]) -> object:
     return None
 "#,
     );
-    write_file(&site_packages.join("typed_api").join("submodule.py"), "value = 1\n");
+    write_file(
+        &site_packages.join("typed_api").join("submodule.py"),
+        "value = 1\n",
+    );
     write_file(
         &dir.join("ok.py"),
         r#"import typed_api.submodule as api
@@ -1803,6 +1818,187 @@ template: Annotated[Template, "thtml"] = t"<Button disabled='yes' />"
         .collect::<Vec<_>>();
     assert!(rules.contains(&"component-missing-prop".to_string()));
     assert!(rules.contains(&"component-prop-type-error".to_string()));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_tdom_missing_required_props_via_direct_html_call() {
+    let dir = test_dir("tdom-missing-prop");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from tdom import html
+
+def Button(*, label: str, disabled: bool = False, children: tuple[object, ...] = ()) -> object:
+    return None
+
+page = html(t"<{Button} disabled />")
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "tdom");
+    assert_eq!(json["diagnostics"][0]["rule"], "component-missing-prop");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing required prop 'label'")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_ignores_unknown_tdom_props() {
+    let dir = test_dir("tdom-unknown-props");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from tdom import html
+
+def Button(*, label: str, children: tuple[object, ...] = ()) -> object:
+    return None
+
+page = html(t"<{Button} label='Save' tone='info' />")
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_supports_explicit_tdom_annotations() {
+    let dir = test_dir("tdom-annotated");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str, children: tuple[object, ...] = ()) -> object:
+    return None
+
+template: Annotated[Template, "tdom"] = t"<{Button} />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "tdom");
+    assert_eq!(json["diagnostics"][0]["rule"], "component-missing-prop");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_rejects_tdom_components_that_require_positional_args() {
+    let dir = test_dir("tdom-positional");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from tdom import html
+
+def NeedsPositional(value, /, *, label: str = "ok") -> object:
+    return None
+
+page = html(t"<{NeedsPositional} />")
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "tdom");
+    assert_eq!(json["diagnostics"][0]["rule"], "component-prop-type-error");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("requires positional arguments")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_rejects_tdom_components_backed_by_varargs_callables() {
+    let dir = test_dir("tdom-varargs");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from tdom import html
+
+def AcceptsVarArgs(*values: object, label: str = "ok") -> object:
+    return None
+
+page = html(t"<{AcceptsVarArgs} />")
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "tdom");
+    assert_eq!(json["diagnostics"][0]["rule"], "component-prop-type-error");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("requires positional arguments")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_expands_tdom_data_attrs_before_kebab_normalization() {
+    let dir = test_dir("tdom-data-attrs");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from tdom import html
+
+def Badge(*, data_user_id: int, children: tuple[object, ...] = ()) -> object:
+    return None
+
+attrs = {"user-id": "wrong"}
+
+page = html(t"<{Badge} data={attrs} />")
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "tdom");
+    assert_eq!(json["diagnostics"][0]["rule"], "component-prop-type-error");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("data_user_id")
+    );
 
     let _ = fs::remove_dir_all(dir);
 }

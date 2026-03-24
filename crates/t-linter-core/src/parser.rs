@@ -35,11 +35,12 @@ struct ScopedImportBinding {
 pub struct CallableSignature {
     pub parameters: Vec<CallableParameter>,
     pub accepts_kwargs: bool,
+    pub requires_positional: bool,
 }
 
 impl CallableSignature {
     fn is_empty(&self) -> bool {
-        self.parameters.is_empty() && !self.accepts_kwargs
+        self.parameters.is_empty() && !self.accepts_kwargs && !self.requires_positional
     }
 }
 
@@ -694,6 +695,13 @@ impl TemplateStringParser {
             match child.kind() {
                 "keyword_separator" => keyword_only = true,
                 "positional_separator" => {
+                    if signature
+                        .parameters
+                        .iter()
+                        .any(|parameter| parameter.required && parameter.allows_keyword)
+                    {
+                        signature.requires_positional = true;
+                    }
                     for parameter in &mut signature.parameters {
                         parameter.allows_keyword = false;
                     }
@@ -704,6 +712,9 @@ impl TemplateStringParser {
                 "list_splat_pattern" => {
                     receiver_skipped = true;
                     keyword_only = true;
+                    // Upstream tdom rejects component call targets backed by
+                    // varargs callables in addition to positional-only ones.
+                    signature.requires_positional = true;
                 }
                 "typed_parameter"
                 | "typed_default_parameter"
@@ -723,6 +734,9 @@ impl TemplateStringParser {
                                 "list_splat_pattern" => {
                                     receiver_skipped = true;
                                     keyword_only = true;
+                                    // Upstream tdom rejects component call
+                                    // targets backed by varargs callables.
+                                    signature.requires_positional = true;
                                     continue;
                                 }
                                 _ => name_node.utf8_text(source.as_bytes()).ok().unwrap_or(""),
@@ -1441,7 +1455,15 @@ impl TemplateStringParser {
             name_bindings,
         )?
         else {
-            return Ok(None);
+            return self.infer_language_from_explicit_callee_target(
+                func_name,
+                callee_node,
+                source,
+                context,
+                assignments,
+                scope_directives,
+                name_bindings,
+            );
         };
 
         let argument_list = match string_node.parent() {
@@ -1458,14 +1480,100 @@ impl TemplateStringParser {
                         argument.position,
                         argument.keyword,
                     ) {
-                        return Ok(parameter.template_language.clone());
+                        if parameter.template_language.is_some() {
+                            return Ok(parameter.template_language.clone());
+                        }
                     }
                     break;
                 }
             }
         }
 
-        Ok(None)
+        self.infer_language_from_explicit_callee_target(
+            func_name,
+            callee_node,
+            source,
+            context,
+            assignments,
+            scope_directives,
+            name_bindings,
+        )
+    }
+
+    fn infer_language_from_explicit_callee_target(
+        &self,
+        func_name: &str,
+        callee_node: Option<Node>,
+        source: &str,
+        context: &ModuleContext,
+        assignments: &[VariableAssignment],
+        scope_directives: &[ScopeDirective],
+        name_bindings: &[NameBinding],
+    ) -> Result<Option<String>> {
+        let Some(target) = self.resolve_callee_import_target(
+            func_name,
+            callee_node,
+            source,
+            context,
+            assignments,
+            scope_directives,
+            name_bindings,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        self.resolve_language_from_explicit_callee_target(&target, &mut HashSet::new())
+    }
+
+    fn resolve_language_from_explicit_callee_target(
+        &self,
+        target: &str,
+        visited: &mut HashSet<String>,
+    ) -> Result<Option<String>> {
+        if !visited.insert(target.to_string()) {
+            return Ok(None);
+        }
+
+        if matches!(target, "tdom.html" | "tdom.processor.html") {
+            return Ok(Some("tdom".to_string()));
+        }
+
+        let Some((module_name, symbol_name)) = target.rsplit_once('.') else {
+            return Ok(None);
+        };
+        let Some(module_path) = self.resolve_python_module_path(module_name) else {
+            return Ok(None);
+        };
+        let Ok(source) = fs::read_to_string(&module_path) else {
+            return Ok(None);
+        };
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .context("Failed to set Python language")?;
+        let Some(tree) = parser.parse(&source, None) else {
+            return Ok(None);
+        };
+
+        let mut module_type_data = ModuleTypeData::default();
+        let mut helper = Self::new()?;
+        helper.search_root = module_path.parent().map(Path::to_path_buf);
+        helper.runtime_python_search_roots = self.runtime_python_search_roots.clone();
+        helper.collect_imports(
+            &tree,
+            &source,
+            &mut module_type_data,
+            Some(module_name),
+            is_package_init_path(&module_path),
+        )?;
+
+        let Some(next_target) = module_type_data.imports.get(symbol_name) else {
+            return Ok(None);
+        };
+
+        self.resolve_language_from_explicit_callee_target(next_target, visited)
     }
 
     fn lookup_callable_signatures<'a>(
@@ -1479,33 +1587,19 @@ impl TemplateStringParser {
         name_bindings: &[NameBinding],
     ) -> Result<Option<&'a CallableSignature>> {
         if let Some(signatures) = context.callable_signatures.get(callee) {
-            if callee.contains('.') {
-                if module_reference_is_shadowed(
-                    callee_node,
-                    source,
-                    assignments,
-                    scope_directives,
-                    name_bindings,
-                )? {
-                    return Ok(None);
-                }
-                let Some(root_identifier) = callee_node.and_then(root_identifier_node) else {
-                    return Ok(None);
-                };
-                let import_target = resolve_import_target_for_identifier(
-                    root_identifier,
-                    source,
-                    scope_directives,
-                    &context.scoped_import_bindings,
-                )?
-                .or_else(|| context.imports.get(root_identifier_text(callee)).cloned());
-                let Some(import_target) = import_target else {
-                    return Ok(None);
-                };
-                if !callable_matches_import_target(callee, &import_target) {
-                    return Ok(None);
-                }
-            } else if context.imports.contains_key(callee)
+            if !self.callee_matches_lookup_target(
+                callee,
+                callee_node,
+                source,
+                context,
+                assignments,
+                scope_directives,
+                name_bindings,
+            )? {
+                return Ok(None);
+            }
+            if !callee.contains('.')
+                && context.imports.contains_key(callee)
                 && direct_callable_reference_is_shadowed(
                     callee_node,
                     source,
@@ -1520,36 +1614,110 @@ impl TemplateStringParser {
             return Ok(Some(signatures));
         }
 
-        let Some((base, member)) = callee.split_once('.') else {
-            return Ok(None);
-        };
-        if module_reference_is_shadowed(
+        let Some(import_target) = self.resolve_callee_import_target(
+            callee,
             callee_node,
             source,
+            context,
             assignments,
             scope_directives,
             name_bindings,
-        )? {
-            return Ok(None);
-        }
-        let import_target =
-            if let Some(root_identifier) = callee_node.and_then(root_identifier_node) {
-                resolve_import_target_for_identifier(
-                    root_identifier,
-                    source,
-                    scope_directives,
-                    &context.scoped_import_bindings,
-                )?
-            } else {
-                None
-            };
-        let Some(import_target) = import_target.or_else(|| context.imports.get(base).cloned())
+        )?
         else {
             return Ok(None);
         };
-        Ok(context
-            .callable_signatures
-            .get(&format!("{import_target}.{member}")))
+
+        Ok(context.callable_signatures.get(&import_target))
+    }
+
+    fn callee_matches_lookup_target(
+        &self,
+        callee: &str,
+        callee_node: Option<Node>,
+        source: &str,
+        context: &ModuleContext,
+        assignments: &[VariableAssignment],
+        scope_directives: &[ScopeDirective],
+        name_bindings: &[NameBinding],
+    ) -> Result<bool> {
+        if !callee.contains('.') {
+            return Ok(true);
+        }
+
+        let Some(import_target) = self.resolve_callee_import_target(
+            callee,
+            callee_node,
+            source,
+            context,
+            assignments,
+            scope_directives,
+            name_bindings,
+        )?
+        else {
+            return Ok(false);
+        };
+
+        Ok(callable_matches_import_target(callee, &import_target))
+    }
+
+    fn resolve_callee_import_target(
+        &self,
+        callee: &str,
+        callee_node: Option<Node>,
+        source: &str,
+        context: &ModuleContext,
+        assignments: &[VariableAssignment],
+        scope_directives: &[ScopeDirective],
+        name_bindings: &[NameBinding],
+    ) -> Result<Option<String>> {
+        if callee.contains('.') {
+            if module_reference_is_shadowed(
+                callee_node,
+                source,
+                assignments,
+                scope_directives,
+                name_bindings,
+            )? {
+                return Ok(None);
+            }
+
+            let Some(root_identifier) = callee_node.and_then(root_identifier_node) else {
+                return Ok(None);
+            };
+            let import_target = resolve_import_target_for_identifier(
+                root_identifier,
+                source,
+                scope_directives,
+                &context.scoped_import_bindings,
+            )?
+            .or_else(|| context.imports.get(root_identifier_text(callee)).cloned());
+            let Some(import_target) = import_target else {
+                return Ok(None);
+            };
+
+            let suffix = &callee[root_identifier_text(callee).len()..];
+            return Ok(Some(format!("{import_target}{suffix}")));
+        }
+
+        if context.imports.contains_key(callee)
+            && direct_callable_reference_is_shadowed(
+                callee_node,
+                source,
+                assignments,
+                scope_directives,
+                name_bindings,
+                context.local_callable_signature_names.contains(callee),
+            )?
+        {
+            return Ok(None);
+        }
+
+        Ok(context.imports.get(callee).cloned().or_else(|| {
+            context
+                .callable_signatures
+                .contains_key(callee)
+                .then(|| callee.to_string())
+        }))
     }
 
     fn resolve_language_from_type_node(
@@ -4450,6 +4618,112 @@ load_config(template=t"name: {name}")
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, None);
+    }
+
+    #[test]
+    fn test_tdom_language_is_inferred_from_direct_module_call() {
+        let source = r#"
+import tdom
+
+page = tdom.html(t"<div>{name}</div>")
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("tdom".to_string()));
+    }
+
+    #[test]
+    fn test_tdom_language_is_inferred_from_reexported_module_call() {
+        let dir = parser_test_dir("tdom-reexport");
+        write_file(&dir.join("bindings.py"), r#"from tdom import html"#);
+        write_file(
+            &dir.join("api.py"),
+            r#"from bindings import html as render_html"#,
+        );
+        let source = r#"from api import render_html
+
+page = render_html(t"<div>{name}</div>")
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("main.py"))
+            .unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("tdom".to_string()));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_installed_package_tdom_language_inference_works_for_processor_html() {
+        let dir = parser_test_dir("tdom-installed-package");
+        let site_packages = project_site_packages(&dir);
+        write_file(&site_packages.join("tdom/__init__.py"), "");
+        write_file(
+            &site_packages.join("tdom/processor.py"),
+            r#"def html(template):
+    return template
+"#,
+        );
+        let source = r#"from tdom.processor import html as render_html
+
+page = render_html(t"<div>{name}</div>")
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("main.py"))
+            .unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("tdom".to_string()));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_callable_signature_tracks_requires_positional() {
+        let source = r#"
+def NeedsPositional(value, /, *, title: str = "ok") -> None:
+    return None
+
+def Flexible(value="ok", /, *, title: str = "ok") -> None:
+    return None
+
+def VarArgs(*values: object, title: str = "ok") -> None:
+    return None
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let _ = parser.find_template_strings(source).unwrap();
+        let context = parser.module_context();
+
+        assert!(
+            context
+                .callable_signatures
+                .get("NeedsPositional")
+                .unwrap()
+                .requires_positional
+        );
+        assert!(
+            !context
+                .callable_signatures
+                .get("Flexible")
+                .unwrap()
+                .requires_positional
+        );
+        assert!(
+            context
+                .callable_signatures
+                .get("VarArgs")
+                .unwrap()
+                .requires_positional
+        );
     }
 
     #[test]

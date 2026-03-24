@@ -27,6 +27,7 @@ tstring-yaml.workspace = true
 tstring-syntax.workspace = true
 tstring-html.workspace = true
 tstring-thtml.workspace = true
+tstring-tdom.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

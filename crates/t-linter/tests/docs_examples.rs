@@ -123,7 +123,7 @@ fn supported_languages_detection_example_stays_lintable() {
 
 #[test]
 fn supported_languages_examples_stay_lintable() {
-    assert_doc_example_is_clean("docs/supported-languages.md", "## Examples", 8);
+    assert_doc_example_is_clean("docs/supported-languages.md", "## Examples", 9);
 }
 
 #[test]

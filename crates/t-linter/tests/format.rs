@@ -1979,6 +1979,78 @@ component_markup: Annotated[Template, "thtml"] = t'<Card title="{title}" disable
 }
 
 #[test]
+fn format_rewrites_explicitly_annotated_tdom_templates() {
+    let dir = test_dir("tdom-annotated-format");
+    let path = dir.join("example.py");
+    write_file(
+        &path,
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "tdom"] = t'<{Card} title = {title}><span>{status}</span></{Card}>'
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t'<{Card} title={title}><span>{status}</span></{Card}>'"#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_rewrites_tdom_template_inferred_via_direct_html_call() {
+    let dir = test_dir("tdom-direct-format");
+    let path = dir.join("example.py");
+    write_file(
+        &path,
+        r#"import tdom
+
+page = tdom.html(t'<{Card} title = {title}><span class = "badge" >{status}</span></{Card}>')
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        content
+            .contains(r#"t'<{Card} title={title}><span class="badge">{status}</span></{Card}>'"#)
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_rewrites_tdom_template_inferred_via_reexported_html_call() {
+    let dir = test_dir("tdom-reexported-format");
+    let path = dir.join("example.py");
+    write_file(&dir.join("bindings.py"), r#"from tdom import html"#);
+    write_file(
+        &dir.join("api.py"),
+        r#"from bindings import html as render_html"#,
+    );
+    write_file(
+        &path,
+        r#"from api import render_html
+
+page = render_html(t'<{Card} title = {title}><span>{status}</span></{Card}>')
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t'<{Card} title={title}><span>{status}</span></{Card}>'"#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn format_stdin_uses_stdin_filename_for_import_inferred_html() {
     let dir = test_dir("stdin-import-inferred-html");
     write_file(
