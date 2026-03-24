@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file.
 This changelog is generated from GitHub Releases and may include manual corrections when release metadata needs adjustment.
 
 ---
+## [0.6.1](https://github.com/koxudaxi/t-linter/releases/tag/0.6.1) - 2026-03-24
+
+## What's Changed
+* Fix format round-trip edge cases by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/32
+* Bump tstring-html and tstring-thtml to 0.1.7 by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/33
+* Rewrite docs to be CLI-focused with feature matrix and LSP editor integration by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/34
+* Bundle t-linter in VS Code extension by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/35
+
+
+**Full Changelog**: https://github.com/koxudaxi/t-linter/compare/0.6.0...0.6.1
+
+---
+
 ## [0.6.0](https://github.com/koxudaxi/t-linter/releases/tag/0.6.0) - 2026-03-23
 
 ## Breaking Changes
