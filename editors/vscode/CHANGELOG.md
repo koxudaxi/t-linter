@@ -6,6 +6,14 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+### Added
+- Save-time formatting support through the `source.fixAll.t-linter` code action
+- Manual single-template rewrite support through `refactor.rewrite.t-linter`
+
+### Changed
+- Document Ruff coexistence mode alongside the existing t-linter formatter mode
+- Clarify bundled binary support and `t-linter.serverPath` requirements
+
 ## [0.1.0] - 2025-01-28
 
 ### Added

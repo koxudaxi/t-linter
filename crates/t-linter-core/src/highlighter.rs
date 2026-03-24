@@ -610,6 +610,7 @@ mod tests {
             string_start,
             string_end,
             location,
+            formatting_wrapper_location: None,
             expressions,
             parts,
             flags,
@@ -1076,6 +1077,7 @@ mod tests {
                 end_line: 1,
                 end_column: 23,
             },
+            formatting_wrapper_location: None,
             expressions: vec![],
             parts: vec![TemplatePart::Static(StaticTextSegment {
                 text: "literal {} braces".to_string(),

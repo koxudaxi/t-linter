@@ -208,7 +208,7 @@ fn format_template_edit(
     Some(
         formatted
             .map(|content| TemplateEdit {
-                location: template.location.clone(),
+                location: template.formatting_location(&content).clone(),
                 replacement: template.formatted_literal(&content),
             })
             .map_err(|error| FormatError::from_backend_error(template, &language, error).into()),
@@ -366,7 +366,7 @@ markup: Annotated[Template, "html"] = t'<div data-a="12345" data-b="67890"></div
         assert_eq!(edits.len(), 1);
         assert_eq!(
             edits[0].replacement,
-            "t'''<div\n  data-a=\"12345\"\n  data-b=\"67890\"\n></div>'''"
+            "t\"\"\"<div\n  data-a=\"12345\"\n  data-b=\"67890\"\n></div>\"\"\""
         );
     }
 
@@ -394,7 +394,7 @@ markup: Annotated[Template, "html"] = t'<div data-a="12345" data-b="67890"></div
         assert_eq!(edits.len(), 1);
         assert_eq!(
             edits[0].replacement,
-            "t'''<div\n  data-a=\"12345\"\n  data-b=\"67890\"\n></div>'''"
+            "t\"\"\"<div\n  data-a=\"12345\"\n  data-b=\"67890\"\n></div>\"\"\""
         );
     }
 }

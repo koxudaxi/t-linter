@@ -6,6 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::{self as unix_fs, PermissionsExt};
 
+const PINNED_RUFF_VERSION: &str = "0.11.13";
+
 fn test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -28,6 +30,32 @@ fn write_file(path: &Path, contents: &str) {
 
 fn run_t_linter(dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
     run_t_linter_with_pythonpath(dir, args, stdin, None)
+}
+
+fn run_ruff_format(dir: &Path, path: &str) -> Output {
+    Command::new("uv")
+        .args([
+            "tool",
+            "run",
+            "--from",
+            &format!("ruff=={PINNED_RUFF_VERSION}"),
+            "ruff",
+            "format",
+            path,
+        ])
+        .current_dir(dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap()
+}
+
+fn apply_ruff_example(dir: &Path) -> Output {
+    run_ruff_format(dir, "example.py")
+}
+
+fn apply_t_linter_example(dir: &Path) -> Output {
+    run_t_linter(dir, &["format", "example.py"], None)
 }
 
 fn run_t_linter_with_pythonpath(
@@ -82,7 +110,12 @@ fn assert_format_round_trip_is_stable(
     expected_fragments: &[&str],
     unexpected_fragments: &[&str],
 ) {
-    assert_format_round_trip_is_stable_with_first_pass(source, expected_fragments, unexpected_fragments, true);
+    assert_format_round_trip_is_stable_with_first_pass(
+        source,
+        expected_fragments,
+        unexpected_fragments,
+        true,
+    );
 }
 
 fn assert_format_round_trip_is_stable_allowing_noop_first_pass(
@@ -90,7 +123,12 @@ fn assert_format_round_trip_is_stable_allowing_noop_first_pass(
     expected_fragments: &[&str],
     unexpected_fragments: &[&str],
 ) {
-    assert_format_round_trip_is_stable_with_first_pass(source, expected_fragments, unexpected_fragments, false);
+    assert_format_round_trip_is_stable_with_first_pass(
+        source,
+        expected_fragments,
+        unexpected_fragments,
+        false,
+    );
 }
 
 fn assert_format_round_trip_is_stable_with_first_pass(
@@ -155,19 +193,11 @@ fn assert_stdin_format_round_trip_is_stable(
     }
     format_args.push("-");
 
-    let first = run_t_linter(
-        &dir,
-        &format_args,
-        Some(source.as_bytes()),
-    );
+    let first = run_t_linter(&dir, &format_args, Some(source.as_bytes()));
     let first_stdout = String::from_utf8(first.stdout).unwrap();
     let first_stderr = String::from_utf8(first.stderr).unwrap();
 
-    let second = run_t_linter(
-        &dir,
-        &format_args,
-        Some(first_stdout.as_bytes()),
-    );
+    let second = run_t_linter(&dir, &format_args, Some(first_stdout.as_bytes()));
     let second_stdout = String::from_utf8(second.stdout).unwrap();
     let second_stderr = String::from_utf8(second.stderr).unwrap();
 
@@ -177,11 +207,7 @@ fn assert_stdin_format_round_trip_is_stable(
     }
     check_args.push("-");
 
-    let check = run_t_linter(
-        &dir,
-        &check_args,
-        Some(second_stdout.as_bytes()),
-    );
+    let check = run_t_linter(&dir, &check_args, Some(second_stdout.as_bytes()));
     let check_stdout = String::from_utf8(check.stdout).unwrap();
     let check_stderr = String::from_utf8(check.stderr).unwrap();
 
@@ -198,6 +224,40 @@ fn assert_stdin_format_round_trip_is_stable(
     }
     for fragment in unexpected_fragments {
         assert!(!second_stdout.contains(fragment));
+    }
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn assert_ruff_and_t_linter_save_pipeline_converges(
+    source: &str,
+    sequence_name: &str,
+    apply_first: fn(&Path) -> Output,
+    apply_second: fn(&Path) -> Output,
+    expected_fragments: &[&str],
+) {
+    let dir = test_dir(sequence_name);
+    let path = dir.join("example.py");
+    write_file(
+        &dir.join("pyproject.toml"),
+        "[tool.t-linter]\nline-length = 20\n",
+    );
+    write_file(&path, source);
+
+    let first = apply_first(&dir);
+    let second = apply_second(&dir);
+    let after_first = fs::read_to_string(&path).unwrap();
+
+    let third = apply_first(&dir);
+    let fourth = apply_second(&dir);
+    let after_second = fs::read_to_string(&path).unwrap();
+
+    for output in [&first, &second, &third, &fourth] {
+        assert_eq!(output.status.code(), Some(0));
+    }
+    assert_eq!(after_first, after_second);
+    for fragment in expected_fragments {
+        assert!(after_second.contains(fragment));
     }
 
     let _ = fs::remove_dir_all(dir);
@@ -2184,4 +2244,40 @@ payload: Annotated[Template, "toml"] = t'title={title}'
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
 
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ruff_then_t_linter_save_pipeline_converges() {
+    assert_ruff_and_t_linter_save_pipeline_converges(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+html: Annotated[Template, "html"] = t'<div data-a="12345" data-b="67890" data-c="abcdef" data-d="ghijkl"></div>'
+"#,
+        "ruff-then-t-linter-converges",
+        apply_ruff_example,
+        apply_t_linter_example,
+        &[
+            r#"t"""<div"#,
+            r#"data-a="12345""#,
+            r#"data-b="67890""#,
+            r#"data-c="abcdef""#,
+            r#"data-d="ghijkl""#,
+        ],
+    );
+}
+
+#[test]
+fn t_linter_then_ruff_save_pipeline_converges_for_single_line_to_triple_quote_case() {
+    assert_ruff_and_t_linter_save_pipeline_converges(
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+html: Annotated[Template, "html"] = t'<div data-a="12345" data-b="67890"></div>'
+"#,
+        "t-linter-then-ruff-converges",
+        apply_t_linter_example,
+        apply_ruff_example,
+        &[r#"t"""<div"#, r#"data-a="12345""#, r#"data-b="67890""#],
+    );
 }

@@ -8,6 +8,7 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 
 - 🎨 **Smart Syntax Highlighting** - Automatic detection and highlighting of embedded languages
 - 🔍 **Type-based Detection** - Understands `Annotated[Template, "language"]` annotations
+- 💾 **Save-time Template Formatting** - Use `source.fixAll.t-linter` alongside Ruff or keep t-linter as the formatter
 - 💡 **IntelliSense Support** - Code completion within template strings
 - 🚀 **Fast & Lightweight** - Built with Rust for optimal performance
 - 🔧 **Highly Configurable** - Customize behavior to match your workflow
@@ -37,8 +38,43 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 
 The extension bundles `t-linter` binaries for Linux x64, macOS x64/arm64, and Windows x64, so those platforms do not need a separate CLI installation. On other platforms, install an external `t-linter` binary and set `t-linter.serverPath`.
 
-### Step 2: Disable Python Language Server
-To prevent conflicts with t-linter's syntax highlighting, you need to disable the Python language server:
+### Step 2: Choose your save-time formatting mode
+
+VSCode supports only one default formatter per language. t-linter therefore supports both a formatter mode and a save-time code action mode.
+
+#### Ruff coexistence mode
+
+Use Ruff for Python formatting and t-linter for template literals:
+
+```json
+{
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.fixAll.t-linter": "explicit"
+    }
+  }
+}
+```
+
+#### t-linter formatter mode
+
+Keep the original formatter-only workflow:
+
+```json
+{
+  "[python]": {
+    "editor.defaultFormatter": "koxudaxi.t-linter",
+    "editor.formatOnSave": true
+  }
+}
+```
+
+`source.fixAll.t-linter` formats every format-capable template literal in the current file. The manual `refactor.rewrite.t-linter` action appears only when your selection maps to exactly one template literal.
+
+### Step 3: Disable Python Language Server (optional)
+If another Python extension conflicts with t-linter's syntax highlighting, you can disable the Python language server:
 
 1. Open VSCode Settings (Ctrl+, / Cmd+,)
 2. Search for "python.languageServer"
@@ -53,7 +89,7 @@ Alternatively, add to your settings.json:
 
 [Learn more about Python language server settings](https://code.visualstudio.com/docs/python/settings-reference#_intellisense-engine-settings)
 
-### Step 3: Configure server path (optional)
+### Step 4: Configure server path (optional)
 If you want to override the bundled binary, or if you are on an unsupported platform:
 
 ```bash
@@ -70,6 +106,16 @@ pip install t-linter
    - Open Settings (Ctrl+, / Cmd+,)
    - Search for `t-linter.serverPath`
    - Enter the full path to your t-linter executable
+
+Bundled binary support matrix:
+
+| Platform | Bundled binary | `t-linter.serverPath` required |
+|---|:---:|:---:|
+| Linux x64 | ✅ | No |
+| macOS x64 | ✅ | No |
+| macOS arm64 | ✅ | No |
+| Windows x64 | ✅ | No |
+| Other platforms | — | Yes |
 
 ### Optional: PEP 750 Support with Patched Pyright
 
@@ -144,6 +190,16 @@ def execute_query(query: sql) -> list:
 # Language inferred from function parameter type
 execute_query(t"SELECT * FROM products WHERE price < {max_price}")
 ```
+
+## Migration Notes
+
+If you previously used t-linter only as `editor.defaultFormatter`, you can switch to Ruff coexistence mode by:
+
+1. Changing `editor.defaultFormatter` to `charliermarsh.ruff`
+2. Keeping `editor.formatOnSave = true`
+3. Adding `editor.codeActionsOnSave = { "source.fixAll.t-linter": "explicit" }`
+
+If you prefer the previous setup, t-linter formatter mode remains supported.
 
 ## Configuration
 
