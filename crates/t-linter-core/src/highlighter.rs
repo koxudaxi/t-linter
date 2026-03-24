@@ -1,7 +1,7 @@
 #[cfg(feature = "sql")]
 use tree_sitter_sequel;
 
-use crate::parser::{Expression, TemplateStringInfo};
+use crate::parser::{TemplatePart, TemplateStringInfo};
 use anyhow::Result;
 use std::collections::HashMap;
 use tracing::info;
@@ -31,6 +31,13 @@ struct LanguageConfig {
 struct Placeholder {
     start: usize,
     end: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessedHighlightContent {
+    content: String,
+    processed_to_original: Vec<usize>,
+    placeholders: Vec<Placeholder>,
 }
 
 impl TemplateHighlighter {
@@ -155,7 +162,8 @@ impl TemplateHighlighter {
             .get(language.to_lowercase().as_str())
             .ok_or_else(|| anyhow::anyhow!("Unsupported language: {}", language))?;
 
-        let processed_content = template.content.clone();
+        let processed = self.prepare_content_for_highlighting(template, language);
+        let processed_content = processed.content.as_str();
 
         let mut parser = Parser::new();
         parser.set_language(&config.language)?;
@@ -198,13 +206,26 @@ impl TemplateHighlighter {
         for event in highlights {
             match event? {
                 HighlightEvent::Source { start, end } => {
+                    let start_byte =
+                        Self::map_processed_offset(&processed.processed_to_original, start);
+                    let end_byte =
+                        Self::map_processed_offset(&processed.processed_to_original, end);
+
                     for &highlight_index in &active_highlights {
-                        highlighted_ranges.push(HighlightedRange {
-                            start_byte: start,
-                            end_byte: end,
-                            highlight_name: self.highlight_names[highlight_index].clone(),
-                            highlight_index,
-                        });
+                        for (segment_start, segment_end) in Self::subtract_placeholder_ranges(
+                            start_byte,
+                            end_byte,
+                            &processed.placeholders,
+                        ) {
+                            if segment_start < segment_end {
+                                highlighted_ranges.push(HighlightedRange {
+                                    start_byte: segment_start,
+                                    end_byte: segment_end,
+                                    highlight_name: self.highlight_names[highlight_index].clone(),
+                                    highlight_index,
+                                });
+                            }
+                        }
                     }
                 }
                 HighlightEvent::HighlightStart(highlight) => {
@@ -216,16 +237,13 @@ impl TemplateHighlighter {
             }
         }
 
-        let mut search_start = 0;
-        while let Some(pos) = template.content[search_start..].find("{}") {
-            let absolute_pos = search_start + pos;
+        for placeholder in &processed.placeholders {
             highlighted_ranges.push(HighlightedRange {
-                start_byte: absolute_pos,
-                end_byte: absolute_pos + 2,
+                start_byte: placeholder.start,
+                end_byte: placeholder.end,
                 highlight_name: "variable.parameter".to_string(),
                 highlight_index: self.get_highlight_index("variable.parameter"),
             });
-            search_start = absolute_pos + 2;
         }
 
         highlighted_ranges.sort_by_key(|r| r.start_byte);
@@ -240,65 +258,50 @@ impl TemplateHighlighter {
 
         Ok(highlighted_ranges)
     }
-    fn prepare_content_with_placeholders(
+
+    fn prepare_content_for_highlighting(
         &self,
-        content: &str,
-        expressions: &[Expression],
-    ) -> (String, Vec<Placeholder>) {
+        template: &TemplateStringInfo,
+        language: &str,
+    ) -> ProcessedHighlightContent {
         let mut processed = String::new();
+        let mut processed_to_original = vec![0];
         let mut placeholders = Vec::new();
-        let mut last_end = 0;
-        let mut expr_iter = expressions.iter();
+        let mut original_offset = 0;
+        let placeholder_text = Self::placeholder_text_for_language(language);
 
-        let mut search_start = 0;
-        while let Some(pos) = content[search_start..].find("{}") {
-            let absolute_pos = search_start + pos;
-
-            processed.push_str(&content[last_end..absolute_pos]);
-
-            let placeholder_text = if let Some(_expr) = expr_iter.next() {
-                "_"
-            } else {
-                "_"
-            };
-
-            let placeholder_start = processed.len();
-            processed.push_str(&placeholder_text);
-            let placeholder_end = processed.len();
-
-            placeholders.push(Placeholder {
-                start: placeholder_start,
-                end: placeholder_end,
-            });
-
-            last_end = absolute_pos + 2;
-            search_start = absolute_pos + 2;
-        }
-
-        if last_end < content.len() {
-            processed.push_str(&content[last_end..]);
-        }
-
-        (processed, placeholders)
-    }
-    fn sanitize_identifier(&self, expr: &str) -> String {
-        let sanitized: String = expr
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    '_'
+        for part in &template.parts {
+            match part {
+                TemplatePart::Static(part) => {
+                    Self::append_original_segment(
+                        &mut processed,
+                        &mut processed_to_original,
+                        &part.text,
+                        original_offset,
+                    );
+                    original_offset += part.text.len();
                 }
-            })
-            .collect();
+                TemplatePart::Interpolation(_) => {
+                    Self::append_placeholder_segment(
+                        &mut processed,
+                        &mut processed_to_original,
+                        placeholder_text,
+                        original_offset,
+                        original_offset + 2,
+                    );
+                    placeholders.push(Placeholder {
+                        start: original_offset,
+                        end: original_offset + 2,
+                    });
+                    original_offset += 2;
+                }
+            }
+        }
 
-        if sanitized.chars().next().map_or(false, |c| c.is_numeric()) {
-            format!("_{}", sanitized)
-        } else if sanitized.is_empty() {
-            "placeholder".to_string()
-        } else {
-            sanitized
+        ProcessedHighlightContent {
+            content: processed,
+            processed_to_original,
+            placeholders,
         }
     }
 
@@ -309,27 +312,78 @@ impl TemplateHighlighter {
             .unwrap_or(0)
     }
 
-    fn byte_to_line_col_in_content(&self, content: &str, byte_offset: usize) -> (usize, usize) {
-        let mut line = 0;
-        let mut col = 0;
-        let mut current_byte = 0;
+    fn append_original_segment(
+        processed: &mut String,
+        processed_to_original: &mut Vec<usize>,
+        segment: &str,
+        original_start: usize,
+    ) {
+        processed.push_str(segment);
+        for offset in 1..=segment.len() {
+            processed_to_original.push(original_start + offset);
+        }
+    }
 
-        for ch in content.chars() {
-            if current_byte >= byte_offset {
+    fn append_placeholder_segment(
+        processed: &mut String,
+        processed_to_original: &mut Vec<usize>,
+        placeholder: &str,
+        original_start: usize,
+        original_end: usize,
+    ) {
+        processed.push_str(placeholder);
+        for _ in 0..placeholder.len() {
+            processed_to_original.push(original_start);
+        }
+        if let Some(last) = processed_to_original.last_mut() {
+            *last = original_end;
+        }
+    }
+
+    fn map_processed_offset(processed_to_original: &[usize], processed_offset: usize) -> usize {
+        let last_index = processed_to_original.len().saturating_sub(1);
+        processed_to_original[processed_offset.min(last_index)]
+    }
+
+    fn subtract_placeholder_ranges(
+        start: usize,
+        end: usize,
+        placeholders: &[Placeholder],
+    ) -> Vec<(usize, usize)> {
+        let mut segments = vec![(start, end)];
+
+        for placeholder in placeholders {
+            let mut next_segments = Vec::new();
+
+            for (segment_start, segment_end) in segments {
+                if segment_end <= placeholder.start || placeholder.end <= segment_start {
+                    next_segments.push((segment_start, segment_end));
+                    continue;
+                }
+
+                if segment_start < placeholder.start {
+                    next_segments.push((segment_start, placeholder.start));
+                }
+                if placeholder.end < segment_end {
+                    next_segments.push((placeholder.end, segment_end));
+                }
+            }
+
+            segments = next_segments;
+            if segments.is_empty() {
                 break;
             }
-
-            if ch == '\n' {
-                line += 1;
-                col = 0;
-            } else {
-                col += 1;
-            }
-
-            current_byte += ch.len_utf8();
         }
 
-        (line, col)
+        segments
+    }
+
+    fn placeholder_text_for_language(language: &str) -> &'static str {
+        match language.to_ascii_lowercase().as_str() {
+            "html" | "thtml" => "t_linter_expr",
+            "css" | "javascript" | "js" | "json" | "yaml" | "yml" | "toml" | "sql" => "0",
+            _ => "t_linter_expr",
+        }
     }
 
     pub fn to_lsp_tokens(
@@ -398,37 +452,6 @@ impl TemplateHighlighter {
 
         tokens
     }
-    fn create_placeholder_mappings(
-        &self,
-        content: &str,
-        expressions: &[Expression],
-    ) -> Vec<(usize, usize, usize, usize)> {
-        let mut mappings = Vec::new();
-        let mut search_start = 0;
-        let mut expr_iter = expressions.iter();
-
-        while let Some(pos) = content[search_start..].find("{}") {
-            let absolute_pos = search_start + pos;
-
-            if let Some(expr) = expr_iter.next() {
-                let placeholder_text = format!("__{}", self.sanitize_identifier(&expr.content));
-                let placeholder_start = absolute_pos;
-                let placeholder_end = placeholder_start + placeholder_text.len();
-
-                mappings.push((
-                    absolute_pos,
-                    absolute_pos + 2,
-                    placeholder_start,
-                    placeholder_end,
-                ));
-            }
-
-            search_start = absolute_pos + 2;
-        }
-
-        mappings
-    }
-
     fn calculate_template_content_offset(&self, raw_content: &str) -> usize {
         if raw_content.starts_with("t\"\"\"") || raw_content.starts_with("t'''") {
             4
@@ -522,7 +545,7 @@ mod tests {
     use super::*;
     use crate::parser::{
         Expression, InterpolationInfo, Location, StaticTextSegment, TemplatePart,
-        TemplateStringFlags, TemplateStringInfo,
+        TemplateStringFlags, TemplateStringInfo, TemplateStringParser,
     };
 
     fn make_template(
@@ -590,6 +613,62 @@ mod tests {
             expressions,
             parts,
             flags,
+        }
+    }
+
+    fn range_overlaps(range: &HighlightedRange, start: usize, end: usize) -> bool {
+        range.end_byte > start && end > range.start_byte
+    }
+
+    fn parse_single_template(source: &str) -> TemplateStringInfo {
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+        assert_eq!(templates.len(), 1);
+        templates.into_iter().next().unwrap()
+    }
+
+    fn placeholder_ranges(template: &TemplateStringInfo) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut offset = 0;
+
+        for part in &template.parts {
+            match part {
+                TemplatePart::Static(part) => offset += part.text.len(),
+                TemplatePart::Interpolation(_) => {
+                    ranges.push((offset, offset + 2));
+                    offset += 2;
+                }
+            }
+        }
+
+        ranges
+    }
+
+    fn assert_non_variable_ranges_avoid_placeholders(
+        ranges: &[HighlightedRange],
+        template: &TemplateStringInfo,
+    ) {
+        for (start, end) in placeholder_ranges(template) {
+            assert!(
+                ranges
+                    .iter()
+                    .filter(|r| r.highlight_name != "variable.parameter")
+                    .all(|r| !range_overlaps(r, start, end))
+            );
+        }
+    }
+
+    fn assert_expression_tokens_match_template(
+        tokens: &[(u32, u32, u32, u32, u32)],
+        template: &TemplateStringInfo,
+    ) {
+        for expr in &template.expressions {
+            assert!(tokens.iter().any(|token| {
+                token.0 == (expr.location.start_line - 1) as u32
+                    && token.1 == (expr.location.start_column - 1) as u32
+                    && token.2 == (expr.location.end_column - expr.location.start_column) as u32
+                    && token.3 == 8
+            }));
         }
     }
 
@@ -819,6 +898,89 @@ mod tests {
     }
 
     #[test]
+    fn test_css_highlighting_keeps_property_aligned_around_interpolation() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+
+        let template = make_template(
+            "padding: {}px;",
+            r#"t"padding: {padding}px;""#,
+            "css",
+            Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 24,
+            },
+            vec![Expression {
+                content: "padding".to_string(),
+                location: Location {
+                    start_line: 1,
+                    start_column: 12,
+                    end_line: 1,
+                    end_column: 19,
+                },
+            }],
+            TemplateStringFlags::default(),
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let placeholder_start = template.content.find("{}").unwrap();
+        let placeholder_end = placeholder_start + 2;
+
+        assert!(ranges.iter().any(|r| {
+            r.highlight_name == "property"
+                && &template.content[r.start_byte..r.end_byte] == "padding"
+        }));
+        assert!(
+            ranges
+                .iter()
+                .filter(|r| r.highlight_name != "variable.parameter")
+                .all(|r| !range_overlaps(r, placeholder_start, placeholder_end))
+        );
+    }
+
+    #[test]
+    fn test_yaml_highlighting_keeps_property_aligned_around_interpolation() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+
+        let template = make_template(
+            "name: {}\n",
+            "t\"name: {app_name}\\n\"",
+            "yaml",
+            Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 19,
+            },
+            vec![Expression {
+                content: "app_name".to_string(),
+                location: Location {
+                    start_line: 1,
+                    start_column: 10,
+                    end_line: 1,
+                    end_column: 18,
+                },
+            }],
+            TemplateStringFlags::default(),
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let placeholder_start = template.content.find("{}").unwrap();
+        let placeholder_end = placeholder_start + 2;
+
+        assert!(ranges.iter().any(|r| {
+            r.highlight_name == "property" && &template.content[r.start_byte..r.end_byte] == "name"
+        }));
+        assert!(
+            ranges
+                .iter()
+                .filter(|r| r.highlight_name != "variable.parameter")
+                .all(|r| !range_overlaps(r, placeholder_start, placeholder_end))
+        );
+    }
+
+    #[test]
     fn test_toml_highlighting() {
         let mut highlighter = TemplateHighlighter::new().unwrap();
 
@@ -855,5 +1017,149 @@ mod tests {
                 .iter()
                 .any(|r| r.highlight_name == "variable.parameter")
         );
+    }
+
+    #[test]
+    fn test_toml_string_highlighting_does_not_cover_interpolation() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+
+        let template = make_template(
+            "name = \"{}\"\n",
+            "t\"name = \\\"{project_name}\\\"\\n\"",
+            "toml",
+            Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 29,
+            },
+            vec![Expression {
+                content: "project_name".to_string(),
+                location: Location {
+                    start_line: 1,
+                    start_column: 13,
+                    end_line: 1,
+                    end_column: 25,
+                },
+            }],
+            TemplateStringFlags::default(),
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let placeholder_start = template.content.find("{}").unwrap();
+        let placeholder_end = placeholder_start + 2;
+
+        assert!(ranges.iter().any(|r| r.highlight_name == "string"));
+        assert!(
+            ranges
+                .iter()
+                .filter(|r| r.highlight_name != "variable.parameter")
+                .all(|r| !range_overlaps(r, placeholder_start, placeholder_end))
+        );
+    }
+
+    #[test]
+    fn test_literal_braces_are_not_marked_as_interpolations() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+
+        let template = TemplateStringInfo {
+            content: "literal {} braces".to_string(),
+            raw_content: r#"t"literal {{}} braces""#.to_string(),
+            variable_name: Some("html".to_string()),
+            function_name: None,
+            language: Some("html".to_string()),
+            string_start: "t\"".to_string(),
+            string_end: "\"".to_string(),
+            location: Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 23,
+            },
+            expressions: vec![],
+            parts: vec![TemplatePart::Static(StaticTextSegment {
+                text: "literal {} braces".to_string(),
+            })],
+            flags: TemplateStringFlags::default(),
+        };
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+
+        assert!(
+            !ranges
+                .iter()
+                .any(|r| r.highlight_name == "variable.parameter")
+        );
+    }
+
+    #[test]
+    fn test_css_semantic_tokens_handle_escaped_braces_and_long_expressions() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+theme = {"spacing": {"lg": 24}}
+
+styles: Annotated[Template, "css"] = t"""
+.card {{
+    content: "{{}}";
+    padding: {theme["spacing"]["lg"]}px;
+}}
+"""
+"#,
+        );
+
+        assert_eq!(template.content.matches("{}").count(), 2);
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        assert_eq!(
+            ranges
+                .iter()
+                .filter(|r| r.highlight_name == "variable.parameter")
+                .count(),
+            1
+        );
+        assert_non_variable_ranges_avoid_placeholders(&ranges, &template);
+
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+        assert_expression_tokens_match_template(&tokens, &template);
+    }
+
+    #[test]
+    fn test_json_semantic_tokens_handle_nested_objects_and_escaped_braces() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+project_name = "demo-project"
+payload = {"nested": {"enabled": True}}
+
+config: Annotated[Template, "json"] = t"""
+{
+  "meta": {
+    "pattern": "{{}}"
+  },
+  "payload": {payload["nested"]}
+}
+"""
+"#,
+        );
+
+        assert_eq!(template.expressions.len(), 1);
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        assert_eq!(
+            ranges
+                .iter()
+                .filter(|r| r.highlight_name == "variable.parameter")
+                .count(),
+            1
+        );
+        assert_non_variable_ranges_avoid_placeholders(&ranges, &template);
+
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+        assert_expression_tokens_match_template(&tokens, &template);
     }
 }
