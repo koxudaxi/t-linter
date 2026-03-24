@@ -4121,13 +4121,22 @@ fn map_template_position_to_document(
     let actual_bytes = actual_content.as_bytes();
     let mut part_iter = parts.iter();
 
-    while template_idx < position_in_template && actual_idx < actual_bytes.len() {
+    while actual_idx < actual_bytes.len() {
         let Some(part) = part_iter.next() else {
             break;
         };
 
         match part {
             TemplatePart::Static(part) => {
+                if part.text.is_empty() {
+                    actual_idx = (actual_idx + part.raw_text.len()).min(actual_bytes.len());
+                    continue;
+                }
+
+                if template_idx >= position_in_template {
+                    break;
+                }
+
                 let remaining_template = position_in_template - template_idx;
                 let consumed = remaining_template.min(part.text.len());
                 template_idx += consumed;
@@ -4135,6 +4144,10 @@ fn map_template_position_to_document(
                     (actual_idx + raw_static_prefix_len(part, consumed, is_raw)).min(actual_bytes.len());
             }
             TemplatePart::Interpolation(part) => {
+                if template_idx >= position_in_template {
+                    break;
+                }
+
                 if template_idx + 2 <= position_in_template {
                     template_idx += 2;
                     actual_idx = (actual_idx + part.raw_source.len()).min(actual_bytes.len());
@@ -4427,6 +4440,29 @@ html = t"""
             raw_text: "\\\n<span>".to_string(),
         };
         assert_eq!(raw_static_prefix_len(&continued_line, 1, false), 3);
+    }
+
+    #[test]
+    fn test_map_template_position_to_document_consumes_zero_length_static_segments() {
+        let parts = vec![
+            TemplatePart::Static(StaticTextSegment {
+                text: "<div>".to_string(),
+                raw_text: "<div>".to_string(),
+            }),
+            TemplatePart::Static(StaticTextSegment {
+                text: String::new(),
+                raw_text: "\\\n".to_string(),
+            }),
+            TemplatePart::Static(StaticTextSegment {
+                text: "<span>".to_string(),
+                raw_text: "<span>".to_string(),
+            }),
+        ];
+
+        assert_eq!(
+            map_template_position_to_document(&parts, false, "<div>\\\n<span>", 5, 0, 0, 0),
+            (1, 0)
+        );
     }
 
     #[test]

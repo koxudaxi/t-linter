@@ -551,13 +551,22 @@ impl TemplateHighlighter {
         let actual_bytes = actual_content.as_bytes();
         let mut part_iter = template.parts.iter();
 
-        while template_idx < position_in_template && actual_idx < actual_bytes.len() {
+        while actual_idx < actual_bytes.len() {
             let Some(part) = part_iter.next() else {
                 break;
             };
 
             match part {
                 TemplatePart::Static(part) => {
+                    if part.text.is_empty() {
+                        actual_idx = (actual_idx + part.raw_text.len()).min(actual_bytes.len());
+                        continue;
+                    }
+
+                    if template_idx >= position_in_template {
+                        break;
+                    }
+
                     let remaining_template = position_in_template - template_idx;
                     let consumed = remaining_template.min(part.text.len());
                     template_idx += consumed;
@@ -566,6 +575,10 @@ impl TemplateHighlighter {
                     .min(actual_bytes.len());
                 }
                 TemplatePart::Interpolation(part) => {
+                    if template_idx >= position_in_template {
+                        break;
+                    }
+
                     if template_idx + 2 <= position_in_template {
                         template_idx += 2;
                         actual_idx = (actual_idx + part.raw_source.len()).min(actual_bytes.len());
@@ -1116,6 +1129,34 @@ page = html(t"""<{Card} title="{}">
 
         assert_expression_tokens_match_template(&tokens, &template);
         assert_has_token_start(&tokens, 4, 4, highlighter.token_type_to_index("tag"), 4);
+    }
+
+    #[test]
+    fn test_html_highlighting_keeps_alignment_after_line_continuation() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+value = "ok"
+
+page: Annotated[Template, "html"] = t"""<div>\
+<span>{value}</span>
+</div>"""
+"#,
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+
+        assert_expression_tokens_match_template(&tokens, &template);
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.0 == 6 && token.1 == 1 && token.2 == 4),
+            "expected a token to start at 7:2 with len 4, got {:?}",
+            tokens
+        );
     }
 
     #[test]
