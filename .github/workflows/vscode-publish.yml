@@ -13,8 +13,47 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
+  build-bundled-binaries:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            vscode_target: linux-x64
+            binary_name: t-linter
+          - runner: macos-13
+            rust_target: x86_64-apple-darwin
+            vscode_target: darwin-x64
+            binary_name: t-linter
+          - runner: macos-14
+            rust_target: aarch64-apple-darwin
+            vscode_target: darwin-arm64
+            binary_name: t-linter
+          - runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            vscode_target: win32-x64
+            binary_name: t-linter.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@v5
 
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@1.94.0
+      with:
+        targets: ${{ matrix.rust_target }}
+
+    - name: Build bundled t-linter binary
+      run: cargo build --release --bin t-linter --target ${{ matrix.rust_target }}
+
+    - name: Upload bundled binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: bundled-${{ matrix.vscode_target }}
+        path: target/${{ matrix.rust_target }}/release/${{ matrix.binary_name }}
+
+  publish:
+    needs:
+      - build-bundled-binaries
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
@@ -23,6 +62,8 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: '20'
+        cache: npm
+        cache-dependency-path: editors/vscode/package-lock.json
 
     - name: Synchronize release version
       shell: bash
@@ -30,10 +71,24 @@ jobs:
         VERSION="${{ github.event.release.tag_name }}"
         VERSION="${VERSION#v}"
         python3 scripts/set_release_versions.py --vscode-version "$VERSION"
+
+    - name: Download bundled binaries
+      uses: actions/download-artifact@v4
+      with:
+        path: .artifacts
+        pattern: bundled-*
     
     - name: Install dependencies
       working-directory: editors/vscode
       run: npm ci
+
+    - name: Stage bundled binaries
+      working-directory: editors/vscode
+      run: |
+        node scripts/prepare-binary.js --source ../../.artifacts/bundled-linux-x64/t-linter --target linux-x64
+        node scripts/prepare-binary.js --source ../../.artifacts/bundled-darwin-x64/t-linter --target darwin-x64
+        node scripts/prepare-binary.js --source ../../.artifacts/bundled-darwin-arm64/t-linter --target darwin-arm64
+        node scripts/prepare-binary.js --source ../../.artifacts/bundled-win32-x64/t-linter.exe --target win32-x64
     
     - name: Compile
       working-directory: editors/vscode
@@ -41,15 +96,13 @@ jobs:
 
     - name: Package Extension
       working-directory: editors/vscode
-      run: |
-        npm install -g @vscode/vsce
-        vsce package
+      run: npx @vscode/vsce package
 
     - name: Publish to VSCode Marketplace
       working-directory: editors/vscode
       env:
         VSCE_PAT: ${{ secrets.VSCE_PAT }}
-      run: vsce publish
+      run: npx @vscode/vsce publish
 
     - name: Upload to GitHub Release
       uses: softprops/action-gh-release@v2

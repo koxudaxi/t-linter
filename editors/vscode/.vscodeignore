@@ -5,6 +5,7 @@ src/**
 .yarnrc
 tsconfig.json
 build.js
+scripts/**
 node_modules/**
 *.ts
 \!*.d.ts

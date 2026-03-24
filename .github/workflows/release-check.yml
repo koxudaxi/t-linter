@@ -106,3 +106,40 @@ jobs:
           fi
           uv pip install --python "$PYTHON_BIN" --force-reinstall dist/*.whl
           "$T_LINTER_BIN" --version
+
+  verify-vscode-extension:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.94.0
+
+      - name: Build bundled t-linter binary
+        run: cargo build --release --bin t-linter
+
+      - name: Install VSCode extension dependencies
+        working-directory: editors/vscode
+        run: npm ci
+
+      - name: Stage bundled binary
+        working-directory: editors/vscode
+        run: node scripts/prepare-binary.js --source ../../target/release/t-linter --target linux-x64
+
+      - name: Compile VSCode extension
+        working-directory: editors/vscode
+        run: npm run compile
+
+      - name: Package VSCode extension
+        working-directory: editors/vscode
+        run: npx @vscode/vsce package

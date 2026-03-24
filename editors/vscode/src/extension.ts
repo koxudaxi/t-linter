@@ -14,6 +14,14 @@ let client: LanguageClient | undefined;
 let outputChannel: vscode.OutputChannel;
 let extensionContext: vscode.ExtensionContext;  // Store context globally
 
+const BUNDLED_BINARY_PATHS: Record<string, string> = {
+    'darwin-arm64': path.join('bin', 'darwin-arm64', 't-linter'),
+    'darwin-x64': path.join('bin', 'darwin-x64', 't-linter'),
+    'linux-arm64': path.join('bin', 'linux-arm64', 't-linter'),
+    'linux-x64': path.join('bin', 'linux-x64', 't-linter'),
+    'win32-x64': path.join('bin', 'win32-x64', 't-linter.exe'),
+};
+
 export async function activate(context: vscode.ExtensionContext) {
     extensionContext = context;  // Save context for later use
     outputChannel = vscode.window.createOutputChannel('T-Linter');
@@ -130,11 +138,17 @@ async function findServerPath(context: vscode.ExtensionContext): Promise<string 
         return configuredPath;
     }
 
-    const possiblePaths = [
-        path.join(context.extensionPath, 'server', 't-linter'),
-        path.join(context.extensionPath, 'bin', 't-linter'),
+    if (configuredPath) {
+        outputChannel.appendLine(`Configured server path does not exist: ${configuredPath}`);
+    }
 
-        't-linter',
+    const bundledPath = await findBundledServerPath(context);
+    if (bundledPath) {
+        outputChannel.appendLine(`Using bundled server path: ${bundledPath}`);
+        return bundledPath;
+    }
+
+    const possiblePaths = [
         path.join(os.homedir(), '.cargo', 'bin', 't-linter'),
         path.join(os.homedir(), '.local', 'bin', 't-linter'),
         '/usr/local/bin/t-linter',
@@ -143,9 +157,6 @@ async function findServerPath(context: vscode.ExtensionContext): Promise<string 
 
     if (process.platform === 'win32') {
         possiblePaths.push(
-            path.join(context.extensionPath, 'server', 't-linter.exe'),
-            path.join(context.extensionPath, 'bin', 't-linter.exe'),
-            't-linter.exe',
             path.join(os.homedir(), '.cargo', 'bin', 't-linter.exe')
         );
     }
@@ -166,19 +177,50 @@ async function findServerPath(context: vscode.ExtensionContext): Promise<string 
 
     if (!pathResult) {
         const choice = await vscode.window.showErrorMessage(
-            't-linter binary not found. Please install it first.',
-            'Install Instructions',
-            'Set Path'
+            'Bundled t-linter binary was not found. Reinstall the extension or configure t-linter.serverPath.',
+            'Open Settings',
+            'View Installation Docs'
         );
 
-        if (choice === 'Install Instructions') {
-            vscode.env.openExternal(vscode.Uri.parse('https://github.com/koxudaxi/t-linter#installation'));
-        } else if (choice === 'Set Path') {
+        if (choice === 'Open Settings') {
             vscode.commands.executeCommand('workbench.action.openSettings', 't-linter.serverPath');
+        } else if (choice === 'View Installation Docs') {
+            vscode.env.openExternal(vscode.Uri.parse('https://t-linter.koxudaxi.dev/installation/'));
         }
     }
 
     return pathResult;
+}
+
+async function findBundledServerPath(context: vscode.ExtensionContext): Promise<string | undefined> {
+    const bundledRelativePath = BUNDLED_BINARY_PATHS[`${process.platform}-${process.arch}`];
+    if (!bundledRelativePath) {
+        outputChannel.appendLine(`No bundled binary mapping for ${process.platform}-${process.arch}`);
+        return undefined;
+    }
+
+    const bundledPath = path.join(context.extensionPath, bundledRelativePath);
+    try {
+        await fs.promises.access(bundledPath, fs.constants.F_OK);
+    } catch {
+        outputChannel.appendLine(`Bundled binary is missing: ${bundledPath}`);
+        return undefined;
+    }
+
+    if (process.platform !== 'win32') {
+        try {
+            await fs.promises.chmod(bundledPath, 0o755);
+        } catch (error) {
+            outputChannel.appendLine(`Failed to set executable bit on bundled binary: ${error}`);
+        }
+    }
+
+    if (await checkExecutable(bundledPath)) {
+        return bundledPath;
+    }
+
+    outputChannel.appendLine(`Bundled binary is not executable: ${bundledPath}`);
+    return undefined;
 }
 
 async function checkExecutable(path: string): Promise<boolean> {
@@ -208,6 +250,8 @@ async function findInPath(executable: string): Promise<string | undefined> {
                 resolve(undefined);
             }
         });
+
+        child.on('error', () => resolve(undefined));
     });
 }
 

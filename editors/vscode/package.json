@@ -79,7 +79,7 @@
         "t-linter.serverPath": {
           "type": "string",
           "default": "",
-          "description": "Path to t-linter executable. Run 'pip install t-linter' to install."
+          "description": "Optional path to a t-linter executable. Leave empty to use the bundled binary when available."
         },
         "t-linter.highlightUntyped": {
           "type": "boolean",
@@ -110,6 +110,7 @@
     "vscode:prepublish": "npm run compile",
     "compile": "node build.js",
     "watch": "node build.js --watch",
+    "prepare-binary": "node scripts/prepare-binary.js",
     "package": "vsce package",
     "publish": "vsce publish"
   },
