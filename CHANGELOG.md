@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 This changelog is generated from GitHub Releases and may include manual corrections when release metadata needs adjustment.
 
 ---
+## [0.6.2](https://github.com/koxudaxi/t-linter/releases/tag/0.6.2) - 2026-03-24
+
+## What's Changed
+* Fix VS Code highlight alignment around interpolations by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/36
+
+
+**Full Changelog**: https://github.com/koxudaxi/t-linter/compare/0.6.1...0.6.2
+
+---
+
 ## [0.6.1](https://github.com/koxudaxi/t-linter/releases/tag/0.6.1) - 2026-03-24
 
 ## What's Changed
