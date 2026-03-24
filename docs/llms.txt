@@ -6,7 +6,7 @@
 - [Installation](https://t-linter.koxudaxi.dev/installation/): t-linter can be installed in three ways depending on your use case.
 ## Usage
 
-- [VSCode Extension](https://t-linter.koxudaxi.dev/usage/vscode/): On Linux x64, macOS x64/arm64, and Windows x64, the VSCode extension bundles `t-linter`; other platforms require `t-linter.serverPath`.
+- [VSCode Extension](https://t-linter.koxudaxi.dev/usage/vscode/): t-linter now supports two save-time formatting modes in VSCode:
 ### CLI
 
 - [Check Command](https://t-linter.koxudaxi.dev/usage/cli/check/): The `check` command validates Python template strings for syntax errors in embedded languages.
