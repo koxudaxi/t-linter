@@ -545,7 +545,7 @@ mod tests {
     use super::*;
     use crate::parser::{
         Expression, InterpolationInfo, Location, StaticTextSegment, TemplatePart,
-        TemplateStringFlags, TemplateStringInfo,
+        TemplateStringFlags, TemplateStringInfo, TemplateStringParser,
     };
 
     fn make_template(
@@ -618,6 +618,58 @@ mod tests {
 
     fn range_overlaps(range: &HighlightedRange, start: usize, end: usize) -> bool {
         range.end_byte > start && end > range.start_byte
+    }
+
+    fn parse_single_template(source: &str) -> TemplateStringInfo {
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+        assert_eq!(templates.len(), 1);
+        templates.into_iter().next().unwrap()
+    }
+
+    fn placeholder_ranges(template: &TemplateStringInfo) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut offset = 0;
+
+        for part in &template.parts {
+            match part {
+                TemplatePart::Static(part) => offset += part.text.len(),
+                TemplatePart::Interpolation(_) => {
+                    ranges.push((offset, offset + 2));
+                    offset += 2;
+                }
+            }
+        }
+
+        ranges
+    }
+
+    fn assert_non_variable_ranges_avoid_placeholders(
+        ranges: &[HighlightedRange],
+        template: &TemplateStringInfo,
+    ) {
+        for (start, end) in placeholder_ranges(template) {
+            assert!(
+                ranges
+                    .iter()
+                    .filter(|r| r.highlight_name != "variable.parameter")
+                    .all(|r| !range_overlaps(r, start, end))
+            );
+        }
+    }
+
+    fn assert_expression_tokens_match_template(
+        tokens: &[(u32, u32, u32, u32, u32)],
+        template: &TemplateStringInfo,
+    ) {
+        for expr in &template.expressions {
+            assert!(tokens.iter().any(|token| {
+                token.0 == (expr.location.start_line - 1) as u32
+                    && token.1 == (expr.location.start_column - 1) as u32
+                    && token.2 == (expr.location.end_column - expr.location.start_column) as u32
+                    && token.3 == 8
+            }));
+        }
     }
 
     #[test]
@@ -1038,5 +1090,76 @@ mod tests {
                 .iter()
                 .any(|r| r.highlight_name == "variable.parameter")
         );
+    }
+
+    #[test]
+    fn test_css_semantic_tokens_handle_escaped_braces_and_long_expressions() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+theme = {"spacing": {"lg": 24}}
+
+styles: Annotated[Template, "css"] = t"""
+.card {{
+    content: "{{}}";
+    padding: {theme["spacing"]["lg"]}px;
+}}
+"""
+"#,
+        );
+
+        assert_eq!(template.content.matches("{}").count(), 2);
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        assert_eq!(
+            ranges
+                .iter()
+                .filter(|r| r.highlight_name == "variable.parameter")
+                .count(),
+            1
+        );
+        assert_non_variable_ranges_avoid_placeholders(&ranges, &template);
+
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+        assert_expression_tokens_match_template(&tokens, &template);
+    }
+
+    #[test]
+    fn test_json_semantic_tokens_handle_nested_objects_and_escaped_braces() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+project_name = "demo-project"
+payload = {"nested": {"enabled": True}}
+
+config: Annotated[Template, "json"] = t"""
+{
+  "meta": {
+    "pattern": "{{}}"
+  },
+  "payload": {payload["nested"]}
+}
+"""
+"#,
+        );
+
+        assert_eq!(template.expressions.len(), 1);
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        assert_eq!(
+            ranges
+                .iter()
+                .filter(|r| r.highlight_name == "variable.parameter")
+                .count(),
+            1
+        );
+        assert_non_variable_ranges_avoid_placeholders(&ranges, &template);
+
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+        assert_expression_tokens_match_template(&tokens, &template);
     }
 }
