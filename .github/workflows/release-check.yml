@@ -142,4 +142,13 @@ jobs:
 
       - name: Package VSCode extension
         working-directory: editors/vscode
-        run: npx @vscode/vsce package
+        run: |
+          npx @vscode/vsce package
+          python3 - <<'PY'
+          import pathlib
+          import zipfile
+
+          vsix = next(pathlib.Path('.').glob('*.vsix'))
+          with zipfile.ZipFile(vsix) as archive:
+              assert 'extension/bin/linux-x64/t-linter' in archive.namelist()
+          PY

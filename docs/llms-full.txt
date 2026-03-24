@@ -222,17 +222,8 @@ Install the extension from the Visual Studio Code Marketplace:
 
 If you want to override the bundled binary, or if you are on an unsupported platform, install `t-linter` separately and set `t-linter.serverPath`:
 
-=== "uv"
-
-    ```bash
-    uv add t-linter
-    ```
-
-=== "pip"
-
-    ```bash
-    pip install t-linter
-    ```
+- `uv`: `uv add t-linter`
+- `pip`: `pip install t-linter`
 
 ## Option 3: Build from Source
 
@@ -253,9 +244,9 @@ cargo install --path crates/t-linter
 
 Source: https://t-linter.koxudaxi.dev/usage/vscode/
 
-After installing the VSCode extension, t-linter will automatically provide syntax highlighting for Python template strings.
+On Linux x64, macOS x64/arm64, and Windows x64, the VSCode extension bundles `t-linter`; other platforms require `t-linter.serverPath`.
 
-The extension bundles `t-linter` binaries for Linux x64, macOS x64/arm64, and Windows x64. On those platforms, no extra CLI installation is required.
+After installation, t-linter provides syntax highlighting for Python template strings.
 
 ## Setup
 

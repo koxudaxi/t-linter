@@ -35,7 +35,7 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 3. Search for "t-linter"
 4. Click Install on "T-Linter - Python Template Strings Highlighter & Linter" by koxudaxi
 
-The extension bundles `t-linter` binaries for Linux x64, macOS x64/arm64, and Windows x64, so those platforms do not need a separate CLI installation.
+The extension bundles `t-linter` binaries for Linux x64, macOS x64/arm64, and Windows x64, so those platforms do not need a separate CLI installation. On other platforms, install an external `t-linter` binary and set `t-linter.serverPath`.
 
 ### Step 2: Disable Python Language Server
 To prevent conflicts with t-linter's syntax highlighting, you need to disable the Python language server:

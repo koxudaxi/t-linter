@@ -1,8 +1,8 @@
 # VSCode Extension
 
-After installing the VSCode extension, t-linter will automatically provide syntax highlighting for Python template strings.
+On Linux x64, macOS x64/arm64, and Windows x64, the VSCode extension bundles `t-linter`; other platforms require `t-linter.serverPath`.
 
-The extension bundles `t-linter` binaries for Linux x64, macOS x64/arm64, and Windows x64. On those platforms, no extra CLI installation is required.
+After installation, t-linter provides syntax highlighting for Python template strings.
 
 ## Setup
 

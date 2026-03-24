@@ -59,17 +59,8 @@ Install the extension from the Visual Studio Code Marketplace:
 
 If you want to override the bundled binary, or if you are on an unsupported platform, install `t-linter` separately and set `t-linter.serverPath`:
 
-=== "uv"
-
-    ```bash
-    uv add t-linter
-    ```
-
-=== "pip"
-
-    ```bash
-    pip install t-linter
-    ```
+- `uv`: `uv add t-linter`
+- `pip`: `pip install t-linter`
 
 ## Option 3: Build from Source
 

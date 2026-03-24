@@ -21,7 +21,7 @@ jobs:
             rust_target: x86_64-unknown-linux-gnu
             vscode_target: linux-x64
             binary_name: t-linter
-          - runner: macos-13
+          - runner: macos-15-intel
             rust_target: x86_64-apple-darwin
             vscode_target: darwin-x64
             binary_name: t-linter
@@ -96,7 +96,16 @@ jobs:
 
     - name: Package Extension
       working-directory: editors/vscode
-      run: npx @vscode/vsce package
+      run: |
+        npx @vscode/vsce package
+        python3 - <<'PY'
+        import pathlib
+        import zipfile
+
+        vsix = next(pathlib.Path('.').glob('*.vsix'))
+        with zipfile.ZipFile(vsix) as archive:
+            assert 'extension/bin/linux-x64/t-linter' in archive.namelist()
+        PY
 
     - name: Publish to VSCode Marketplace
       working-directory: editors/vscode
