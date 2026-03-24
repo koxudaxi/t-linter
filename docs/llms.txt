@@ -2,7 +2,7 @@
 
 > Intelligent syntax highlighting and validation for Python template strings (PEP 750)
 
-- [t-linter](https://t-linter.koxudaxi.dev/): Intelligent syntax highlighting and validation for Python template strings ([PEP 750](https://peps.python.org/pep-0750/)).
+- [t-linter](https://t-linter.koxudaxi.dev/): Intelligent syntax highlighting, validation, and formatting for Python template strings ([PEP 750](https://peps.python.org/pep-0750/)).
 - [Installation](https://t-linter.koxudaxi.dev/installation/): t-linter can be installed in three ways depending on your use case.
 ## Usage
 

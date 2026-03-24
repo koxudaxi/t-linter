@@ -32,32 +32,30 @@ render_page(t"<div>{page_content}</div>")
 
 ## Supported Languages
 
-| Language | Annotation | Highlighting | Validation |
-|----------|-----------|:------------:|:----------:|
-| **HTML** | `"html"` | Tree-sitter | `tstring-html` backend |
-| **T-HTML** | `"thtml"` | Tree-sitter (HTML-like) | `tstring-thtml` backend |
-| **SQL** | `"sql"` | Tree-sitter | Tree-sitter |
-| **JavaScript** | `"javascript"` | Tree-sitter | Tree-sitter |
-| **CSS** | `"css"` | Tree-sitter | Tree-sitter |
-| **JSON** | `"json"` | Tree-sitter | `tstring-json` backend |
-| **YAML** | `"yaml"` | Tree-sitter | `tstring-yaml` backend |
-| **TOML** | `"toml"` | Tree-sitter | `tstring-toml` backend |
+| Language | Annotation | Check | Format | Highlight | Engine |
+|----------|-----------|:-----:|:------:|:---------:|--------|
+| **HTML** | `"html"` | ✅ | ✅ | ✅ | `tstring-html` backend |
+| **T-HTML** | `"thtml"` | ✅ | ✅ | ✅ | `tstring-thtml` backend |
+| **JSON** | `"json"` | ✅ | ✅ | ✅ | `tstring-json` backend |
+| **YAML** | `"yaml"`, `"yml"` | ✅ | ✅ | ✅ | `tstring-yaml` backend |
+| **TOML** | `"toml"` | ✅ | ✅ | ✅ | `tstring-toml` backend |
+| **CSS** | `"css"` | ✅ | — | ✅ | Tree-sitter |
+| **JavaScript** | `"javascript"`, `"js"` | ✅ | — | ✅ | Tree-sitter |
+| **SQL** | `"sql"` | ✅ | — | ✅ | Tree-sitter |
 
-## Backend-powered Validation and Formatting
+- **Check** — syntax validation via `t-linter check` CLI and LSP diagnostics
+- **Format** — canonical formatting via `t-linter format` CLI and LSP formatting
+- **Highlight** — semantic tokens via LSP for editor syntax highlighting
 
-For backend-powered languages, t-linter splits responsibilities:
+## Backend-powered vs Tree-sitter Languages
 
-- **`semanticTokens`**: Tree-sitter only, for low-latency highlighting
-- **`check`**: Strict parsing through the dedicated Rust backends
-- **`formatting`**: Canonical formatting through the same Rust backends
+For backend-powered languages (HTML, T-HTML, JSON, YAML, TOML), t-linter splits responsibilities:
 
-This currently applies to:
+- **Highlighting**: Tree-sitter only, for low-latency semantic tokens
+- **Validation**: Strict parsing through the dedicated Rust backends (`tstring-*` crates)
+- **Formatting**: Canonical formatting through the same Rust backends
 
-- `html` via `tstring-html`
-- `thtml` via `tstring-thtml`
-- `json` via `tstring-json`
-- `yaml` via `tstring-yaml`
-- `toml` via `tstring-toml`
+For Tree-sitter-only languages (CSS, JavaScript, SQL), t-linter uses Tree-sitter for both highlighting and validation. Formatting is not yet available for these languages.
 
 ## HTML Notes
 
