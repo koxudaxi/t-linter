@@ -1581,9 +1581,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-html"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3be409d983bc60d6fb2f0556fc6703f8d51deefe4fb2e5057a0218a82b6684c2"
+checksum = "b733548c345f550c6862df3dcdba45223a2db396f5f284c51bab5dbeb6484a17"
 dependencies = [
  "tstring-format-doc",
  "tstring-syntax",
@@ -1610,9 +1610,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-thtml"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35d23b271e50251fa9ad615ba3c02be8d5aee2dfb8c61a7650aa5468d162da53"
+checksum = "5b91299ebe273433f555a83c74b5c33a7d025ffa8a8e914a1e7274c3de41f86b"
 dependencies = [
  "tstring-html",
  "tstring-syntax",

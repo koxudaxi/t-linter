@@ -1,30 +1,41 @@
 # t-linter
 
-Intelligent syntax highlighting and validation for Python template strings ([PEP 750](https://peps.python.org/pep-0750/)).
+Intelligent syntax highlighting, validation, and formatting for Python template strings ([PEP 750](https://peps.python.org/pep-0750/)).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![VSCode Marketplace](https://img.shields.io/visual-studio-marketplace/v/koxudaxi.t-linter.svg)](https://marketplace.visualstudio.com/items?itemName=koxudaxi.t-linter)
 [![PyPI](https://img.shields.io/pypi/v/t-linter.svg)](https://pypi.org/project/t-linter/)
+[![VSCode Marketplace](https://img.shields.io/visual-studio-marketplace/v/koxudaxi.t-linter.svg)](https://marketplace.visualstudio.com/items?itemName=koxudaxi.t-linter)
 
 ## Overview
 
-t-linter provides intelligent syntax highlighting and linting for Python template strings (PEP 750) through multiple distribution channels:
+t-linter validates and formats embedded languages inside Python template strings (PEP 750). Built with Rust and Tree-sitter for speed, it ships as a single binary that works as both a CLI tool and an LSP server.
 
-- **Command-line tool**: Install via PyPI (`pip install t-linter`) for direct CLI usage and LSP server
-- **VSCode Extension**: Install from the Visual Studio Code Marketplace for seamless editor integration
+- **`t-linter check`** — validate template string syntax
+- **`t-linter format`** — canonically reformat supported template literals
+- **`t-linter lsp`** — start the Language Server Protocol server for editor integration
 
 ## Features
 
-- **Smart Syntax Highlighting** - Detects embedded languages in `t"..."` strings
-- **Type-based Detection** - Understands `Annotated[Template, "html"]` annotations
-- **Fast** - Built with Rust and Tree-sitter for optimal performance
-- **Extensible** - Support for HTML, T-HTML, SQL, JavaScript, CSS, JSON, YAML, TOML, and more
+- **Linting** - Detect syntax errors in embedded HTML, JSON, YAML, TOML, CSS, JavaScript, SQL
+- **Formatting** - Canonical formatting for HTML, T-HTML, JSON, YAML, TOML templates
+- **Syntax Highlighting** - Smart highlighting via LSP semantic tokens
+- **Type-based Detection** - Understands `Annotated[Template, "html"]` and type aliases
+- **Fast** - Single Rust binary with Tree-sitter parsers
 
-For HTML, T-HTML, JSON, YAML, and TOML, t-linter splits responsibilities:
+## Supported Languages
 
-- `semanticTokens`: Tree-sitter only, for low-latency highlighting
-- `check`: strict parsing through the `tstring-html`, `tstring-thtml`, `tstring-json`, `tstring-yaml`, and `tstring-toml` backends
-- `formatting`: canonical formatting through the same Rust backends
+| Language | Annotation | Check | Format | Highlight |
+|----------|-----------|:-----:|:------:|:---------:|
+| **HTML** | `"html"` | ✅ | ✅ | ✅ |
+| **T-HTML** | `"thtml"` | ✅ | ✅ | ✅ |
+| **JSON** | `"json"` | ✅ | ✅ | ✅ |
+| **YAML** | `"yaml"`, `"yml"` | ✅ | ✅ | ✅ |
+| **TOML** | `"toml"` | ✅ | ✅ | ✅ |
+| **CSS** | `"css"` | ✅ | — | ✅ |
+| **JavaScript** | `"javascript"`, `"js"` | ✅ | — | ✅ |
+| **SQL** | `"sql"` | ✅ | — | ✅ |
+
+For HTML, T-HTML, JSON, YAML, and TOML, t-linter uses dedicated Rust backends (`tstring-*` crates) for strict validation and canonical formatting. CSS, JavaScript, and SQL use Tree-sitter for syntax validation and highlighting.
 
 ## Quick Start
 
@@ -40,13 +51,13 @@ Check your Python files for template string issues:
 t-linter check src/
 ```
 
-Or rewrite supported template literals in place:
+Rewrite supported template literals in place:
 
 ```bash
 t-linter format src/
 ```
 
-Or start the LSP server for editor integration:
+Start the LSP server for editor integration:
 
 ```bash
 t-linter lsp

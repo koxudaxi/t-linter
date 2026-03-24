@@ -1,10 +1,10 @@
 # t-linter 🐍✨
 
-Intelligent syntax highlighting and validation for Python template strings (PEP 750).
+Intelligent syntax highlighting, validation, and formatting for Python template strings (PEP 750).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![VSCode Marketplace](https://img.shields.io/visual-studio-marketplace/v/koxudaxi.t-linter.svg)](https://marketplace.visualstudio.com/items?itemName=koxudaxi.t-linter)
 [![PyPI](https://img.shields.io/pypi/v/t-linter.svg)](https://pypi.org/project/t-linter/)
+[![VSCode Marketplace](https://img.shields.io/visual-studio-marketplace/v/koxudaxi.t-linter.svg)](https://marketplace.visualstudio.com/items?itemName=koxudaxi.t-linter)
 
 > 📣 💼 Maintainer update: Open to opportunities. 🔗 [koxudaxi.dev](https://koxudaxi.dev/?utm_source=github_readme&utm_medium=top&utm_campaign=open_to_work)
 
@@ -12,10 +12,10 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 
 **👉 [t-linter.koxudaxi.dev](https://t-linter.koxudaxi.dev)**
 
-- 📦 [Installation](https://t-linter.koxudaxi.dev/installation/) - VSCode Extension, PyPI, Build from source
-- 🎨 [VSCode Extension](https://t-linter.koxudaxi.dev/usage/vscode/) - Editor integration & setup
+- 📦 [Installation](https://t-linter.koxudaxi.dev/installation/) - PyPI, VSCode Extension, Build from source
 - 🔍 [Check Command](https://t-linter.koxudaxi.dev/usage/cli/check/) - CLI validation & output formats
 - 🧹 [Format Command](https://t-linter.koxudaxi.dev/usage/cli/format/) - Canonical formatting for supported templates
+- 🖥️ [LSP Server](https://t-linter.koxudaxi.dev/usage/cli/lsp/) - Editor integration (VSCode, Claude Code, Codex, Neovim, etc.)
 - ⚙️ [Configuration](https://t-linter.koxudaxi.dev/usage/configuration/) - pyproject.toml & ignore files
 - 🌐 [Supported Languages](https://t-linter.koxudaxi.dev/supported-languages/) - HTML, T-HTML, SQL, JS, CSS, JSON, YAML, TOML
 
@@ -23,78 +23,38 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 
 ## Overview
 
-t-linter provides intelligent syntax highlighting and linting for Python template strings (PEP 750) through multiple distribution channels:
+t-linter validates and formats embedded languages inside Python template strings (PEP 750). Built with Rust and Tree-sitter for speed, it ships as a single binary that works as both a CLI tool and an LSP server.
 
-- **🔧 Command-line tool**: Install via PyPI (`pip install t-linter`) for direct CLI usage and LSP server
-- **🎨 VSCode Extension**: Install from the Visual Studio Code Marketplace for seamless editor integration
-
-![T-Linter VSCode Extension in action](editors/vscode/images/img.png)
+- **`t-linter check`** — validate template string syntax
+- **`t-linter format`** — canonically reformat supported template literals
+- **`t-linter lsp`** — start the Language Server Protocol server for editor integration
 
 ## Features
 
-- 🎨 **Smart Syntax Highlighting** - Detects embedded languages in `t"..."` strings
-- 🔍 **Type-based Detection** - Understands `Annotated[Template, "html"]` annotations
-- 🚀 **Fast** - Built with Rust and Tree-sitter for optimal performance
-- 🔧 **Extensible** - Support for HTML, T-HTML, SQL, JavaScript, CSS, JSON, YAML, TOML, and more
+- 🔍 **Linting** - Detect syntax errors in embedded HTML, JSON, YAML, TOML, CSS, JavaScript, SQL
+- 🧹 **Formatting** - Canonical formatting for HTML, T-HTML, JSON, YAML, TOML templates
+- 🎨 **Syntax Highlighting** - Smart highlighting via LSP semantic tokens
+- 🔧 **Type-based Detection** - Understands `Annotated[Template, "html"]` and type aliases
+- 🚀 **Fast** - Single Rust binary with Tree-sitter parsers
 
-For HTML, T-HTML, JSON, YAML, and TOML, `t-linter` now splits responsibilities:
+## Supported Languages
 
-- `semanticTokens`: Tree-sitter only, for low-latency highlighting
-- `check`: strict parsing through the `tstring-html`, `tstring-thtml`, `tstring-json`, `tstring-yaml`, and `tstring-toml` backends
-- `formatting`: canonical formatting through the same Rust backends
+| Language | Annotation | Check | Format | Highlight |
+|----------|-----------|:-----:|:------:|:---------:|
+| **HTML** | `"html"` | ✅ | ✅ | ✅ |
+| **T-HTML** | `"thtml"` | ✅ | ✅ | ✅ |
+| **JSON** | `"json"` | ✅ | ✅ | ✅ |
+| **YAML** | `"yaml"`, `"yml"` | ✅ | ✅ | ✅ |
+| **TOML** | `"toml"` | ✅ | ✅ | ✅ |
+| **CSS** | `"css"` | ✅ | — | ✅ |
+| **JavaScript** | `"javascript"`, `"js"` | ✅ | — | ✅ |
+| **SQL** | `"sql"` | ✅ | — | ✅ |
+
+For HTML, T-HTML, JSON, YAML, and TOML, t-linter uses dedicated Rust backends (`tstring-*` crates) for strict validation and canonical formatting. CSS, JavaScript, and SQL use Tree-sitter for syntax validation and highlighting.
 
 ## Installation
 
-### Option 1: VSCode Extension (Recommended for VSCode users)
-
-**Step 1: Install the VSCode extension**
-Install the extension from the Visual Studio Code Marketplace:
-
-1. Open VSCode
-2. Go to Extensions (Ctrl+Shift+X / Cmd+Shift+X)
-3. Search for "t-linter"
-4. Click Install on "T-Linter - Python Template Strings Highlighter & Linter" by koxudaxi
-
-The extension bundles `t-linter` binaries for Linux x64, macOS x64/arm64, and Windows x64, so those platforms do not need a separate CLI installation.
-
-**Step 2: Disable Python Language Server**
-To prevent conflicts with t-linter's syntax highlighting, disable the Python language server:
-
-1. Open VSCode Settings (Ctrl+, / Cmd+,)
-2. Search for "python.languageServer"
-3. Set it to "None"
-
-Alternatively, add to your settings.json:
-```json
-{
-    "python.languageServer": "None"
-}
-```
-
-**Step 3: Configure the server path (optional)**
-If you want to override the bundled binary, or if you are on an unsupported platform, install `t-linter` separately and configure the server path in VSCode settings:
-
-1. Install `t-linter` and find the path by running in terminal:
-   ```bash
-   pip install t-linter
-   ```
-2. Find your `t-linter` path:
-   ```bash
-   which t-linter     # macOS/Linux
-   where t-linter     # Windows
-   ```
-3. Open VSCode Settings (Ctrl+, / Cmd+,)
-4. Search for "t-linter.serverPath"
-5. Set the full path to your t-linter executable:
-   - **Windows**: `C:\Users\YourName\AppData\Local\Programs\Python\Python3xx\Scripts\t-linter.exe`
-   - **macOS**: `/Users/yourname/.local/bin/t-linter` or `/usr/local/bin/t-linter`
-   - **Linux**: `/home/yourname/.local/bin/t-linter` or `/usr/local/bin/t-linter`
-
-**[→ Install from VSCode Marketplace](https://marketplace.visualstudio.com/items?itemName=koxudaxi.t-linter)**
-
-### Option 2: PyPI Package Only (CLI tool and LSP server)
-
-For command-line usage or integration with other editors, install t-linter as a project dependency:
+### PyPI (Recommended)
 
 ```bash
 pip install t-linter
@@ -102,27 +62,39 @@ pip install t-linter
 
 Or add to your project's dependencies:
 ```bash
-# Using requirements.txt
-t-linter
-
-# Using uv
+# Using uv (recommended)
 uv add t-linter
 
-# Or manually in pyproject.toml
-[project]
-dependencies = [
-    "t-linter",
-    # other dependencies...
-]
+# Or using pip with requirements.txt
+echo "t-linter" >> requirements.txt
+pip install -r requirements.txt
 ```
 
-This provides the `t-linter` command-line tool and LSP server without the VSCode extension.
+This provides the `t-linter` CLI tool and LSP server.
 
 **[→ View on PyPI](https://pypi.org/project/t-linter/)**
 
-### Option 3: Build from Source
+### VSCode Extension
 
-For development or bleeding-edge features:
+If you use VSCode, install the extension for seamless editor integration:
+
+1. Open VSCode → Extensions (Ctrl+Shift+X / Cmd+Shift+X)
+2. Search for "t-linter" → Install "T-Linter" by koxudaxi
+3. On Linux x64, macOS x64/arm64, and Windows x64, the extension bundles the `t-linter` binary, so no separate PyPI install is required.
+4. On unsupported platforms, or if you want to override the bundled binary, install `t-linter` via PyPI (see above) and set `t-linter.serverPath` to the full executable path.
+5. To avoid conflicts with t-linter's semantic highlighting, set the Python language server to `"None"` in your workspace settings. This disables features like auto-complete and go-to-definition from the Python language server in that workspace:
+   ```json
+   {
+       "python.languageServer": "None"
+   }
+   ```
+   If you need those features, you can keep the Python language server enabled — t-linter will still provide template string diagnostics and formatting, though semantic highlighting may conflict.
+
+If you use an external `t-linter` binary and it is not in your PATH, set `t-linter.serverPath` in VSCode settings to the full path of the executable.
+
+**[→ Install from VSCode Marketplace](https://marketplace.visualstudio.com/items?itemName=koxudaxi.t-linter)**
+
+### Build from Source
 
 ```bash
 git clone https://github.com/koxudaxi/t-linter
@@ -132,51 +104,51 @@ cargo install --path crates/t-linter
 
 ## Usage
 
-### VSCode Extension
-After installing the VSCode extension, t-linter will automatically provide syntax highlighting for Python template strings.
+### Check
 
-**Troubleshooting**: If syntax highlighting doesn't work:
-1. Reinstall the extension to restore the bundled binary
-2. Check that Python language server is disabled: `python.languageServer` should be set to "None"
-3. If you use an external binary, check the server path in VSCode settings: `t-linter.serverPath`
-4. Restart VSCode after making changes
+Validate template strings for syntax errors:
 
-### Command Line Interface
-If you installed via PyPI, you can use t-linter from the command line:
-
-**Run the language server** (for editor integration):
 ```bash
-t-linter lsp
-```
-
-In the LSP, diagnostics are debounced and published from the dedicated Rust
-backends for HTML, T-HTML, JSON, YAML, and TOML templates. Formatting requests
-rewrite the whole template literal using the backend formatter while keeping
-interpolation source such as `{name!r:>5}` intact.
-
-**Check files for issues**:
-```bash
-# Check Python files for template string issues
+# Check a single file
 t-linter check file.py
+
+# Check a directory
 t-linter check src/
 
-# Output formats
+# Output formats: human (default), json, github
 t-linter check file.py --format json
 t-linter check file.py --format github  # GitHub Actions annotations
-t-linter check file.py --error-on-issues  # Exit with error code if issues found
+
+# Exit with error code if issues found (useful for CI)
+t-linter check file.py --error-on-issues
 ```
 
-`check` supports `human`, `json`, and `github` output formats.
+Example output:
+```text
+example.py:4:46: error[embedded-parse-error] Invalid json syntax in template string (language=json)
+1 files scanned, 1 templates scanned, 1 diagnostics, 0 failed files
+```
 
-`check --format` controls report output formatting only. Use the `format`
-subcommand to rewrite supported template literals in place:
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Run completed successfully |
+| `1` | Issues were found and `--error-on-issues` was set |
+| `2` | Operational failure such as an unreadable file |
+
+### Format
+
+Rewrite supported template literals (HTML, T-HTML, JSON, YAML, TOML) in place:
 
 ```bash
-# Format Python files containing HTML/T-HTML/JSON/YAML/TOML templates
+# Format a single file
 t-linter format file.py
+
+# Format a directory
 t-linter format src/
 
-# Check whether formatting would change any files
+# Check whether formatting would change any files (for CI)
 t-linter format --check file.py
 
 # Override the formatter line length
@@ -186,7 +158,66 @@ t-linter format --line-length 100 file.py
 cat file.py | t-linter format --stdin-filename file.py -
 ```
 
-Configuration can be provided via `pyproject.toml`:
+Templates in unsupported languages (CSS, JavaScript, SQL) are left unchanged.
+
+### LSP Server
+
+Start the Language Server Protocol server for editor integration:
+
+```bash
+t-linter lsp
+```
+
+The LSP server provides:
+
+- **Semantic Tokens** — syntax highlighting for embedded languages
+- **Diagnostics** — real-time validation with 250ms debouncing
+- **Document Formatting** — full document and range formatting
+
+#### Claude Code
+
+Add t-linter as an LSP server in your project's `.claude/settings.json`:
+
+```json
+{
+  "lsp": {
+    "t-linter": {
+      "command": "t-linter",
+      "args": ["lsp"],
+      "languages": ["python"]
+    }
+  }
+}
+```
+
+Claude Code will then use t-linter's diagnostics when editing Python files containing template strings.
+
+#### Codex
+
+Add the LSP configuration to your project's `codex.json` or start t-linter's LSP server as part of your development environment. The `t-linter check` and `t-linter format` commands can also be used directly in Codex's sandbox:
+
+```bash
+t-linter check src/
+t-linter format --check src/
+```
+
+#### Neovim
+
+```lua
+vim.lsp.start({
+  name = "t-linter",
+  cmd = { "t-linter", "lsp" },
+  filetypes = { "python" },
+})
+```
+
+#### Other Editors
+
+Any editor with LSP support can use t-linter. Configure the LSP client to start `t-linter lsp` as the server command for Python files.
+
+### Configuration
+
+Configuration via `pyproject.toml`:
 
 ```toml
 [tool.t-linter]
@@ -195,111 +226,16 @@ extend-exclude = ["generated", "vendor"]
 ignore-file = ".t-linterignore"
 ```
 
-Supported keys:
-- `line-length`: formatter print width for HTML and T-HTML templates only
-- `exclude`: override the built-in default excludes
-- `extend-exclude`: add more exclude patterns on top of the defaults
-- `ignore-file`: path to a gitignore-style ignore file, relative to the project root
+| Key | Description |
+|-----|-------------|
+| `line-length` | Formatter print width (applies to HTML and T-HTML only; JSON, YAML, and TOML use fixed formatting rules) |
+| `exclude` | Override the built-in default excludes |
+| `extend-exclude` | Add more exclude patterns on top of the defaults |
+| `ignore-file` | Path to a gitignore-style ignore file, relative to the project root |
 
 By default, `t-linter` also reads `.t-linterignore` from the project root if it exists.
 
-Exit codes:
-- `0`: Run completed successfully
-- `1`: Issues were found and `--error-on-issues` was set
-- `2`: Operational failure such as an unreadable file
-
-Example input:
-```python
-from typing import Annotated
-from string.templatelib import Template
-
-payload: Annotated[Template, "json"] = t"""[1,,2]"""
-```
-
-Example `human` output:
-```text
-example.py:4:46: error[embedded-parse-error] Invalid json syntax in template string (language=json)
-1 files scanned, 1 templates scanned, 1 diagnostics, 0 failed files
-```
-
-Example `json` output:
-```json
-{
-  "files": [
-    {
-      "file": "example.py",
-      "template_count": 1,
-      "diagnostics": [
-        {
-          "rule": "embedded-parse-error",
-          "severity": "error",
-          "language": "json",
-          "message": "Invalid json syntax in template string",
-          "file": "example.py",
-          "start_line": 4,
-          "start_column": 46,
-          "end_line": 4,
-          "end_column": 47
-        }
-      ]
-    }
-  ],
-  "diagnostics": [
-    {
-      "rule": "embedded-parse-error",
-      "severity": "error",
-      "language": "json",
-      "message": "Invalid json syntax in template string",
-      "file": "example.py",
-      "start_line": 4,
-      "start_column": 46,
-      "end_line": 4,
-      "end_column": 47
-    }
-  ],
-  "summary": {
-    "files_scanned": 1,
-    "templates_scanned": 1,
-    "diagnostics": 1,
-    "failed_files": 0
-  }
-}
-```
-
-Example `github` output:
-```text
-::error file=example.py,line=4,col=46,title=t-linter(embedded-parse-error)::Invalid json syntax in template string (language=json)
-```
-
-**Get template string statistics** (🚧 Coming soon):
-```bash
-# Analyze template string usage in your codebase
-t-linter stats .  # Current directory
-t-linter stats src/  # Specific directory
-
-# Expected output (when implemented):
-# - Number of template strings by language
-# - Template string locations
-# - Language detection methods used
-# - Type alias usage statistics
-```
-
-## Roadmap
-
-### Planned Features
-- ✅ **Language Server Protocol (LSP)** - Fully implemented
-- ✅ **Syntax Highlighting** - Supports HTML, T-HTML, SQL, JavaScript, CSS, JSON, YAML, TOML
-- ✅ **Type Alias Support** - Recognizes `type html = Annotated[Template, "html"]`
-- ✅ **Linting (`check` command)** - Validate template strings for syntax errors
-- 🚧 **Statistics (`stats` command)** - Analyze template string usage across codebases
-- 📋 **Cross-file Type Resolution** - Track type aliases across module boundaries
-- 📋 **Auto-completion** - Context-aware completions within template strings
-
 ## Quick Start Example
-
-Here's a complete example you can run through `t-linter check` right away. Each
-helper function declares the embedded language once, and the interpolation
-values are defined next to the template usage:
 
 ```python
 from typing import Annotated
@@ -390,3 +326,15 @@ or JSON objects.
 
 For `html`, `<title>{value}</title>` is allowed and treated as escaped text.
 `<script>`, `<style>`, and `<textarea>` still reject interpolations for safety.
+
+## Roadmap
+
+### Planned Features
+- ✅ **Language Server Protocol (LSP)** - Fully implemented
+- ✅ **Syntax Highlighting** - Supports HTML, T-HTML, SQL, JavaScript, CSS, JSON, YAML, TOML
+- ✅ **Type Alias Support** - Recognizes `type html = Annotated[Template, "html"]`
+- ✅ **Linting (`check` command)** - Validate template strings for syntax errors
+- ✅ **Formatting (`format` command)** - Canonical formatting for HTML, T-HTML, JSON, YAML, TOML
+- 🚧 **Statistics (`stats` command)** - Analyze template string usage across codebases
+- 📋 **Cross-file Type Resolution** - Track type aliases across module boundaries
+- 📋 **Auto-completion** - Context-aware completions within template strings
