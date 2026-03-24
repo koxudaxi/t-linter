@@ -17,9 +17,10 @@ t-linter validates and formats embedded languages inside Python template strings
 ## Features
 
 - **Linting** - Detect syntax errors in embedded HTML, JSON, YAML, TOML, CSS, JavaScript, SQL
-- **Formatting** - Canonical formatting for HTML, T-HTML, JSON, YAML, TOML templates
+- **Formatting** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML templates
 - **Syntax Highlighting** - Smart highlighting via LSP semantic tokens
 - **Type-based Detection** - Understands `Annotated[Template, "html"]` and type aliases
+- **Callee Inference** - Detects backend languages from helpers such as `tdom.html(...)`
 - **Fast** - Single Rust binary with Tree-sitter parsers
 
 ## Supported Languages
@@ -28,6 +29,7 @@ t-linter validates and formats embedded languages inside Python template strings
 |----------|-----------|:-----:|:------:|:---------:|
 | **HTML** | `"html"` | ✅ | ✅ | ✅ |
 | **T-HTML** | `"thtml"` | ✅ | ✅ | ✅ |
+| **TDOM** | `"tdom"` | ✅ | ✅ | ✅ |
 | **JSON** | `"json"` | ✅ | ✅ | ✅ |
 | **YAML** | `"yaml"`, `"yml"` | ✅ | ✅ | ✅ |
 | **TOML** | `"toml"` | ✅ | ✅ | ✅ |
@@ -35,7 +37,7 @@ t-linter validates and formats embedded languages inside Python template strings
 | **JavaScript** | `"javascript"`, `"js"` | ✅ | — | ✅ |
 | **SQL** | `"sql"` | ✅ | — | ✅ |
 
-For HTML, T-HTML, JSON, YAML, and TOML, t-linter uses dedicated Rust backends (`tstring-*` crates) for strict validation and canonical formatting. CSS, JavaScript, and SQL use Tree-sitter for syntax validation and highlighting.
+For HTML, T-HTML, TDOM, JSON, YAML, and TOML, t-linter uses dedicated Rust backends (`tstring-*` crates) for strict validation and canonical formatting. CSS, JavaScript, and SQL use Tree-sitter for syntax validation and highlighting.
 
 ## Quick Start
 

@@ -199,6 +199,10 @@ fn format_template_edit(
             &input,
             &tstring_html::FormatOptions { line_length },
         ),
+        "tdom" => tstring_tdom::format_template_with_options(
+            &input,
+            &tstring_tdom::FormatOptions { line_length },
+        ),
         "json" => tstring_json::format_template(&input),
         "yaml" | "yml" => tstring_yaml::format_template(&input),
         "toml" => tstring_toml::format_template(&input),

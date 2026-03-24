@@ -28,16 +28,16 @@ struct LanguageConfig {
 }
 
 #[derive(Debug, Clone)]
-struct Placeholder {
-    start: usize,
-    end: usize,
-}
-
-#[derive(Debug, Clone)]
 struct ProcessedHighlightContent {
     content: String,
     processed_to_original: Vec<usize>,
     placeholders: Vec<Placeholder>,
+}
+
+#[derive(Debug, Clone)]
+struct Placeholder {
+    start: usize,
+    end: usize,
 }
 
 impl TemplateHighlighter {
@@ -85,6 +85,12 @@ impl TemplateHighlighter {
         );
         language_configs.insert(
             "thtml".to_string(),
+            LanguageConfig {
+                language: tree_sitter_html::LANGUAGE.into(),
+            },
+        );
+        language_configs.insert(
+            "tdom".to_string(),
             LanguageConfig {
                 language: tree_sitter_html::LANGUAGE.into(),
             },
@@ -168,7 +174,7 @@ impl TemplateHighlighter {
         let mut parser = Parser::new();
         parser.set_language(&config.language)?;
         let _tree = parser
-            .parse(&processed_content, None)
+            .parse(processed_content, None)
             .ok_or_else(|| anyhow::anyhow!("Failed to parse template content"))?;
 
         let mut temp_config = HighlightConfiguration::new(
@@ -177,6 +183,7 @@ impl TemplateHighlighter {
             match language.to_lowercase().as_str() {
                 "html" => tree_sitter_html::HIGHLIGHTS_QUERY,
                 "thtml" => tree_sitter_html::HIGHLIGHTS_QUERY,
+                "tdom" => tree_sitter_html::HIGHLIGHTS_QUERY,
                 "css" => tree_sitter_css::HIGHLIGHTS_QUERY,
                 "javascript" | "js" => tree_sitter_javascript::HIGHLIGHT_QUERY,
                 "json" => tree_sitter_json::HIGHLIGHTS_QUERY,
@@ -264,6 +271,10 @@ impl TemplateHighlighter {
         template: &TemplateStringInfo,
         language: &str,
     ) -> ProcessedHighlightContent {
+        if language.eq_ignore_ascii_case("tdom") {
+            return Self::prepare_tdom_content_for_highlighting(&template.content);
+        }
+
         let mut processed = String::new();
         let mut processed_to_original = vec![0];
         let mut placeholders = Vec::new();
@@ -297,6 +308,56 @@ impl TemplateHighlighter {
                 }
             }
         }
+
+        ProcessedHighlightContent {
+            content: processed,
+            processed_to_original,
+            placeholders,
+        }
+    }
+
+    fn prepare_tdom_content_for_highlighting(content: &str) -> ProcessedHighlightContent {
+        let mut processed = String::new();
+        let mut processed_to_original = vec![0];
+        let mut placeholders = Vec::new();
+        let mut search_start = 0;
+
+        while let Some(pos) = content[search_start..].find("{}") {
+            let absolute_pos = search_start + pos;
+            Self::append_original_segment(
+                &mut processed,
+                &mut processed_to_original,
+                &content[search_start..absolute_pos],
+                search_start,
+            );
+
+            let placeholder_text = if content[..absolute_pos].ends_with("</")
+                || content[..absolute_pos].ends_with('<')
+            {
+                "tdom_component"
+            } else {
+                "t_linter_expr"
+            };
+            Self::append_placeholder_segment(
+                &mut processed,
+                &mut processed_to_original,
+                placeholder_text,
+                absolute_pos,
+                absolute_pos + 2,
+            );
+            placeholders.push(Placeholder {
+                start: absolute_pos,
+                end: absolute_pos + 2,
+            });
+            search_start = absolute_pos + 2;
+        }
+
+        Self::append_original_segment(
+            &mut processed,
+            &mut processed_to_original,
+            &content[search_start..],
+            search_start,
+        );
 
         ProcessedHighlightContent {
             content: processed,
@@ -380,12 +441,11 @@ impl TemplateHighlighter {
 
     fn placeholder_text_for_language(language: &str) -> &'static str {
         match language.to_ascii_lowercase().as_str() {
-            "html" | "thtml" => "t_linter_expr",
+            "html" | "thtml" | "tdom" => "t_linter_expr",
             "css" | "javascript" | "js" | "json" | "yaml" | "yml" | "toml" | "sql" => "0",
             _ => "t_linter_expr",
         }
     }
-
     pub fn to_lsp_tokens(
         &self,
         ranges: Vec<HighlightedRange>,
@@ -755,6 +815,74 @@ mod tests {
             ranges
                 .iter()
                 .any(|r| r.highlight_name == "variable.parameter")
+        );
+    }
+
+    #[test]
+    fn test_tdom_highlighting() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+
+        let template = make_template(
+            "<{} title={}><span>{}</span></{}>",
+            r#"t"<{Card} title={title}><span>{status}</span></{Card}>""#,
+            "tdom",
+            Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 60,
+            },
+            vec![
+                Expression {
+                    content: "Card".to_string(),
+                    location: Location {
+                        start_line: 1,
+                        start_column: 3,
+                        end_line: 1,
+                        end_column: 7,
+                    },
+                },
+                Expression {
+                    content: "title".to_string(),
+                    location: Location {
+                        start_line: 1,
+                        start_column: 15,
+                        end_line: 1,
+                        end_column: 20,
+                    },
+                },
+                Expression {
+                    content: "status".to_string(),
+                    location: Location {
+                        start_line: 1,
+                        start_column: 29,
+                        end_line: 1,
+                        end_column: 35,
+                    },
+                },
+                Expression {
+                    content: "Card".to_string(),
+                    location: Location {
+                        start_line: 1,
+                        start_column: 44,
+                        end_line: 1,
+                        end_column: 48,
+                    },
+                },
+            ],
+            TemplateStringFlags::default(),
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+
+        assert!(ranges.iter().any(|r| r.highlight_name == "tag"));
+        assert!(ranges.iter().any(|r| r.highlight_name == "attribute"));
+        assert_eq!(
+            ranges
+                .iter()
+                .filter(|r| r.highlight_name == "variable.parameter")
+                .count(),
+            4
         );
     }
 

@@ -8,11 +8,12 @@ use tstring_html as backend_html;
 use tstring_html::{Attribute, AttributeLike, Node as HtmlNode};
 use tstring_json as backend_json;
 use tstring_syntax::Diagnostic;
+use tstring_tdom as backend_tdom;
 use tstring_thtml as backend_thtml;
 use tstring_toml as backend_toml;
 use tstring_yaml as backend_yaml;
 
-use crate::parser::{CallableParameter, CallableValueType, ModuleContext};
+use crate::parser::{CallableParameter, CallableSignature, CallableValueType, ModuleContext};
 use crate::{TemplateStringInfo, TemplateStringParser};
 
 const RULE_EMBEDDED_PARSE_ERROR: &str = "embedded-parse-error";
@@ -212,7 +213,7 @@ fn lint_template(
 
     if matches!(
         language.as_str(),
-        "html" | "thtml" | "json" | "yaml" | "yml" | "toml"
+        "html" | "thtml" | "tdom" | "json" | "yaml" | "yml" | "toml"
     ) {
         return lint_backend_template(
             path,
@@ -281,6 +282,7 @@ fn lint_backend_template(
     let result = match language {
         "html" => backend_html::check_template(&input),
         "thtml" => backend_thtml::check_template(&input),
+        "tdom" => backend_tdom::check_template(&input),
         "json" => backend_json::check_template(&input),
         "yaml" | "yml" => backend_yaml::check_template(&input),
         "toml" => backend_toml::check_template(&input),
@@ -291,6 +293,14 @@ fn lint_backend_template(
         let mut diagnostics = Vec::new();
         if language == "thtml" {
             diagnostics.extend(lint_thtml_component_props(
+                path,
+                source,
+                template,
+                module_context,
+                static_spread_analysis,
+            )?);
+        } else if language == "tdom" {
+            diagnostics.extend(lint_tdom_component_props(
                 path,
                 source,
                 template,
@@ -559,6 +569,7 @@ fn placeholder_for_language(language: &str) -> &'static str {
     match language {
         "html" => "t_linter_expr",
         "thtml" => "t_linter_expr",
+        "tdom" => "t_linter_expr",
         "css" => "0",
         "javascript" => "tLinterExpr",
         "json" => "\"t_linter_expr\"",
@@ -573,6 +584,7 @@ fn normalize_language(language: &str) -> Option<&str> {
     match language.to_ascii_lowercase().as_str() {
         "html" => Some("html"),
         "thtml" => Some("thtml"),
+        "tdom" => Some("tdom"),
         "css" => Some("css"),
         "javascript" | "js" => Some("javascript"),
         "json" => Some("json"),
@@ -595,6 +607,30 @@ fn lint_thtml_component_props(
     let mut diagnostics = Vec::new();
     for child in &document.children {
         lint_thtml_component_node(
+            path,
+            source,
+            template,
+            module_context,
+            static_spread_analysis,
+            child,
+            &mut diagnostics,
+        );
+    }
+    Ok(diagnostics)
+}
+
+fn lint_tdom_component_props(
+    path: &Path,
+    source: &str,
+    template: &TemplateStringInfo,
+    module_context: &ModuleContext,
+    static_spread_analysis: &StaticSpreadAnalysis,
+) -> Result<Vec<LintDiagnostic>> {
+    let document = backend_tdom::prepare_template(&template.to_template_input())
+        .map_err(|error| anyhow::anyhow!(error.message))?;
+    let mut diagnostics = Vec::new();
+    for child in &document.children {
+        lint_tdom_component_node(
             path,
             source,
             template,
@@ -682,6 +718,81 @@ fn lint_thtml_component_node(
     }
 }
 
+fn lint_tdom_component_node(
+    path: &Path,
+    source: &str,
+    template: &TemplateStringInfo,
+    module_context: &ModuleContext,
+    static_spread_analysis: &StaticSpreadAnalysis,
+    node: &backend_tdom::Node,
+    diagnostics: &mut Vec<LintDiagnostic>,
+) {
+    match node {
+        backend_tdom::Node::ComponentTag(component) => {
+            lint_tdom_component_signature(
+                path,
+                source,
+                template,
+                module_context,
+                static_spread_analysis,
+                component,
+                diagnostics,
+            );
+            for child in &component.children {
+                lint_tdom_component_node(
+                    path,
+                    source,
+                    template,
+                    module_context,
+                    static_spread_analysis,
+                    child,
+                    diagnostics,
+                );
+            }
+        }
+        backend_tdom::Node::Element(element) => {
+            for child in &element.children {
+                lint_tdom_component_node(
+                    path,
+                    source,
+                    template,
+                    module_context,
+                    static_spread_analysis,
+                    child,
+                    diagnostics,
+                );
+            }
+        }
+        backend_tdom::Node::RawTextElement(element) => {
+            for child in &element.children {
+                lint_tdom_component_node(
+                    path,
+                    source,
+                    template,
+                    module_context,
+                    static_spread_analysis,
+                    child,
+                    diagnostics,
+                );
+            }
+        }
+        backend_tdom::Node::Fragment(fragment) => {
+            for child in &fragment.children {
+                lint_tdom_component_node(
+                    path,
+                    source,
+                    template,
+                    module_context,
+                    static_spread_analysis,
+                    child,
+                    diagnostics,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 fn lint_component_signature(
     path: &Path,
     source: &str,
@@ -695,6 +806,7 @@ fn lint_component_signature(
         diagnostics.push(make_component_diagnostic(
             path,
             template,
+            "thtml",
             RULE_COMPONENT_UNRESOLVED,
             format!(
                 "Component '{}' is not defined in local or imported callables visible to t-linter.",
@@ -773,6 +885,7 @@ fn lint_component_signature(
             diagnostics.push(make_component_diagnostic(
                 path,
                 template,
+                "thtml",
                 RULE_COMPONENT_UNEXPECTED_PROP,
                 format!(
                     "Component '{}' does not accept prop '{}'.",
@@ -800,6 +913,7 @@ fn lint_component_signature(
         diagnostics.push(make_component_diagnostic(
             path,
             template,
+            "thtml",
             RULE_COMPONENT_MISSING_PROP,
             format!(
                 "Component '{}' is missing required prop '{}'.",
@@ -852,6 +966,7 @@ fn lint_component_attribute_type(
         ComponentAttributeValueKind::BareBoolean => Some(make_component_diagnostic(
             path,
             template,
+            "thtml",
             RULE_COMPONENT_PROP_TYPE_ERROR,
             format!(
                 "Component '{}' prop '{}' expects {}, but bare T-HTML attributes pass boolean true.",
@@ -864,6 +979,7 @@ fn lint_component_attribute_type(
         ComponentAttributeValueKind::StringLike => Some(make_component_diagnostic(
             path,
             template,
+            "thtml",
             RULE_COMPONENT_PROP_TYPE_ERROR,
             format!(
                 "Component '{}' prop '{}' expects {}, but T-HTML attribute syntax passes strings here. Use a spread prop for typed values.",
@@ -876,9 +992,380 @@ fn lint_component_attribute_type(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TdomComponentValueKind {
+    BareBoolean,
+    StringLike,
+    Typed {
+        value_type: Option<CallableValueType>,
+        accepts_none: bool,
+        known: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct TdomResolvedPropValue {
+    name: String,
+    value_kind: TdomComponentValueKind,
+    span: Option<tstring_syntax::SourceSpan>,
+}
+
+fn lint_tdom_component_signature(
+    path: &Path,
+    source: &str,
+    template: &TemplateStringInfo,
+    module_context: &ModuleContext,
+    static_spread_analysis: &StaticSpreadAnalysis,
+    component: &backend_tdom::ComponentTagNode,
+    diagnostics: &mut Vec<LintDiagnostic>,
+) {
+    let Some(signature) =
+        resolve_tdom_component_signature(module_context, &component.start_tag.expression)
+    else {
+        // Be conservative for opaque or instance-callable targets: keep syntax,
+        // check, format, and highlighting support, but skip prop diagnostics.
+        return;
+    };
+
+    if signature.requires_positional {
+        diagnostics.push(make_component_diagnostic(
+            path,
+            template,
+            "tdom",
+            RULE_COMPONENT_PROP_TYPE_ERROR,
+            format!(
+                "Component '{}' cannot be invoked from tdom because it requires positional arguments.",
+                component.start_tag.expression
+            ),
+            component
+                .start_tag
+                .span
+                .as_ref()
+                .or(component.span.as_ref()),
+        ));
+        return;
+    }
+
+    let mut resolved_props = std::collections::BTreeMap::<String, TdomResolvedPropValue>::new();
+    let mut has_unknown_spread = false;
+
+    for attribute in &component.attributes {
+        match attribute {
+            backend_tdom::AttributeLike::LiteralAttribute(attribute) => {
+                let normalized_name = normalize_tdom_prop_name(&attribute.name);
+                resolved_props.insert(
+                    normalized_name.clone(),
+                    TdomResolvedPropValue {
+                        name: normalized_name,
+                        value_kind: if attribute.value.is_some() {
+                            TdomComponentValueKind::StringLike
+                        } else {
+                            TdomComponentValueKind::BareBoolean
+                        },
+                        span: attribute.span.clone(),
+                    },
+                );
+            }
+            backend_tdom::AttributeLike::InterpolatedAttribute(attribute) => {
+                extend_tdom_interpolated_attr_values(
+                    source,
+                    template,
+                    static_spread_analysis,
+                    attribute,
+                    &mut resolved_props,
+                    &mut has_unknown_spread,
+                );
+            }
+            backend_tdom::AttributeLike::TemplatedAttribute(attribute) => {
+                let normalized_name = normalize_tdom_prop_name(&attribute.name);
+                resolved_props.insert(
+                    normalized_name.clone(),
+                    TdomResolvedPropValue {
+                        name: normalized_name,
+                        value_kind: TdomComponentValueKind::StringLike,
+                        span: attribute.span.clone(),
+                    },
+                );
+            }
+            backend_tdom::AttributeLike::SpreadAttribute(spread) => {
+                if let Some(entries) = resolve_static_spread_entries(
+                    source,
+                    template,
+                    static_spread_analysis,
+                    &spread.interpolation.expression,
+                    spread.interpolation.span.as_ref().or(spread.span.as_ref()),
+                ) {
+                    for entry in entries {
+                        let normalized_name = normalize_tdom_prop_name(&entry.key);
+                        resolved_props.insert(
+                            normalized_name.clone(),
+                            TdomResolvedPropValue {
+                                name: normalized_name,
+                                value_kind: TdomComponentValueKind::Typed {
+                                    value_type: entry.value_type,
+                                    accepts_none: entry.accepts_none,
+                                    known: entry.value_type.is_some() || entry.accepts_none,
+                                },
+                                span: spread
+                                    .interpolation
+                                    .span
+                                    .clone()
+                                    .or_else(|| spread.span.clone()),
+                            },
+                        );
+                    }
+                } else {
+                    has_unknown_spread = true;
+                }
+            }
+        }
+    }
+
+    for (prop_name, resolved_prop) in &resolved_props {
+        let Some(parameter) = signature
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == *prop_name && parameter.allows_keyword)
+        else {
+            // Match tdom runtime semantics: unknown attrs are ignored rather than
+            // reported as unexpected props.
+            continue;
+        };
+
+        if let Some(diagnostic) =
+            lint_tdom_component_attribute_type(path, template, component, resolved_prop, parameter)
+        {
+            diagnostics.push(diagnostic);
+        }
+    }
+
+    for parameter in &signature.parameters {
+        if !parameter.required
+            || parameter.name == "children"
+            || parameter.template_language.is_some()
+        {
+            continue;
+        }
+        if resolved_props.contains_key(&parameter.name) {
+            continue;
+        }
+        if has_unknown_spread {
+            continue;
+        }
+
+        diagnostics.push(make_component_diagnostic(
+            path,
+            template,
+            "tdom",
+            RULE_COMPONENT_MISSING_PROP,
+            format!(
+                "Component '{}' is missing required prop '{}'.",
+                component.start_tag.expression, parameter.name
+            ),
+            component
+                .start_tag
+                .span
+                .as_ref()
+                .or(component.span.as_ref()),
+        ));
+    }
+}
+
+fn extend_tdom_interpolated_attr_values(
+    source: &str,
+    template: &TemplateStringInfo,
+    static_spread_analysis: &StaticSpreadAnalysis,
+    attribute: &backend_tdom::InterpolatedAttribute,
+    resolved_props: &mut std::collections::BTreeMap<String, TdomResolvedPropValue>,
+    has_unknown_spread: &mut bool,
+) {
+    if attribute.name == "data" || attribute.name == "aria" {
+        if let Some(entries) = resolve_static_spread_entries(
+            source,
+            template,
+            static_spread_analysis,
+            &attribute.interpolation.expression,
+            attribute
+                .interpolation
+                .span
+                .as_ref()
+                .or(attribute.span.as_ref()),
+        ) {
+            for entry in entries {
+                let expanded_name = format!("{}-{}", attribute.name, entry.key);
+                let normalized_name = normalize_tdom_prop_name(&expanded_name);
+                let value_kind = if attribute.name == "aria" {
+                    TdomComponentValueKind::StringLike
+                } else if matches!(entry.value_type, Some(CallableValueType::Bool))
+                    || entry.accepts_none
+                {
+                    TdomComponentValueKind::Typed {
+                        value_type: entry.value_type,
+                        accepts_none: entry.accepts_none,
+                        known: true,
+                    }
+                } else if entry.value_type.is_some() {
+                    TdomComponentValueKind::StringLike
+                } else {
+                    TdomComponentValueKind::Typed {
+                        value_type: entry.value_type,
+                        accepts_none: entry.accepts_none,
+                        known: false,
+                    }
+                };
+                resolved_props.insert(
+                    normalized_name.clone(),
+                    TdomResolvedPropValue {
+                        name: normalized_name,
+                        value_kind,
+                        span: attribute
+                            .interpolation
+                            .span
+                            .clone()
+                            .or_else(|| attribute.span.clone()),
+                    },
+                );
+            }
+            return;
+        }
+
+        *has_unknown_spread = true;
+        return;
+    }
+
+    let normalized_name = normalize_tdom_prop_name(&attribute.name);
+    let value_kind = if matches!(attribute.name.as_str(), "class" | "style") {
+        TdomComponentValueKind::StringLike
+    } else if let Some((value_type, accepts_none)) =
+        parse_static_value_expression(&attribute.interpolation.expression)
+    {
+        TdomComponentValueKind::Typed {
+            value_type,
+            accepts_none,
+            known: true,
+        }
+    } else {
+        TdomComponentValueKind::Typed {
+            value_type: None,
+            accepts_none: false,
+            known: false,
+        }
+    };
+    resolved_props.insert(
+        normalized_name.clone(),
+        TdomResolvedPropValue {
+            name: normalized_name,
+            value_kind,
+            span: attribute
+                .interpolation
+                .span
+                .clone()
+                .or_else(|| attribute.span.clone()),
+        },
+    );
+}
+
+fn lint_tdom_component_attribute_type(
+    path: &Path,
+    template: &TemplateStringInfo,
+    component: &backend_tdom::ComponentTagNode,
+    resolved_prop: &TdomResolvedPropValue,
+    parameter: &CallableParameter,
+) -> Option<LintDiagnostic> {
+    if parameter.value_types.is_empty() {
+        return None;
+    }
+
+    let span = resolved_prop
+        .span
+        .as_ref()
+        .or(component.start_tag.span.as_ref())
+        .or(component.span.as_ref());
+    let accepts_string = parameter.value_types.contains(&CallableValueType::String);
+    let accepts_bool = parameter.value_types.contains(&CallableValueType::Bool);
+
+    match resolved_prop.value_kind {
+        TdomComponentValueKind::BareBoolean if accepts_bool => None,
+        TdomComponentValueKind::BareBoolean => Some(make_component_diagnostic(
+            path,
+            template,
+            "tdom",
+            RULE_COMPONENT_PROP_TYPE_ERROR,
+            format!(
+                "Component '{}' prop '{}' expects {}, but bare tdom attributes pass boolean true.",
+                component.start_tag.expression,
+                resolved_prop.name,
+                describe_callable_value_types(&parameter.value_types, parameter.accepts_none),
+            ),
+            span,
+        )),
+        TdomComponentValueKind::StringLike if accepts_string => None,
+        TdomComponentValueKind::StringLike => Some(make_component_diagnostic(
+            path,
+            template,
+            "tdom",
+            RULE_COMPONENT_PROP_TYPE_ERROR,
+            format!(
+                "Component '{}' prop '{}' expects {}, but this tdom attribute resolves to a string-like value.",
+                component.start_tag.expression,
+                resolved_prop.name,
+                describe_callable_value_types(&parameter.value_types, parameter.accepts_none),
+            ),
+            span,
+        )),
+        TdomComponentValueKind::Typed {
+            value_type,
+            accepts_none,
+            known,
+        } => {
+            if !known || spread_value_matches_parameter(value_type, accepts_none, parameter) {
+                None
+            } else {
+                Some(make_component_diagnostic(
+                    path,
+                    template,
+                    "tdom",
+                    RULE_COMPONENT_PROP_TYPE_ERROR,
+                    format!(
+                        "Component '{}' prop '{}' expects {}, but the interpolated value resolves to an incompatible type.",
+                        component.start_tag.expression,
+                        resolved_prop.name,
+                        describe_callable_value_types(
+                            &parameter.value_types,
+                            parameter.accepts_none
+                        ),
+                    ),
+                    span,
+                ))
+            }
+        }
+    }
+}
+
+fn resolve_tdom_component_signature<'a>(
+    module_context: &'a ModuleContext,
+    expression: &str,
+) -> Option<&'a CallableSignature> {
+    module_context
+        .callable_signatures
+        .get(expression)
+        .or_else(|| {
+            let (base, suffix) = expression.split_once('.')?;
+            let import_target = module_context.imports.get(base)?;
+            module_context
+                .callable_signatures
+                .get(&format!("{import_target}.{suffix}"))
+        })
+}
+
+fn normalize_tdom_prop_name(name: &str) -> String {
+    name.replace('-', "_").to_ascii_lowercase()
+}
+
 fn make_component_diagnostic(
     path: &Path,
     template: &TemplateStringInfo,
+    language: &str,
     rule: &str,
     message: String,
     span: Option<&tstring_syntax::SourceSpan>,
@@ -891,7 +1378,7 @@ fn make_component_diagnostic(
     LintDiagnostic {
         rule: rule.to_string(),
         severity: LintSeverity::Error,
-        language: Some("thtml".to_string()),
+        language: Some(language.to_string()),
         message,
         file: path.to_path_buf(),
         start_line: location.start_line,
@@ -1085,6 +1572,27 @@ fn parse_static_dictionary_expression(expression: &str) -> Option<StaticDictLite
         None => root,
     };
     parse_static_dictionary_node(dict_node, expression)
+}
+
+fn parse_static_value_expression(expression: &str) -> Option<(Option<CallableValueType>, bool)> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(expression, None)?;
+    let root = tree.root_node();
+    let value_node = match root.named_child(0) {
+        Some(child) if child.kind() == "expression_statement" => child.named_child(0)?,
+        Some(child) => child,
+        None => root,
+    };
+
+    match value_node.kind() {
+        "true" | "false" | "integer" | "float" | "string" | "none" => {
+            Some(parse_static_value_node(value_node))
+        }
+        _ => None,
+    }
 }
 
 fn parse_static_dictionary_node(node: Node<'_>, source: &str) -> Option<StaticDictLiteral> {
@@ -1285,6 +1793,11 @@ def Badge(*, children: str | None = None) -> object:
     return None
 
 "#
+        } else if language == "tdom" {
+            r#"def Card(*, title: str, children: tuple[object, ...] = ()) -> object:
+    return None
+
+"#
         } else {
             ""
         };
@@ -1304,6 +1817,7 @@ value: Annotated[Template, "{language}"] = t"""{python_template}"""
         let valid_cases = [
             ("html", "<div>{}</div>"),
             ("thtml", "<Card title=\"{}\"><Badge>{}</Badge></Card>"),
+            ("tdom", "<{} title={}><span>{}</span></{}>"),
             ("css", "body { color: {}; }"),
             ("javascript", "const value = {};"),
             ("json", r#"{"name": {}, "enabled": true}"#),
@@ -1327,6 +1841,7 @@ value: Annotated[Template, "{language}"] = t"""{python_template}"""
         let invalid_cases = [
             ("html", "<div><"),
             ("thtml", "<Card><"),
+            ("tdom", "<{}></div>"),
             ("css", "body { color: ; }"),
             ("javascript", "function {"),
             ("json", "[1,,2]"),

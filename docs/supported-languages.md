@@ -4,30 +4,18 @@ t-linter supports syntax highlighting and validation for the following embedded 
 
 ## Language Detection
 
-Languages are detected through direct annotations, function parameter
-annotations, and type aliases. The examples below use typed helper functions so
-you can run them through `t-linter check` as-is:
+Languages are detected through direct annotations, function parameter annotations, type aliases, and supported callee inference such as `tdom.html(...)`.
 
 ```python
 from typing import Annotated
 from string.templatelib import Template
 
-def render_html(template: Annotated[Template, "html"]) -> None:
-    pass
+# Direct annotation
+template: Annotated[Template, "html"] = t"<p>{content}</p>"
 
-content = "Hello from t-linter"
-render_html(t"<p>{content}</p>")
-
-# Type alias reused by another helper
+# Type alias
 type html = Annotated[Template, "html"]
-
-
-def render_page(template: html) -> None:
-    pass
-
-
-page_content = "Reused through a type alias"
-render_page(t"<div>{page_content}</div>")
+page: html = t"<div>{content}</div>"
 ```
 
 ## Supported Languages
@@ -36,6 +24,7 @@ render_page(t"<div>{page_content}</div>")
 |----------|-----------|:-----:|:------:|:---------:|--------|
 | **HTML** | `"html"` | ✅ | ✅ | ✅ | `tstring-html` backend |
 | **T-HTML** | `"thtml"` | ✅ | ✅ | ✅ | `tstring-thtml` backend |
+| **TDOM** | `"tdom"` | ✅ | ✅ | ✅ | `tstring-tdom` backend |
 | **JSON** | `"json"` | ✅ | ✅ | ✅ | `tstring-json` backend |
 | **YAML** | `"yaml"`, `"yml"` | ✅ | ✅ | ✅ | `tstring-yaml` backend |
 | **TOML** | `"toml"` | ✅ | ✅ | ✅ | `tstring-toml` backend |
@@ -49,7 +38,7 @@ render_page(t"<div>{page_content}</div>")
 
 ## Backend-powered vs Tree-sitter Languages
 
-For backend-powered languages (HTML, T-HTML, JSON, YAML, TOML), t-linter splits responsibilities:
+For backend-powered languages (HTML, T-HTML, TDOM, JSON, YAML, TOML), t-linter splits responsibilities:
 
 - **Highlighting**: Tree-sitter only, for low-latency semantic tokens
 - **Validation**: Strict parsing through the dedicated Rust backends (`tstring-*` crates)
@@ -135,6 +124,14 @@ render_thtml(t"""
 </Card>
 """)
 
+from tdom import html
+
+page = html(t"""
+<{Card} title={title}>
+    <span>{status}</span>
+</{Card}>
+""")
+
 user_id = 42
 run_sql(t"""
 SELECT * FROM users WHERE id = {user_id}
@@ -177,5 +174,4 @@ version = "{version}"
 """)
 ```
 
-Use `{{` and `}}` when the embedded language needs literal braces, such as CSS
-or JSON objects.
+Use `{{` and `}}` when the embedded language needs literal braces, such as CSS or JSON objects.

@@ -1,15 +1,19 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
 
 fn test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let unique_id = NEXT_TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "t-linter-docs-{name}-{}-{nanos}",
+        "t-linter-docs-{name}-{}-{nanos}-{unique_id}",
         std::process::id()
     ));
     fs::create_dir_all(&dir).unwrap();
@@ -123,10 +127,10 @@ fn supported_languages_detection_example_stays_lintable() {
 
 #[test]
 fn supported_languages_examples_stay_lintable() {
-    assert_doc_example_is_clean("docs/supported-languages.md", "## Examples", 8);
+    assert_doc_example_is_clean("docs/supported-languages.md", "## Examples", 9);
 }
 
 #[test]
 fn llms_full_supported_languages_examples_stay_lintable() {
-    assert_doc_example_is_clean("docs/llms-full.txt", "## Examples", 8);
+    assert_doc_example_is_clean("docs/llms-full.txt", "## Examples", 9);
 }
