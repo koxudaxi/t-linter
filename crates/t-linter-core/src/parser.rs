@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::Chars;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
@@ -1304,12 +1306,12 @@ impl TemplateStringParser {
 
                     if last_end_byte > 0 && start_byte > last_end_byte {
                         let between = &source[last_end_byte..start_byte];
-                        push_static_part(&mut content_parts, &mut parts, between);
+                        push_static_part(&mut content_parts, &mut parts, between, between);
                     }
 
                     let text = child.utf8_text(source.as_bytes())?;
                     let processed_content = unescape_template_text(text, is_raw);
-                    push_static_part(&mut content_parts, &mut parts, &processed_content);
+                    push_static_part(&mut content_parts, &mut parts, &processed_content, text);
                     last_end_byte = end_byte;
                 }
                 "interpolation" => {
@@ -1317,7 +1319,7 @@ impl TemplateStringParser {
 
                     if last_end_byte > 0 && start_byte > last_end_byte {
                         let between = &source[last_end_byte..start_byte];
-                        push_static_part(&mut content_parts, &mut parts, between);
+                        push_static_part(&mut content_parts, &mut parts, between, between);
                     }
 
                     content_parts.push("{}".to_string());
@@ -1341,14 +1343,14 @@ impl TemplateStringParser {
 
                     if last_end_byte > 0 && start_byte > last_end_byte {
                         let between = &source[last_end_byte..start_byte];
-                        push_static_part(&mut content_parts, &mut parts, between);
+                        push_static_part(&mut content_parts, &mut parts, between, between);
                     }
 
                     let text = child.utf8_text(source.as_bytes())?;
                     if text == "{{" {
-                        push_static_part(&mut content_parts, &mut parts, "{");
+                        push_static_part(&mut content_parts, &mut parts, "{", "{{");
                     } else if text == "}}" {
-                        push_static_part(&mut content_parts, &mut parts, "}");
+                        push_static_part(&mut content_parts, &mut parts, "}", "}}");
                     }
 
                     last_end_byte = child.end_byte();
@@ -1360,7 +1362,7 @@ impl TemplateStringParser {
                     let start_byte = child.start_byte();
                     if last_end_byte > 0 && start_byte > last_end_byte {
                         let between = &source[last_end_byte..start_byte];
-                        push_static_part(&mut content_parts, &mut parts, between);
+                        push_static_part(&mut content_parts, &mut parts, between, between);
                     }
                     last_end_byte = child.end_byte();
                 }
@@ -3723,6 +3725,7 @@ pub enum TemplatePart {
 #[derive(Debug, Clone)]
 pub struct StaticTextSegment {
     pub text: String,
+    pub raw_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -3850,7 +3853,8 @@ impl TemplateStringInfo {
         let template_start_col = self.location.start_column - 1;
 
         let (start_line, start_col) = map_template_position_to_document(
-            &self.content,
+            &self.parts,
+            self.flags.is_raw,
             actual_content,
             start_offset,
             template_start_line,
@@ -3858,7 +3862,8 @@ impl TemplateStringInfo {
             prefix_len,
         );
         let (end_line, end_col) = map_template_position_to_document(
-            &self.content,
+            &self.parts,
+            self.flags.is_raw,
             actual_content,
             end_offset,
             template_start_line,
@@ -3894,67 +3899,217 @@ fn formatting_wrapper_location(node: Node) -> Option<Location> {
     })
 }
 
-fn push_static_part(content_parts: &mut Vec<String>, parts: &mut Vec<TemplatePart>, text: &str) {
-    if text.is_empty() {
+fn push_static_part(
+    content_parts: &mut Vec<String>,
+    parts: &mut Vec<TemplatePart>,
+    text: &str,
+    raw_text: &str,
+) {
+    if text.is_empty() && raw_text.is_empty() {
         return;
     }
 
     let text = text.to_string();
+    let raw_text = raw_text.to_string();
     content_parts.push(text.clone());
-    parts.push(TemplatePart::Static(StaticTextSegment { text }));
+    parts.push(TemplatePart::Static(StaticTextSegment { text, raw_text }));
+}
+
+struct DecodedTemplateUnit {
+    decoded: String,
+    raw_len: usize,
 }
 
 fn unescape_template_text(text: &str, is_raw: bool) -> String {
     let mut processed_content = String::new();
-    let mut chars = text.chars();
+    let mut chars = text.chars().peekable();
 
-    while let Some(ch) = chars.next() {
-        if !is_raw
-            && ch == '\\'
-            && let Some(next_ch) = chars.next()
-        {
-            match next_ch {
-                '\\' => processed_content.push('\\'),
-                '\'' => processed_content.push('\''),
-                '"' => processed_content.push('"'),
-                'n' => processed_content.push('\n'),
-                'r' => processed_content.push('\r'),
-                't' => processed_content.push('\t'),
-                '0' => processed_content.push('\0'),
-                'b' => processed_content.push('\u{0008}'),
-                'f' => processed_content.push('\u{000C}'),
-                _ => {
-                    processed_content.push('\\');
-                    processed_content.push(next_ch);
-                }
-            }
-            continue;
-        }
-
-        if ch == '{' {
-            if let Some(next_ch) = chars.clone().next()
-                && next_ch == '{'
-            {
-                processed_content.push('{');
-                chars.next();
-                continue;
-            }
-        } else if ch == '}'
-            && let Some(next_ch) = chars.clone().next()
-            && next_ch == '}'
-        {
-            processed_content.push('}');
-            chars.next();
-            continue;
-        }
-        processed_content.push(ch);
+    while let Some(unit) = next_template_unit(&mut chars, is_raw) {
+        processed_content.push_str(&unit.decoded);
     }
 
     processed_content
 }
 
+fn next_template_unit(chars: &mut Peekable<Chars<'_>>, is_raw: bool) -> Option<DecodedTemplateUnit> {
+    let ch = chars.next()?;
+
+    if !is_raw
+        && ch == '\\'
+        && let Some((decoded, extra_raw_len)) = decode_python_escape(chars)
+    {
+        return Some(DecodedTemplateUnit {
+            decoded,
+            raw_len: ch.len_utf8() + extra_raw_len,
+        });
+    }
+
+    if ch == '{' && chars.peek() == Some(&'{') {
+        chars.next();
+        return Some(DecodedTemplateUnit {
+            decoded: "{".to_string(),
+            raw_len: 2,
+        });
+    }
+
+    if ch == '}' && chars.peek() == Some(&'}') {
+        chars.next();
+        return Some(DecodedTemplateUnit {
+            decoded: "}".to_string(),
+            raw_len: 2,
+        });
+    }
+
+    Some(DecodedTemplateUnit {
+        decoded: ch.to_string(),
+        raw_len: ch.len_utf8(),
+    })
+}
+
+fn decode_python_escape(chars: &mut Peekable<Chars<'_>>) -> Option<(String, usize)> {
+    let mut probe = chars.clone();
+    let next = probe.next()?;
+
+    let simple_escape = match next {
+        '\\' => Some('\\'),
+        '\'' => Some('\''),
+        '"' => Some('"'),
+        'a' => Some('\u{0007}'),
+        'b' => Some('\u{0008}'),
+        'f' => Some('\u{000C}'),
+        'n' => Some('\n'),
+        'r' => Some('\r'),
+        't' => Some('\t'),
+        'v' => Some('\u{000B}'),
+        _ => None,
+    };
+    if let Some(ch) = simple_escape {
+        advance_chars(chars, 1);
+        return Some((ch.to_string(), 1));
+    }
+
+    match next {
+        '\n' => {
+            advance_chars(chars, 1);
+            Some((String::new(), 1))
+        }
+        '\r' => {
+            let mut consumed = 1;
+            if probe.next() == Some('\n') {
+                consumed += 1;
+            }
+            advance_chars(chars, consumed);
+            Some((String::new(), consumed))
+        }
+        'x' => decode_fixed_width_escape(chars, 2, 16),
+        'u' => decode_fixed_width_escape(chars, 4, 16),
+        'U' => decode_fixed_width_escape(chars, 8, 16),
+        'N' => decode_named_escape(chars),
+        '0'..='7' => decode_octal_escape(chars),
+        _ => None,
+    }
+}
+
+fn decode_fixed_width_escape(chars: &mut Peekable<Chars<'_>>, digits: usize, radix: u32) -> Option<(String, usize)> {
+    let mut probe = chars.clone();
+    let prefix = probe.next()?;
+    let mut raw = String::new();
+    raw.push(prefix);
+
+    for _ in 0..digits {
+        let ch = probe.next()?;
+        if !ch.is_digit(radix) {
+            return None;
+        }
+        raw.push(ch);
+    }
+
+    let value = u32::from_str_radix(&raw[1..], radix).ok()?;
+    let decoded = char::from_u32(value)?;
+    advance_chars(chars, raw.len());
+    Some((decoded.to_string(), raw.len()))
+}
+
+fn decode_octal_escape(chars: &mut Peekable<Chars<'_>>) -> Option<(String, usize)> {
+    let mut probe = chars.clone();
+    let first = probe.next()?;
+    let mut digits = String::new();
+    digits.push(first);
+
+    while digits.len() < 3 {
+        let Some(next) = probe.peek().copied() else {
+            break;
+        };
+        if !matches!(next, '0'..='7') {
+            break;
+        }
+        digits.push(probe.next().expect("peeked char should exist"));
+    }
+
+    let value = u32::from_str_radix(&digits, 8).ok()?;
+    let decoded = char::from_u32(value)?;
+    advance_chars(chars, digits.len());
+    Some((decoded.to_string(), digits.len()))
+}
+
+fn decode_named_escape(chars: &mut Peekable<Chars<'_>>) -> Option<(String, usize)> {
+    let mut probe = chars.clone();
+    if probe.next()? != 'N' || probe.next()? != '{' {
+        return None;
+    }
+
+    let mut name = String::new();
+    let mut raw_len = 2;
+    while let Some(ch) = probe.next() {
+        raw_len += ch.len_utf8();
+        if ch == '}' {
+            let decoded = unicode_names2::character(&name)?;
+            advance_chars(chars, raw_len);
+            return Some((decoded.to_string(), raw_len));
+        }
+        name.push(ch);
+    }
+
+    None
+}
+
+fn advance_chars(chars: &mut Peekable<Chars<'_>>, count: usize) {
+    for _ in 0..count {
+        chars.next();
+    }
+}
+
+pub(crate) fn raw_static_prefix_len(
+    segment: &StaticTextSegment,
+    decoded_prefix_len: usize,
+    is_raw: bool,
+) -> usize {
+    if decoded_prefix_len == 0 || segment.raw_text.is_empty() {
+        return 0;
+    }
+
+    if segment.text.len() <= decoded_prefix_len {
+        return segment.raw_text.len();
+    }
+
+    let mut raw_chars = segment.raw_text.chars().peekable();
+    let mut decoded_bytes = 0;
+    let mut consumed_raw_bytes = 0;
+
+    while decoded_bytes < decoded_prefix_len {
+        let Some(unit) = next_template_unit(&mut raw_chars, is_raw) else {
+            break;
+        };
+        consumed_raw_bytes += unit.raw_len;
+        decoded_bytes += unit.decoded.len();
+    }
+
+    consumed_raw_bytes
+}
+
 fn map_template_position_to_document(
-    template_content: &str,
+    parts: &[TemplatePart],
+    is_raw: bool,
     actual_content: &str,
     position_in_template: usize,
     template_start_line: usize,
@@ -3963,28 +4118,30 @@ fn map_template_position_to_document(
 ) -> (usize, usize) {
     let mut template_idx = 0;
     let mut actual_idx = 0;
-    let template_bytes = template_content.as_bytes();
     let actual_bytes = actual_content.as_bytes();
+    let mut part_iter = parts.iter();
 
     while template_idx < position_in_template && actual_idx < actual_bytes.len() {
-        if template_idx + 1 < template_bytes.len()
-            && template_bytes[template_idx] == b'{'
-            && template_bytes[template_idx + 1] == b'}'
-        {
-            if actual_idx < actual_bytes.len() && actual_bytes[actual_idx] == b'{' {
-                let mut expr_end = actual_idx + 1;
-                while expr_end < actual_bytes.len() && actual_bytes[expr_end] != b'}' {
-                    expr_end += 1;
-                }
-                if expr_end < actual_bytes.len() {
-                    expr_end += 1;
-                }
-                actual_idx = expr_end;
+        let Some(part) = part_iter.next() else {
+            break;
+        };
+
+        match part {
+            TemplatePart::Static(part) => {
+                let remaining_template = position_in_template - template_idx;
+                let consumed = remaining_template.min(part.text.len());
+                template_idx += consumed;
+                actual_idx =
+                    (actual_idx + raw_static_prefix_len(part, consumed, is_raw)).min(actual_bytes.len());
             }
-            template_idx += 2;
-        } else {
-            template_idx += 1;
-            actual_idx += 1;
+            TemplatePart::Interpolation(part) => {
+                if template_idx + 2 <= position_in_template {
+                    template_idx += 2;
+                    actual_idx = (actual_idx + part.raw_source.len()).min(actual_bytes.len());
+                } else {
+                    break;
+                }
+            }
         }
     }
 
@@ -4235,6 +4392,41 @@ html = t"""
         assert_eq!(templates[0].content, "Use {braces} in {}");
         assert_eq!(templates[0].expressions.len(), 1);
         assert_eq!(templates[0].expressions[0].content, "var");
+    }
+
+    #[test]
+    fn test_raw_static_prefix_len_handles_known_and_unknown_escapes() {
+        let unknown_escape = StaticTextSegment {
+            text: r#"\q<span>"#.to_string(),
+            raw_text: r#"\q<span>"#.to_string(),
+        };
+        assert_eq!(raw_static_prefix_len(&unknown_escape, 1, false), 1);
+        assert_eq!(raw_static_prefix_len(&unknown_escape, 2, false), 2);
+
+        let known_escape = StaticTextSegment {
+            text: "\n<span>".to_string(),
+            raw_text: r#"\n<span>"#.to_string(),
+        };
+        assert_eq!(raw_static_prefix_len(&known_escape, 1, false), 2);
+        assert_eq!(raw_static_prefix_len(&known_escape, 2, false), 3);
+
+        let unicode_escape = StaticTextSegment {
+            text: "A<span>".to_string(),
+            raw_text: r#"\u0041<span>"#.to_string(),
+        };
+        assert_eq!(raw_static_prefix_len(&unicode_escape, 1, false), 6);
+
+        let named_escape = StaticTextSegment {
+            text: "A<span>".to_string(),
+            raw_text: r#"\N{LATIN CAPITAL LETTER A}<span>"#.to_string(),
+        };
+        assert_eq!(raw_static_prefix_len(&named_escape, 1, false), 26);
+
+        let continued_line = StaticTextSegment {
+            text: "<span>".to_string(),
+            raw_text: "\\\n<span>".to_string(),
+        };
+        assert_eq!(raw_static_prefix_len(&continued_line, 1, false), 3);
     }
 
     #[test]
