@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::Chars;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
@@ -1304,12 +1306,12 @@ impl TemplateStringParser {
 
                     if last_end_byte > 0 && start_byte > last_end_byte {
                         let between = &source[last_end_byte..start_byte];
-                        push_static_part(&mut content_parts, &mut parts, between);
+                        push_static_part(&mut content_parts, &mut parts, between, between);
                     }
 
                     let text = child.utf8_text(source.as_bytes())?;
                     let processed_content = unescape_template_text(text, is_raw);
-                    push_static_part(&mut content_parts, &mut parts, &processed_content);
+                    push_static_part(&mut content_parts, &mut parts, &processed_content, text);
                     last_end_byte = end_byte;
                 }
                 "interpolation" => {
@@ -1317,7 +1319,7 @@ impl TemplateStringParser {
 
                     if last_end_byte > 0 && start_byte > last_end_byte {
                         let between = &source[last_end_byte..start_byte];
-                        push_static_part(&mut content_parts, &mut parts, between);
+                        push_static_part(&mut content_parts, &mut parts, between, between);
                     }
 
                     content_parts.push("{}".to_string());
@@ -1341,14 +1343,14 @@ impl TemplateStringParser {
 
                     if last_end_byte > 0 && start_byte > last_end_byte {
                         let between = &source[last_end_byte..start_byte];
-                        push_static_part(&mut content_parts, &mut parts, between);
+                        push_static_part(&mut content_parts, &mut parts, between, between);
                     }
 
                     let text = child.utf8_text(source.as_bytes())?;
                     if text == "{{" {
-                        push_static_part(&mut content_parts, &mut parts, "{");
+                        push_static_part(&mut content_parts, &mut parts, "{", "{{");
                     } else if text == "}}" {
-                        push_static_part(&mut content_parts, &mut parts, "}");
+                        push_static_part(&mut content_parts, &mut parts, "}", "}}");
                     }
 
                     last_end_byte = child.end_byte();
@@ -1360,7 +1362,7 @@ impl TemplateStringParser {
                     let start_byte = child.start_byte();
                     if last_end_byte > 0 && start_byte > last_end_byte {
                         let between = &source[last_end_byte..start_byte];
-                        push_static_part(&mut content_parts, &mut parts, between);
+                        push_static_part(&mut content_parts, &mut parts, between, between);
                     }
                     last_end_byte = child.end_byte();
                 }
@@ -3723,6 +3725,7 @@ pub enum TemplatePart {
 #[derive(Debug, Clone)]
 pub struct StaticTextSegment {
     pub text: String,
+    pub raw_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -3820,9 +3823,12 @@ impl TemplateStringInfo {
 
     fn token_position_to_content_offset(&self, position: &SourcePosition) -> usize {
         let mut offset = 0;
+        let mut visible_token_index = 0;
 
-        for (token_index, part) in self.parts.iter().enumerate() {
-            if token_index == position.token_index {
+        for part in &self.parts {
+            let contributes_token = !matches!(part, TemplatePart::Static(part) if part.text.is_empty());
+
+            if contributes_token && visible_token_index == position.token_index {
                 return match part {
                     TemplatePart::Static(part) => offset + position.offset.min(part.text.len()),
                     TemplatePart::Interpolation(_) => offset + position.offset.min(2),
@@ -3833,6 +3839,10 @@ impl TemplateStringInfo {
                 TemplatePart::Static(part) => part.text.len(),
                 TemplatePart::Interpolation(_) => 2,
             };
+
+            if contributes_token {
+                visible_token_index += 1;
+            }
         }
 
         offset
@@ -3850,7 +3860,8 @@ impl TemplateStringInfo {
         let template_start_col = self.location.start_column - 1;
 
         let (start_line, start_col) = map_template_position_to_document(
-            &self.content,
+            &self.parts,
+            self.flags.is_raw,
             actual_content,
             start_offset,
             template_start_line,
@@ -3858,7 +3869,8 @@ impl TemplateStringInfo {
             prefix_len,
         );
         let (end_line, end_col) = map_template_position_to_document(
-            &self.content,
+            &self.parts,
+            self.flags.is_raw,
             actual_content,
             end_offset,
             template_start_line,
@@ -3894,67 +3906,218 @@ fn formatting_wrapper_location(node: Node) -> Option<Location> {
     })
 }
 
-fn push_static_part(content_parts: &mut Vec<String>, parts: &mut Vec<TemplatePart>, text: &str) {
-    if text.is_empty() {
+fn push_static_part(
+    content_parts: &mut Vec<String>,
+    parts: &mut Vec<TemplatePart>,
+    text: &str,
+    raw_text: &str,
+) {
+    if text.is_empty() && raw_text.is_empty() {
         return;
     }
 
     let text = text.to_string();
+    let raw_text = raw_text.to_string();
     content_parts.push(text.clone());
-    parts.push(TemplatePart::Static(StaticTextSegment { text }));
+    parts.push(TemplatePart::Static(StaticTextSegment { text, raw_text }));
+}
+
+struct DecodedTemplateUnit {
+    decoded: String,
+    raw_len: usize,
 }
 
 fn unescape_template_text(text: &str, is_raw: bool) -> String {
     let mut processed_content = String::new();
-    let mut chars = text.chars();
+    let mut chars = text.chars().peekable();
 
-    while let Some(ch) = chars.next() {
-        if !is_raw
-            && ch == '\\'
-            && let Some(next_ch) = chars.next()
-        {
-            match next_ch {
-                '\\' => processed_content.push('\\'),
-                '\'' => processed_content.push('\''),
-                '"' => processed_content.push('"'),
-                'n' => processed_content.push('\n'),
-                'r' => processed_content.push('\r'),
-                't' => processed_content.push('\t'),
-                '0' => processed_content.push('\0'),
-                'b' => processed_content.push('\u{0008}'),
-                'f' => processed_content.push('\u{000C}'),
-                _ => {
-                    processed_content.push('\\');
-                    processed_content.push(next_ch);
-                }
-            }
-            continue;
-        }
-
-        if ch == '{' {
-            if let Some(next_ch) = chars.clone().next()
-                && next_ch == '{'
-            {
-                processed_content.push('{');
-                chars.next();
-                continue;
-            }
-        } else if ch == '}'
-            && let Some(next_ch) = chars.clone().next()
-            && next_ch == '}'
-        {
-            processed_content.push('}');
-            chars.next();
-            continue;
-        }
-        processed_content.push(ch);
+    while let Some(unit) = next_template_unit(&mut chars, is_raw) {
+        processed_content.push_str(&unit.decoded);
     }
 
     processed_content
 }
 
+fn next_template_unit(chars: &mut Peekable<Chars<'_>>, is_raw: bool) -> Option<DecodedTemplateUnit> {
+    let ch = chars.next()?;
+
+    if !is_raw
+        && ch == '\\'
+        && let Some((decoded, extra_raw_len)) = decode_python_escape(chars)
+    {
+        return Some(DecodedTemplateUnit {
+            decoded,
+            raw_len: ch.len_utf8() + extra_raw_len,
+        });
+    }
+
+    if ch == '{' && chars.peek() == Some(&'{') {
+        chars.next();
+        return Some(DecodedTemplateUnit {
+            decoded: "{".to_string(),
+            raw_len: 2,
+        });
+    }
+
+    if ch == '}' && chars.peek() == Some(&'}') {
+        chars.next();
+        return Some(DecodedTemplateUnit {
+            decoded: "}".to_string(),
+            raw_len: 2,
+        });
+    }
+
+    Some(DecodedTemplateUnit {
+        decoded: ch.to_string(),
+        raw_len: ch.len_utf8(),
+    })
+}
+
+fn decode_python_escape(chars: &mut Peekable<Chars<'_>>) -> Option<(String, usize)> {
+    let mut probe = chars.clone();
+    let next = probe.next()?;
+
+    let simple_escape = match next {
+        '\\' => Some('\\'),
+        '\'' => Some('\''),
+        '"' => Some('"'),
+        'a' => Some('\u{0007}'),
+        'b' => Some('\u{0008}'),
+        'f' => Some('\u{000C}'),
+        'n' => Some('\n'),
+        'r' => Some('\r'),
+        't' => Some('\t'),
+        'v' => Some('\u{000B}'),
+        _ => None,
+    };
+    if let Some(ch) = simple_escape {
+        advance_chars(chars, 1);
+        return Some((ch.to_string(), 1));
+    }
+
+    match next {
+        '\n' => {
+            advance_chars(chars, 1);
+            Some((String::new(), 1))
+        }
+        '\r' => {
+            let mut consumed = 1;
+            if probe.next() == Some('\n') {
+                consumed += 1;
+            }
+            advance_chars(chars, consumed);
+            Some((String::new(), consumed))
+        }
+        'x' => decode_fixed_width_escape(chars, 2, 16),
+        'u' => decode_fixed_width_escape(chars, 4, 16),
+        'U' => decode_fixed_width_escape(chars, 8, 16),
+        'N' => decode_named_escape(chars),
+        '0'..='7' => decode_octal_escape(chars),
+        _ => None,
+    }
+}
+
+fn decode_fixed_width_escape(chars: &mut Peekable<Chars<'_>>, digits: usize, radix: u32) -> Option<(String, usize)> {
+    let mut probe = chars.clone();
+    let prefix = probe.next()?;
+    let mut raw = String::new();
+    raw.push(prefix);
+
+    for _ in 0..digits {
+        let ch = probe.next()?;
+        if !ch.is_digit(radix) {
+            return None;
+        }
+        raw.push(ch);
+    }
+
+    let value = u32::from_str_radix(&raw[1..], radix).ok()?;
+    let decoded = char::from_u32(value)?;
+    advance_chars(chars, raw.len());
+    Some((decoded.to_string(), raw.len()))
+}
+
+fn decode_octal_escape(chars: &mut Peekable<Chars<'_>>) -> Option<(String, usize)> {
+    let mut probe = chars.clone();
+    let first = probe.next()?;
+    let mut digits = String::new();
+    digits.push(first);
+
+    while digits.len() < 3 {
+        let Some(next) = probe.peek().copied() else {
+            break;
+        };
+        if !matches!(next, '0'..='7') {
+            break;
+        }
+        digits.push(probe.next().expect("peeked char should exist"));
+    }
+
+    let value = u32::from_str_radix(&digits, 8).ok()?;
+    let decoded = char::from_u32(value)?;
+    advance_chars(chars, digits.len());
+    Some((decoded.to_string(), digits.len()))
+}
+
+fn decode_named_escape(chars: &mut Peekable<Chars<'_>>) -> Option<(String, usize)> {
+    let mut probe = chars.clone();
+    if probe.next()? != 'N' || probe.next()? != '{' {
+        return None;
+    }
+
+    let mut name = String::new();
+    let mut raw_len = 2;
+    while let Some(ch) = probe.next() {
+        raw_len += ch.len_utf8();
+        if ch == '}' {
+            let decoded = unicode_names2::character(&name)?;
+            advance_chars(chars, raw_len);
+            return Some((decoded.to_string(), raw_len));
+        }
+        name.push(ch);
+    }
+
+    None
+}
+
+fn advance_chars(chars: &mut Peekable<Chars<'_>>, count: usize) {
+    for _ in 0..count {
+        chars.next();
+    }
+}
+
+pub(crate) fn raw_static_prefix_len(
+    segment: &StaticTextSegment,
+    decoded_prefix_len: usize,
+    is_raw: bool,
+) -> usize {
+    if segment.raw_text.is_empty() {
+        return 0;
+    }
+
+    if segment.text.len() <= decoded_prefix_len {
+        return segment.raw_text.len();
+    }
+
+    let mut raw_chars = segment.raw_text.chars().peekable();
+    let mut decoded_bytes = 0;
+    let mut consumed_raw_bytes = 0;
+
+    while let Some(unit) = next_template_unit(&mut raw_chars, is_raw) {
+        if !unit.decoded.is_empty() && decoded_bytes >= decoded_prefix_len {
+            break;
+        }
+
+        consumed_raw_bytes += unit.raw_len;
+        decoded_bytes += unit.decoded.len();
+    }
+
+    consumed_raw_bytes
+}
+
 fn map_template_position_to_document(
-    template_content: &str,
+    parts: &[TemplatePart],
+    is_raw: bool,
     actual_content: &str,
     position_in_template: usize,
     template_start_line: usize,
@@ -3963,28 +4126,43 @@ fn map_template_position_to_document(
 ) -> (usize, usize) {
     let mut template_idx = 0;
     let mut actual_idx = 0;
-    let template_bytes = template_content.as_bytes();
     let actual_bytes = actual_content.as_bytes();
+    let mut part_iter = parts.iter();
 
-    while template_idx < position_in_template && actual_idx < actual_bytes.len() {
-        if template_idx + 1 < template_bytes.len()
-            && template_bytes[template_idx] == b'{'
-            && template_bytes[template_idx + 1] == b'}'
-        {
-            if actual_idx < actual_bytes.len() && actual_bytes[actual_idx] == b'{' {
-                let mut expr_end = actual_idx + 1;
-                while expr_end < actual_bytes.len() && actual_bytes[expr_end] != b'}' {
-                    expr_end += 1;
+    while actual_idx < actual_bytes.len() {
+        let Some(part) = part_iter.next() else {
+            break;
+        };
+
+        match part {
+            TemplatePart::Static(part) => {
+                if part.text.is_empty() {
+                    actual_idx = (actual_idx + part.raw_text.len()).min(actual_bytes.len());
+                    continue;
                 }
-                if expr_end < actual_bytes.len() {
-                    expr_end += 1;
+
+                let remaining_template = position_in_template.saturating_sub(template_idx);
+                let consumed = remaining_template.min(part.text.len());
+                actual_idx =
+                    (actual_idx + raw_static_prefix_len(part, consumed, is_raw)).min(actual_bytes.len());
+                template_idx += consumed;
+
+                if consumed < part.text.len() {
+                    break;
                 }
-                actual_idx = expr_end;
             }
-            template_idx += 2;
-        } else {
-            template_idx += 1;
-            actual_idx += 1;
+            TemplatePart::Interpolation(part) => {
+                if template_idx >= position_in_template {
+                    break;
+                }
+
+                if template_idx + 2 <= position_in_template {
+                    template_idx += 2;
+                    actual_idx = (actual_idx + part.raw_source.len()).min(actual_bytes.len());
+                } else {
+                    break;
+                }
+            }
         }
     }
 
@@ -4235,6 +4413,237 @@ html = t"""
         assert_eq!(templates[0].content, "Use {braces} in {}");
         assert_eq!(templates[0].expressions.len(), 1);
         assert_eq!(templates[0].expressions[0].content, "var");
+    }
+
+    #[test]
+    fn test_raw_static_prefix_len_handles_known_and_unknown_escapes() {
+        let unknown_escape = StaticTextSegment {
+            text: r#"\q<span>"#.to_string(),
+            raw_text: r#"\q<span>"#.to_string(),
+        };
+        assert_eq!(raw_static_prefix_len(&unknown_escape, 1, false), 1);
+        assert_eq!(raw_static_prefix_len(&unknown_escape, 2, false), 2);
+
+        let known_escape = StaticTextSegment {
+            text: "\n<span>".to_string(),
+            raw_text: r#"\n<span>"#.to_string(),
+        };
+        assert_eq!(raw_static_prefix_len(&known_escape, 1, false), 2);
+        assert_eq!(raw_static_prefix_len(&known_escape, 2, false), 3);
+
+        let unicode_escape = StaticTextSegment {
+            text: "A<span>".to_string(),
+            raw_text: r#"\u0041<span>"#.to_string(),
+        };
+        assert_eq!(raw_static_prefix_len(&unicode_escape, 1, false), 6);
+
+        let named_escape = StaticTextSegment {
+            text: "A<span>".to_string(),
+            raw_text: r#"\N{LATIN CAPITAL LETTER A}<span>"#.to_string(),
+        };
+        assert_eq!(raw_static_prefix_len(&named_escape, 1, false), 26);
+
+        let continued_line = StaticTextSegment {
+            text: "<span>".to_string(),
+            raw_text: "\\\n<span>".to_string(),
+        };
+        assert_eq!(raw_static_prefix_len(&continued_line, 0, false), 2);
+        assert_eq!(raw_static_prefix_len(&continued_line, 1, false), 3);
+    }
+
+    #[test]
+    fn test_raw_static_prefix_len_boundary_cases() {
+        let cases = [
+            (
+                StaticTextSegment {
+                    text: "AB".to_string(),
+                    raw_text: "A\\\nB".to_string(),
+                },
+                vec![(0, 0), (1, 3), (2, 4)],
+            ),
+            (
+                StaticTextSegment {
+                    text: "<span>".to_string(),
+                    raw_text: "\\\n<span>".to_string(),
+                },
+                vec![(0, 2), (1, 3), (6, 8)],
+            ),
+            (
+                StaticTextSegment {
+                    text: "AB".to_string(),
+                    raw_text: "\\u0041\\\nB".to_string(),
+                },
+                vec![(0, 0), (1, 8), (2, 9)],
+            ),
+        ];
+
+        for (segment, expectations) in cases {
+            for (decoded_prefix_len, expected_raw_len) in expectations {
+                assert_eq!(
+                    raw_static_prefix_len(&segment, decoded_prefix_len, false),
+                    expected_raw_len,
+                    "segment {:?}, decoded_prefix_len {}",
+                    segment.raw_text,
+                    decoded_prefix_len
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_map_template_position_to_document_consumes_zero_length_static_segments() {
+        let parts = vec![
+            TemplatePart::Interpolation(InterpolationInfo {
+                expression: "value".to_string(),
+                conversion: None,
+                format_spec: String::new(),
+                raw_source: "{value}".to_string(),
+                location: Location {
+                    start_line: 1,
+                    start_column: 1,
+                    end_line: 1,
+                    end_column: 8,
+                },
+                interpolation_index: 0,
+            }),
+            TemplatePart::Static(StaticTextSegment {
+                text: "<span>".to_string(),
+                raw_text: "\\\n<span>".to_string(),
+            }),
+        ];
+
+        assert_eq!(
+            map_template_position_to_document(&parts, false, "{value}\\\n<span>", 2, 0, 0, 0),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn test_map_template_position_to_document_boundary_cases() {
+        let static_with_continuation = vec![TemplatePart::Static(StaticTextSegment {
+            text: "AB".to_string(),
+            raw_text: "A\\\nB".to_string(),
+        })];
+        assert_eq!(
+            map_template_position_to_document(&static_with_continuation, false, "A\\\nB", 0, 0, 0, 0),
+            (0, 0)
+        );
+        assert_eq!(
+            map_template_position_to_document(&static_with_continuation, false, "A\\\nB", 1, 0, 0, 0),
+            (1, 0)
+        );
+        assert_eq!(
+            map_template_position_to_document(&static_with_continuation, false, "A\\\nB", 2, 0, 0, 0),
+            (1, 1)
+        );
+
+        let interpolation_then_continuation = vec![
+            TemplatePart::Interpolation(InterpolationInfo {
+                expression: "value".to_string(),
+                conversion: None,
+                format_spec: String::new(),
+                raw_source: "{value}".to_string(),
+                location: Location {
+                    start_line: 1,
+                    start_column: 1,
+                    end_line: 1,
+                    end_column: 8,
+                },
+                interpolation_index: 0,
+            }),
+            TemplatePart::Static(StaticTextSegment {
+                text: "<span>".to_string(),
+                raw_text: "\\\n<span>".to_string(),
+            }),
+        ];
+        assert_eq!(
+            map_template_position_to_document(
+                &interpolation_then_continuation,
+                false,
+                "{value}\\\n<span>",
+                2,
+                0,
+                0,
+                0
+            ),
+            (1, 0)
+        );
+        assert_eq!(
+            map_template_position_to_document(
+                &interpolation_then_continuation,
+                false,
+                "{value}\\\n<span>",
+                3,
+                0,
+                0,
+                0
+            ),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn test_token_position_to_content_offset_skips_raw_only_static_parts() {
+        let template = TemplateStringInfo {
+            content: "{}{}".to_string(),
+            raw_content: r#"t"{a}\
+{b}""#
+            .to_string(),
+            variable_name: None,
+            function_name: None,
+            language: Some("html".to_string()),
+            string_start: "t\"".to_string(),
+            string_end: "\"".to_string(),
+            location: Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 2,
+                end_column: 5,
+            },
+            formatting_wrapper_location: None,
+            expressions: vec![],
+            parts: vec![
+                TemplatePart::Interpolation(InterpolationInfo {
+                    expression: "a".to_string(),
+                    conversion: None,
+                    format_spec: String::new(),
+                    raw_source: "{a}".to_string(),
+                    location: Location {
+                        start_line: 1,
+                        start_column: 3,
+                        end_line: 1,
+                        end_column: 6,
+                    },
+                    interpolation_index: 0,
+                }),
+                TemplatePart::Static(StaticTextSegment {
+                    text: String::new(),
+                    raw_text: "\\\n".to_string(),
+                }),
+                TemplatePart::Interpolation(InterpolationInfo {
+                    expression: "b".to_string(),
+                    conversion: None,
+                    format_spec: String::new(),
+                    raw_source: "{b}".to_string(),
+                    location: Location {
+                        start_line: 2,
+                        start_column: 1,
+                        end_line: 2,
+                        end_column: 4,
+                    },
+                    interpolation_index: 1,
+                }),
+            ],
+            flags: TemplateStringFlags::default(),
+        };
+
+        assert_eq!(
+            template.token_position_to_content_offset(&SourcePosition {
+                token_index: 1,
+                offset: 0,
+            }),
+            2
+        );
     }
 
     #[test]

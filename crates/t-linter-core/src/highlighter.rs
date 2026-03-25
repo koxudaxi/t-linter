@@ -1,7 +1,7 @@
 #[cfg(feature = "sql")]
 use tree_sitter_sequel;
 
-use crate::parser::{TemplatePart, TemplateStringInfo};
+use crate::parser::{raw_static_prefix_len, TemplatePart, TemplateStringInfo};
 use anyhow::Result;
 use std::collections::HashMap;
 use tracing::info;
@@ -272,7 +272,7 @@ impl TemplateHighlighter {
         language: &str,
     ) -> ProcessedHighlightContent {
         if language.eq_ignore_ascii_case("tdom") {
-            return Self::prepare_tdom_content_for_highlighting(&template.content);
+            return Self::prepare_tdom_content_for_highlighting(template);
         }
 
         let mut processed = String::new();
@@ -316,48 +316,47 @@ impl TemplateHighlighter {
         }
     }
 
-    fn prepare_tdom_content_for_highlighting(content: &str) -> ProcessedHighlightContent {
+    fn prepare_tdom_content_for_highlighting(template: &TemplateStringInfo) -> ProcessedHighlightContent {
         let mut processed = String::new();
         let mut processed_to_original = vec![0];
         let mut placeholders = Vec::new();
-        let mut search_start = 0;
+        let mut original_offset = 0;
 
-        while let Some(pos) = content[search_start..].find("{}") {
-            let absolute_pos = search_start + pos;
-            Self::append_original_segment(
-                &mut processed,
-                &mut processed_to_original,
-                &content[search_start..absolute_pos],
-                search_start,
-            );
-
-            let placeholder_text = if content[..absolute_pos].ends_with("</")
-                || content[..absolute_pos].ends_with('<')
-            {
-                "tdom_component"
-            } else {
-                "t_linter_expr"
-            };
-            Self::append_placeholder_segment(
-                &mut processed,
-                &mut processed_to_original,
-                placeholder_text,
-                absolute_pos,
-                absolute_pos + 2,
-            );
-            placeholders.push(Placeholder {
-                start: absolute_pos,
-                end: absolute_pos + 2,
-            });
-            search_start = absolute_pos + 2;
+        for part in &template.parts {
+            match part {
+                TemplatePart::Static(part) => {
+                    Self::append_original_segment(
+                        &mut processed,
+                        &mut processed_to_original,
+                        &part.text,
+                        original_offset,
+                    );
+                    original_offset += part.text.len();
+                }
+                TemplatePart::Interpolation(_) => {
+                    let placeholder_text =
+                        if template.content[..original_offset].ends_with("</")
+                            || template.content[..original_offset].ends_with('<')
+                        {
+                            "tdom_component"
+                        } else {
+                            "t_linter_expr"
+                        };
+                    Self::append_placeholder_segment(
+                        &mut processed,
+                        &mut processed_to_original,
+                        placeholder_text,
+                        original_offset,
+                        original_offset + 2,
+                    );
+                    placeholders.push(Placeholder {
+                        start: original_offset,
+                        end: original_offset + 2,
+                    });
+                    original_offset += 2;
+                }
+            }
         }
-
-        Self::append_original_segment(
-            &mut processed,
-            &mut processed_to_original,
-            &content[search_start..],
-            search_start,
-        );
 
         ProcessedHighlightContent {
             content: processed,
@@ -478,15 +477,27 @@ impl TemplateHighlighter {
             }
 
             let (doc_line, doc_col) = self.map_template_position_to_document(
-                &template.content,
+                template,
                 actual_content,
                 range.start_byte,
                 template_start_line,
                 template_start_col,
                 prefix_len,
             );
+            let (doc_end_line, doc_end_col) = self.map_template_position_to_document(
+                template,
+                actual_content,
+                range.end_byte,
+                template_start_line,
+                template_start_col,
+                prefix_len,
+            );
 
-            let length = range.end_byte - range.start_byte;
+            if doc_end_line != doc_line {
+                continue;
+            }
+
+            let length = doc_end_col.saturating_sub(doc_col);
 
             info!(
                 "Range {}: {} content[{}..{}]='{}' -> line {} col {}",
@@ -528,7 +539,7 @@ impl TemplateHighlighter {
 
     fn map_template_position_to_document(
         &self,
-        template_content: &str,
+        template: &TemplateStringInfo,
         actual_content: &str,
         position_in_template: usize,
         template_start_line: usize,
@@ -537,28 +548,44 @@ impl TemplateHighlighter {
     ) -> (usize, usize) {
         let mut template_idx = 0;
         let mut actual_idx = 0;
-        let template_bytes = template_content.as_bytes();
         let actual_bytes = actual_content.as_bytes();
+        let mut part_iter = template.parts.iter();
 
-        while template_idx < position_in_template && actual_idx < actual_bytes.len() {
-            if template_idx + 1 < template_bytes.len()
-                && template_bytes[template_idx] == b'{'
-                && template_bytes[template_idx + 1] == b'}'
-            {
-                if actual_idx < actual_bytes.len() && actual_bytes[actual_idx] == b'{' {
-                    let mut expr_end = actual_idx + 1;
-                    while expr_end < actual_bytes.len() && actual_bytes[expr_end] != b'}' {
-                        expr_end += 1;
+        while actual_idx < actual_bytes.len() {
+            let Some(part) = part_iter.next() else {
+                break;
+            };
+
+            match part {
+                TemplatePart::Static(part) => {
+                    if part.text.is_empty() {
+                        actual_idx = (actual_idx + part.raw_text.len()).min(actual_bytes.len());
+                        continue;
                     }
-                    if expr_end < actual_bytes.len() {
-                        expr_end += 1;
+
+                    let remaining_template = position_in_template.saturating_sub(template_idx);
+                    let consumed = remaining_template.min(part.text.len());
+                    actual_idx = (actual_idx
+                        + raw_static_prefix_len(part, consumed, template.flags.is_raw))
+                    .min(actual_bytes.len());
+                    template_idx += consumed;
+
+                    if consumed < part.text.len() {
+                        break;
                     }
-                    actual_idx = expr_end;
                 }
-                template_idx += 2;
-            } else {
-                template_idx += 1;
-                actual_idx += 1;
+                TemplatePart::Interpolation(part) => {
+                    if template_idx >= position_in_template {
+                        break;
+                    }
+
+                    if template_idx + 2 <= position_in_template {
+                        template_idx += 2;
+                        actual_idx = (actual_idx + part.raw_source.len()).min(actual_bytes.len());
+                    } else {
+                        break;
+                    }
+                }
             }
         }
 
@@ -626,6 +653,7 @@ mod tests {
             if !before.is_empty() {
                 parts.push(TemplatePart::Static(StaticTextSegment {
                     text: before.to_string(),
+                    raw_text: before.to_string(),
                 }));
             }
             let expression = expressions
@@ -650,11 +678,13 @@ mod tests {
         if search_start < content.len() {
             parts.push(TemplatePart::Static(StaticTextSegment {
                 text: content[search_start..].to_string(),
+                raw_text: content[search_start..].to_string(),
             }));
         }
         if parts.is_empty() {
             parts.push(TemplatePart::Static(StaticTextSegment {
                 text: String::new(),
+                raw_text: String::new(),
             }));
         }
 
@@ -731,6 +761,68 @@ mod tests {
                     && token.3 == 8
             }));
         }
+    }
+
+    fn assert_non_variable_tokens_avoid_expression_ranges(
+        highlighter: &TemplateHighlighter,
+        tokens: &[(u32, u32, u32, u32, u32)],
+        template: &TemplateStringInfo,
+    ) {
+        let variable_parameter_index = highlighter.token_type_to_index("variable.parameter");
+
+        for token in tokens {
+            if token.3 == variable_parameter_index {
+                continue;
+            }
+
+            let token_line = token.0 as usize + 1;
+            let token_start = token.1 as usize + 1;
+            let token_end = token_start + token.2 as usize;
+
+            for expr in &template.expressions {
+                if token_line < expr.location.start_line || token_line > expr.location.end_line {
+                    continue;
+                }
+
+                let overlaps = if expr.location.start_line == expr.location.end_line {
+                    token_end > expr.location.start_column && token_start < expr.location.end_column
+                } else if token_line == expr.location.start_line {
+                    token_end > expr.location.start_column
+                } else if token_line == expr.location.end_line {
+                    token_start < expr.location.end_column
+                } else {
+                    true
+                };
+
+                assert!(
+                    !overlaps,
+                    "non-variable token {:?} overlaps expression {:?}",
+                    token,
+                    expr.location
+                );
+            }
+        }
+    }
+
+    fn assert_has_token_start(
+        tokens: &[(u32, u32, u32, u32, u32)],
+        line_1_based: usize,
+        start_column_1_based: usize,
+        token_type: u32,
+        length: u32,
+    ) {
+        assert!(
+            tokens
+                .iter()
+                .any(|token| {
+                    token.0 == (line_1_based - 1) as u32
+                        && token.1 == (start_column_1_based - 1) as u32
+                        && token.2 == length
+                        && token.3 == token_type
+                }),
+            "expected token type {token_type} at {line_1_based}:{start_column_1_based} len {length}, got {:?}",
+            tokens
+        );
     }
 
     #[test]
@@ -884,6 +976,297 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    #[test]
+    fn test_tdom_highlighting_keeps_nested_template_expression_boundaries() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from dataclasses import dataclass
+from typing import Iterable
+from tdom import Node, html
+
+
+@dataclass
+class Card:
+    children: Iterable[Node]
+    title: str
+    subtitle: str | None = None
+
+    def __call__(self) -> Node:
+        return html(t"""<div class="card">
+  <h2>{self.title}</h2>
+  {self.subtitle and t"<h3>{self.subtitle}</h3>"}
+  <div class="content">{self.children}</div>
+</div>
+        """)
+"#,
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+
+        assert_expression_tokens_match_template(&tokens, &template);
+        assert_non_variable_tokens_avoid_expression_ranges(&highlighter, &tokens, &template);
+        assert_has_token_start(&tokens, 16, 4, highlighter.token_type_to_index("tag"), 3);
+    }
+
+    #[test]
+    fn test_tdom_highlighting_keeps_alignment_after_nested_dict_and_template_expressions() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from tdom import html
+
+title = "Dashboard"
+status = "ready"
+subtitle = "Summary"
+children = "Body"
+items = [1, 2, 3]
+
+page = html(t"""<{Card} title={title}>
+  {items and {"count": len(items)}}
+  {subtitle and t"<h3>{subtitle}</h3>"}
+  <footer data-state={status}>{children}</footer>
+</{Card}>""")
+"#,
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+
+        assert_expression_tokens_match_template(&tokens, &template);
+        assert_non_variable_tokens_avoid_expression_ranges(&highlighter, &tokens, &template);
+        assert_has_token_start(&tokens, 12, 4, highlighter.token_type_to_index("tag"), 6);
+    }
+
+    #[test]
+    fn test_html_highlighting_keeps_alignment_after_nested_template_expression() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+show_heading = True
+title = "Overview"
+content = "Details"
+
+page: Annotated[Template, "html"] = t"""<section class="panel">
+  {show_heading and t"<h1>{title}</h1>"}
+  <p>{content}</p>
+</section>"""
+"#,
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+
+        assert_expression_tokens_match_template(&tokens, &template);
+        assert_non_variable_tokens_avoid_expression_ranges(&highlighter, &tokens, &template);
+        assert_has_token_start(&tokens, 10, 4, highlighter.token_type_to_index("tag"), 1);
+    }
+
+    #[test]
+    fn test_html_highlighting_keeps_alignment_after_escaped_braces() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+value = "ok"
+
+page: Annotated[Template, "html"] = t"""<div data-pattern="{{}}">
+  <span>{value}</span>
+  <footer>done</footer>
+</div>"""
+"#,
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+
+        assert_expression_tokens_match_template(&tokens, &template);
+        assert_has_token_start(&tokens, 6, 60, highlighter.token_type_to_index("string"), 4);
+        assert_has_token_start(&tokens, 8, 4, highlighter.token_type_to_index("tag"), 6);
+    }
+
+    #[test]
+    fn test_html_semantic_tokens_preserve_raw_lengths_for_python_escapes() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+value = "ok"
+
+page: Annotated[Template, "html"] = t"""<div data-escape="\u0041">
+  <span>{value}</span>
+</div>"""
+"#,
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+
+        assert_expression_tokens_match_template(&tokens, &template);
+        assert_has_token_start(&tokens, 6, 59, highlighter.token_type_to_index("string"), 6);
+        assert_has_token_start(&tokens, 7, 4, highlighter.token_type_to_index("tag"), 4);
+    }
+
+    #[test]
+    fn test_tdom_highlighting_keeps_literal_braces_static() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from tdom import html
+
+page = html(t"""<{Card} title="{}">
+  <span>ok</span>
+</{Card}>""")
+"#,
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+
+        assert_expression_tokens_match_template(&tokens, &template);
+        assert_has_token_start(&tokens, 4, 4, highlighter.token_type_to_index("tag"), 4);
+    }
+
+    #[test]
+    fn test_html_highlighting_keeps_alignment_after_line_continuation() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+value = "ok"
+
+page: Annotated[Template, "html"] = t"""<div>\
+<span>{value}</span>
+</div>"""
+"#,
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+
+        assert_expression_tokens_match_template(&tokens, &template);
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.0 == 6 && token.1 == 1 && token.2 == 4),
+            "expected a token to start at 7:2 with len 4, got {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_html_highlighting_keeps_alignment_after_interpolation_then_line_continuation() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+value = "ok"
+
+page: Annotated[Template, "html"] = t"""<div>{value}\
+<span>ok</span>
+</div>"""
+"#,
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+
+        assert_expression_tokens_match_template(&tokens, &template);
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.0 == 6 && token.1 == 1 && token.2 == 4),
+            "expected a token to start at 7:2 with len 4 after interpolation + continuation, got {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_html_highlighting_boundary_cases_stay_aligned() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let cases = [
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+value = "ok"
+
+page: Annotated[Template, "html"] = t"""<div>\
+<span>{value}</span>
+</div>"""
+"#,
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+value = "ok"
+
+page: Annotated[Template, "html"] = t"""<div>{value}\
+<span>ok</span>
+</div>"""
+"#,
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+value = "ok"
+
+page: Annotated[Template, "html"] = t"""<div>A\
+B<span>{value}</span>
+</div>"""
+"#,
+        ];
+
+        for source in cases {
+            let template = parse_single_template(source);
+            let ranges = highlighter.highlight_template(&template).unwrap();
+            let tokens = highlighter.to_lsp_tokens(ranges, &template);
+
+            assert_expression_tokens_match_template(&tokens, &template);
+            assert!(
+                tokens
+                    .iter()
+                    .any(|token| token.0 >= 6 && token.2 > 0),
+                "expected tokens on the continued line, got {:?}",
+                tokens
+            );
+        }
+    }
+
+    #[test]
+    fn test_to_lsp_tokens_skips_multiline_ranges() {
+        let highlighter = TemplateHighlighter::new().unwrap();
+        let template = make_template(
+            "<div>\n<span></span>\n</div>",
+            "t\"\"\"<div>\n<span></span>\n</div>\"\"\"",
+            "html",
+            Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 3,
+                end_column: 8,
+            },
+            vec![],
+            TemplateStringFlags {
+                is_triple: true,
+                ..TemplateStringFlags::default()
+            },
+        );
+
+        let tokens = highlighter.to_lsp_tokens(
+            vec![HighlightedRange {
+                start_byte: 0,
+                end_byte: template.content.len(),
+                highlight_name: "string".to_string(),
+                highlight_index: highlighter.token_type_to_index("string") as usize,
+            }],
+            &template,
+        );
+
+        assert!(tokens.is_empty(), "expected multiline ranges to be skipped, got {:?}", tokens);
     }
 
     #[test]
@@ -1209,6 +1592,7 @@ mod tests {
             expressions: vec![],
             parts: vec![TemplatePart::Static(StaticTextSegment {
                 text: "literal {} braces".to_string(),
+                raw_text: "literal {} braces".to_string(),
             })],
             flags: TemplateStringFlags::default(),
         };
@@ -1254,6 +1638,7 @@ styles: Annotated[Template, "css"] = t"""
 
         let tokens = highlighter.to_lsp_tokens(ranges, &template);
         assert_expression_tokens_match_template(&tokens, &template);
+        assert_has_token_start(&tokens, 8, 5, highlighter.token_type_to_index("tag"), 7);
     }
 
     #[test]
