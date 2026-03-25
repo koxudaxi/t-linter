@@ -3823,9 +3823,12 @@ impl TemplateStringInfo {
 
     fn token_position_to_content_offset(&self, position: &SourcePosition) -> usize {
         let mut offset = 0;
+        let mut visible_token_index = 0;
 
-        for (token_index, part) in self.parts.iter().enumerate() {
-            if token_index == position.token_index {
+        for part in &self.parts {
+            let contributes_token = !matches!(part, TemplatePart::Static(part) if part.text.is_empty());
+
+            if contributes_token && visible_token_index == position.token_index {
                 return match part {
                     TemplatePart::Static(part) => offset + position.offset.min(part.text.len()),
                     TemplatePart::Interpolation(_) => offset + position.offset.min(2),
@@ -3836,6 +3839,10 @@ impl TemplateStringInfo {
                 TemplatePart::Static(part) => part.text.len(),
                 TemplatePart::Interpolation(_) => 2,
             };
+
+            if contributes_token {
+                visible_token_index += 1;
+            }
         }
 
         offset
@@ -4572,6 +4579,70 @@ html = t"""
                 0
             ),
             (1, 1)
+        );
+    }
+
+    #[test]
+    fn test_token_position_to_content_offset_skips_raw_only_static_parts() {
+        let template = TemplateStringInfo {
+            content: "{}{}".to_string(),
+            raw_content: r#"t"{a}\
+{b}""#
+            .to_string(),
+            variable_name: None,
+            function_name: None,
+            language: Some("html".to_string()),
+            string_start: "t\"".to_string(),
+            string_end: "\"".to_string(),
+            location: Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 2,
+                end_column: 5,
+            },
+            formatting_wrapper_location: None,
+            expressions: vec![],
+            parts: vec![
+                TemplatePart::Interpolation(InterpolationInfo {
+                    expression: "a".to_string(),
+                    conversion: None,
+                    format_spec: String::new(),
+                    raw_source: "{a}".to_string(),
+                    location: Location {
+                        start_line: 1,
+                        start_column: 3,
+                        end_line: 1,
+                        end_column: 6,
+                    },
+                    interpolation_index: 0,
+                }),
+                TemplatePart::Static(StaticTextSegment {
+                    text: String::new(),
+                    raw_text: "\\\n".to_string(),
+                }),
+                TemplatePart::Interpolation(InterpolationInfo {
+                    expression: "b".to_string(),
+                    conversion: None,
+                    format_spec: String::new(),
+                    raw_source: "{b}".to_string(),
+                    location: Location {
+                        start_line: 2,
+                        start_column: 1,
+                        end_line: 2,
+                        end_column: 4,
+                    },
+                    interpolation_index: 1,
+                }),
+            ],
+            flags: TemplateStringFlags::default(),
+        };
+
+        assert_eq!(
+            template.token_position_to_content_offset(&SourcePosition {
+                token_index: 1,
+                offset: 0,
+            }),
+            2
         );
     }
 

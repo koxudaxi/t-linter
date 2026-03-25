@@ -493,11 +493,11 @@ impl TemplateHighlighter {
                 prefix_len,
             );
 
-            let length = if doc_end_line == doc_line {
-                doc_end_col.saturating_sub(doc_col)
-            } else {
-                range.end_byte - range.start_byte
-            };
+            if doc_end_line != doc_line {
+                continue;
+            }
+
+            let length = doc_end_col.saturating_sub(doc_col);
 
             info!(
                 "Range {}: {} content[{}..{}]='{}' -> line {} col {}",
@@ -1234,6 +1234,39 @@ B<span>{value}</span>
                 tokens
             );
         }
+    }
+
+    #[test]
+    fn test_to_lsp_tokens_skips_multiline_ranges() {
+        let highlighter = TemplateHighlighter::new().unwrap();
+        let template = make_template(
+            "<div>\n<span></span>\n</div>",
+            "t\"\"\"<div>\n<span></span>\n</div>\"\"\"",
+            "html",
+            Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 3,
+                end_column: 8,
+            },
+            vec![],
+            TemplateStringFlags {
+                is_triple: true,
+                ..TemplateStringFlags::default()
+            },
+        );
+
+        let tokens = highlighter.to_lsp_tokens(
+            vec![HighlightedRange {
+                start_byte: 0,
+                end_byte: template.content.len(),
+                highlight_name: "string".to_string(),
+                highlight_index: highlighter.token_type_to_index("string") as usize,
+            }],
+            &template,
+        );
+
+        assert!(tokens.is_empty(), "expected multiline ranges to be skipped, got {:?}", tokens);
     }
 
     #[test]
