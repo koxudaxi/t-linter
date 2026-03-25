@@ -27,3 +27,13 @@ pub fn init() -> Result<()> {
     tracing::info!("t-linter-core initialized");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_succeeds() {
+        init().expect("core init");
+    }
+}

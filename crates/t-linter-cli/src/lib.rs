@@ -166,9 +166,8 @@ pub fn format(
     format_files(paths, check, line_length)
 }
 
-pub fn stats(path: String) -> Result<()> {
+pub fn stats(path: String) {
     println!("Analyzing statistics for: {}", path);
-    Ok(())
 }
 
 fn check_failure_to_result(failure: &DiscoveryFailure) -> LintFileResult {
