@@ -563,16 +563,16 @@ impl TemplateHighlighter {
                         continue;
                     }
 
-                    if template_idx >= position_in_template {
-                        break;
-                    }
-
-                    let remaining_template = position_in_template - template_idx;
+                    let remaining_template = position_in_template.saturating_sub(template_idx);
                     let consumed = remaining_template.min(part.text.len());
-                    template_idx += consumed;
                     actual_idx = (actual_idx
                         + raw_static_prefix_len(part, consumed, template.flags.is_raw))
                     .min(actual_bytes.len());
+                    template_idx += consumed;
+
+                    if consumed < part.text.len() {
+                        break;
+                    }
                 }
                 TemplatePart::Interpolation(part) => {
                     if template_idx >= position_in_template {
@@ -1157,6 +1157,83 @@ page: Annotated[Template, "html"] = t"""<div>\
             "expected a token to start at 7:2 with len 4, got {:?}",
             tokens
         );
+    }
+
+    #[test]
+    fn test_html_highlighting_keeps_alignment_after_interpolation_then_line_continuation() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+value = "ok"
+
+page: Annotated[Template, "html"] = t"""<div>{value}\
+<span>ok</span>
+</div>"""
+"#,
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+
+        assert_expression_tokens_match_template(&tokens, &template);
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.0 == 6 && token.1 == 1 && token.2 == 4),
+            "expected a token to start at 7:2 with len 4 after interpolation + continuation, got {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_html_highlighting_boundary_cases_stay_aligned() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let cases = [
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+value = "ok"
+
+page: Annotated[Template, "html"] = t"""<div>\
+<span>{value}</span>
+</div>"""
+"#,
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+value = "ok"
+
+page: Annotated[Template, "html"] = t"""<div>{value}\
+<span>ok</span>
+</div>"""
+"#,
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+value = "ok"
+
+page: Annotated[Template, "html"] = t"""<div>A\
+B<span>{value}</span>
+</div>"""
+"#,
+        ];
+
+        for source in cases {
+            let template = parse_single_template(source);
+            let ranges = highlighter.highlight_template(&template).unwrap();
+            let tokens = highlighter.to_lsp_tokens(ranges, &template);
+
+            assert_expression_tokens_match_template(&tokens, &template);
+            assert!(
+                tokens
+                    .iter()
+                    .any(|token| token.0 >= 6 && token.2 > 0),
+                "expected tokens on the continued line, got {:?}",
+                tokens
+            );
+        }
     }
 
     #[test]

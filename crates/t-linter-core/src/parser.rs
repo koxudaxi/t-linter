@@ -4084,7 +4084,7 @@ pub(crate) fn raw_static_prefix_len(
     decoded_prefix_len: usize,
     is_raw: bool,
 ) -> usize {
-    if decoded_prefix_len == 0 || segment.raw_text.is_empty() {
+    if segment.raw_text.is_empty() {
         return 0;
     }
 
@@ -4096,10 +4096,11 @@ pub(crate) fn raw_static_prefix_len(
     let mut decoded_bytes = 0;
     let mut consumed_raw_bytes = 0;
 
-    while decoded_bytes < decoded_prefix_len {
-        let Some(unit) = next_template_unit(&mut raw_chars, is_raw) else {
+    while let Some(unit) = next_template_unit(&mut raw_chars, is_raw) {
+        if !unit.decoded.is_empty() && decoded_bytes >= decoded_prefix_len {
             break;
-        };
+        }
+
         consumed_raw_bytes += unit.raw_len;
         decoded_bytes += unit.decoded.len();
     }
@@ -4133,15 +4134,15 @@ fn map_template_position_to_document(
                     continue;
                 }
 
-                if template_idx >= position_in_template {
-                    break;
-                }
-
-                let remaining_template = position_in_template - template_idx;
+                let remaining_template = position_in_template.saturating_sub(template_idx);
                 let consumed = remaining_template.min(part.text.len());
-                template_idx += consumed;
                 actual_idx =
                     (actual_idx + raw_static_prefix_len(part, consumed, is_raw)).min(actual_bytes.len());
+                template_idx += consumed;
+
+                if consumed < part.text.len() {
+                    break;
+                }
             }
             TemplatePart::Interpolation(part) => {
                 if template_idx >= position_in_template {
@@ -4439,29 +4440,138 @@ html = t"""
             text: "<span>".to_string(),
             raw_text: "\\\n<span>".to_string(),
         };
+        assert_eq!(raw_static_prefix_len(&continued_line, 0, false), 2);
         assert_eq!(raw_static_prefix_len(&continued_line, 1, false), 3);
+    }
+
+    #[test]
+    fn test_raw_static_prefix_len_boundary_cases() {
+        let cases = [
+            (
+                StaticTextSegment {
+                    text: "AB".to_string(),
+                    raw_text: "A\\\nB".to_string(),
+                },
+                vec![(0, 0), (1, 3), (2, 4)],
+            ),
+            (
+                StaticTextSegment {
+                    text: "<span>".to_string(),
+                    raw_text: "\\\n<span>".to_string(),
+                },
+                vec![(0, 2), (1, 3), (6, 8)],
+            ),
+            (
+                StaticTextSegment {
+                    text: "AB".to_string(),
+                    raw_text: "\\u0041\\\nB".to_string(),
+                },
+                vec![(0, 0), (1, 8), (2, 9)],
+            ),
+        ];
+
+        for (segment, expectations) in cases {
+            for (decoded_prefix_len, expected_raw_len) in expectations {
+                assert_eq!(
+                    raw_static_prefix_len(&segment, decoded_prefix_len, false),
+                    expected_raw_len,
+                    "segment {:?}, decoded_prefix_len {}",
+                    segment.raw_text,
+                    decoded_prefix_len
+                );
+            }
+        }
     }
 
     #[test]
     fn test_map_template_position_to_document_consumes_zero_length_static_segments() {
         let parts = vec![
-            TemplatePart::Static(StaticTextSegment {
-                text: "<div>".to_string(),
-                raw_text: "<div>".to_string(),
-            }),
-            TemplatePart::Static(StaticTextSegment {
-                text: String::new(),
-                raw_text: "\\\n".to_string(),
+            TemplatePart::Interpolation(InterpolationInfo {
+                expression: "value".to_string(),
+                conversion: None,
+                format_spec: String::new(),
+                raw_source: "{value}".to_string(),
+                location: Location {
+                    start_line: 1,
+                    start_column: 1,
+                    end_line: 1,
+                    end_column: 8,
+                },
+                interpolation_index: 0,
             }),
             TemplatePart::Static(StaticTextSegment {
                 text: "<span>".to_string(),
-                raw_text: "<span>".to_string(),
+                raw_text: "\\\n<span>".to_string(),
             }),
         ];
 
         assert_eq!(
-            map_template_position_to_document(&parts, false, "<div>\\\n<span>", 5, 0, 0, 0),
+            map_template_position_to_document(&parts, false, "{value}\\\n<span>", 2, 0, 0, 0),
             (1, 0)
+        );
+    }
+
+    #[test]
+    fn test_map_template_position_to_document_boundary_cases() {
+        let static_with_continuation = vec![TemplatePart::Static(StaticTextSegment {
+            text: "AB".to_string(),
+            raw_text: "A\\\nB".to_string(),
+        })];
+        assert_eq!(
+            map_template_position_to_document(&static_with_continuation, false, "A\\\nB", 0, 0, 0, 0),
+            (0, 0)
+        );
+        assert_eq!(
+            map_template_position_to_document(&static_with_continuation, false, "A\\\nB", 1, 0, 0, 0),
+            (1, 0)
+        );
+        assert_eq!(
+            map_template_position_to_document(&static_with_continuation, false, "A\\\nB", 2, 0, 0, 0),
+            (1, 1)
+        );
+
+        let interpolation_then_continuation = vec![
+            TemplatePart::Interpolation(InterpolationInfo {
+                expression: "value".to_string(),
+                conversion: None,
+                format_spec: String::new(),
+                raw_source: "{value}".to_string(),
+                location: Location {
+                    start_line: 1,
+                    start_column: 1,
+                    end_line: 1,
+                    end_column: 8,
+                },
+                interpolation_index: 0,
+            }),
+            TemplatePart::Static(StaticTextSegment {
+                text: "<span>".to_string(),
+                raw_text: "\\\n<span>".to_string(),
+            }),
+        ];
+        assert_eq!(
+            map_template_position_to_document(
+                &interpolation_then_continuation,
+                false,
+                "{value}\\\n<span>",
+                2,
+                0,
+                0,
+                0
+            ),
+            (1, 0)
+        );
+        assert_eq!(
+            map_template_position_to_document(
+                &interpolation_then_continuation,
+                false,
+                "{value}\\\n<span>",
+                3,
+                0,
+                0,
+                0
+            ),
+            (1, 1)
         );
     }
 
