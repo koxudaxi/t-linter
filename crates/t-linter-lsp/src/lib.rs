@@ -740,7 +740,7 @@ fn internal_error(err: anyhow::Error) -> tower_lsp::jsonrpc::Error {
     }
 }
 
-pub async fn run_server() {
+pub async fn run_server() -> Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
@@ -749,6 +749,7 @@ pub async fn run_server() {
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -968,7 +969,7 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
         };
         let lsp_edits = template_edits_to_lsp(vec![edit]);
         assert_eq!(lsp_edits.len(), 1);
-        let uri = Url::parse("file:///tmp/example.py").expect("uri");
+        let uri = Url::from_file_path(std::env::temp_dir().join("example.py")).expect("uri");
         let workspace_edit = workspace_edit_for_uri(&uri, lsp_edits.clone());
         assert_eq!(
             workspace_edit

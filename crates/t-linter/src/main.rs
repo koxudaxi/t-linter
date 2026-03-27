@@ -32,8 +32,13 @@ async fn main() {
     let exit_code = match cli.command {
         Some(t_linter_cli::Commands::Lsp { stdio: _ }) => {
             init_logging("info,tower_lsp=warn,t_linter=debug");
-            t_linter_lsp::run_server().await;
-            0
+            match t_linter_lsp::run_server().await {
+                Ok(_) => 0,
+                Err(error) => {
+                    eprintln!("{error}");
+                    1
+                }
+            }
         }
         Some(t_linter_cli::Commands::Check {
             paths,
@@ -66,13 +71,23 @@ async fn main() {
         }
         Some(t_linter_cli::Commands::Stats { path }) => {
             init_logging("off");
-            t_linter_cli::stats(path);
-            0
+            match t_linter_cli::stats(path) {
+                Ok(_) => 0,
+                Err(error) => {
+                    eprintln!("{error}");
+                    1
+                }
+            }
         }
         None => {
             init_logging("info,tower_lsp=warn,t_linter=debug");
-            t_linter_lsp::run_server().await;
-            0
+            match t_linter_lsp::run_server().await {
+                Ok(_) => 0,
+                Err(error) => {
+                    eprintln!("{error}");
+                    1
+                }
+            }
         }
     };
 

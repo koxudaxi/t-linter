@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, ExitStatus};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -21,6 +21,21 @@ fn write_file(path: &Path, contents: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, contents).unwrap();
+}
+
+fn wait_for_child_with_timeout(child: &mut Child, timeout: Duration) -> ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("child process timed out after {:?}", timeout);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[test]
@@ -81,17 +96,23 @@ fn check_command_reports_invalid_config_errors() {
 
 #[test]
 fn lsp_subcommand_exits_cleanly_with_closed_stdio() {
-    let output = Command::new(env!("CARGO_BIN_EXE_t-linter"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_t-linter"))
         .args(["lsp", "--stdio"])
-        .output()
+        .spawn()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        wait_for_child_with_timeout(&mut child, Duration::from_secs(10)).code(),
+        Some(0)
+    );
 }
 
 #[test]
 fn default_command_exits_cleanly_with_closed_stdio() {
-    let output = Command::new(env!("CARGO_BIN_EXE_t-linter")).output().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_t-linter")).spawn().unwrap();
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        wait_for_child_with_timeout(&mut child, Duration::from_secs(10)).code(),
+        Some(0)
+    );
 }
