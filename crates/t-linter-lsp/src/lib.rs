@@ -772,8 +772,8 @@ impl Default for TLinterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use t_linter_core::LintSeverity;
+    use tempfile::TempDir;
     use tower_lsp::LspService;
 
     #[test]
@@ -811,10 +811,8 @@ mod tests {
 
         assert_eq!(extract_line_length_from_lsp_options(&options), Some(120));
 
-        options.properties = HashMap::from([(
-            "lineLength".to_string(),
-            FormattingProperty::Bool(true),
-        )]);
+        options.properties =
+            HashMap::from([("lineLength".to_string(), FormattingProperty::Bool(true))]);
         assert_eq!(extract_line_length_from_lsp_options(&options), None);
 
         let uri = Url::parse("untitled:example.py").expect("uri");
@@ -1277,7 +1275,32 @@ plain = t"hello {name}"
         };
 
         assert!(!tokens.data.is_empty());
-        assert!(tokens.data.iter().any(|token| token.token_type == TOKEN_TYPE_MACRO));
+
+        let absolute_tokens = semantic_token_positions(&tokens.data);
+        let typed_html_line = source
+            .lines()
+            .position(|line| line.starts_with("typed_html:"))
+            .expect("typed_html line") as u32;
+        let unsupported_line = source
+            .lines()
+            .position(|line| line.starts_with("unsupported:"))
+            .expect("unsupported line") as u32;
+        let plain_line = source
+            .lines()
+            .position(|line| line.starts_with("plain ="))
+            .expect("plain line") as u32;
+
+        assert!(absolute_tokens.iter().any(|(line, _, token_type)| {
+            *line == typed_html_line && *token_type != TOKEN_TYPE_MACRO
+        }));
+        assert!(absolute_tokens.iter().any(|(line, _, token_type)| {
+            *line == unsupported_line && *token_type == TOKEN_TYPE_MACRO
+        }));
+        assert!(
+            absolute_tokens
+                .iter()
+                .any(|(line, _, _)| *line == plain_line)
+        );
     }
 
     #[test]
@@ -1508,14 +1531,34 @@ query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
     }
 
     async fn await_scheduled_diagnostics(server: &TLinterLanguageServer, uri: &Url) {
-        let (_, handle) = server
-            .diagnostic_tasks
-            .remove(uri)
-            .expect("scheduled diagnostic task");
-        tokio::time::timeout(Duration::from_secs(2), handle)
-            .await
-            .expect("diagnostic task timed out")
-            .expect("diagnostic task completed");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !server.diagnostic_tasks.contains_key(uri) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("diagnostic task timed out");
+    }
+
+    fn semantic_token_positions(tokens: &[SemanticToken]) -> Vec<(u32, u32, u32)> {
+        let mut line = 0;
+        let mut start = 0;
+        let mut absolute = Vec::with_capacity(tokens.len());
+
+        for token in tokens {
+            line += token.delta_line;
+            if token.delta_line == 0 {
+                start += token.delta_start;
+            } else {
+                start = token.delta_start;
+            }
+            absolute.push((line, start, token.token_type));
+        }
+
+        absolute
     }
 
     fn code_action_params(
