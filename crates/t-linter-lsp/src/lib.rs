@@ -1127,6 +1127,7 @@ page: Annotated[Template, "html"] = t"<div>{value}</div>"
         let server = service.inner();
 
         open_cached_document(server, &file_uri, source).await;
+        assert!(server.diagnostic_tasks.contains_key(&file_uri));
         await_scheduled_diagnostics(server, &file_uri).await;
         assert!(server.diagnostic_tasks.is_empty());
 
@@ -1141,6 +1142,7 @@ page: Annotated[Template, "html"] = t"<div>{value}</div>"
                 },
             })
             .await;
+        assert!(server.diagnostic_tasks.contains_key(&untitled_uri));
         await_scheduled_diagnostics(server, &untitled_uri).await;
         assert!(server.diagnostic_tasks.is_empty());
 
@@ -1240,8 +1242,9 @@ template: Annotated[Template, "unsupported"] = t"<body>demo</body>"
                 work_done_progress_params: WorkDoneProgressParams::default(),
             })
             .await
-            .expect("range formatting response");
-        assert!(changed.is_some());
+            .expect("range formatting response")
+            .expect("range formatting should produce edits for this selection");
+        assert!(!changed.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
