@@ -749,7 +749,6 @@ pub async fn run_server() -> Result<()> {
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
-
     Ok(())
 }
 
@@ -773,6 +772,7 @@ impl Default for TLinterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use t_linter_core::LintSeverity;
     use tempfile::TempDir;
     use tower_lsp::LspService;
 
@@ -792,6 +792,32 @@ mod tests {
 
         options.properties.remove("printWidth");
         assert_eq!(extract_line_length_from_lsp_options(&options), Some(20));
+    }
+
+    #[test]
+    fn lsp_format_options_handle_string_bool_and_default_values() {
+        let mut options = FormattingOptions {
+            tab_size: 2,
+            insert_spaces: true,
+            ..Default::default()
+        };
+        options.properties = HashMap::from([
+            (
+                "lineLength".to_string(),
+                FormattingProperty::String("120".to_string()),
+            ),
+            ("printWidth".to_string(), FormattingProperty::Bool(true)),
+        ]);
+
+        assert_eq!(extract_line_length_from_lsp_options(&options), Some(120));
+
+        options.properties =
+            HashMap::from([("lineLength".to_string(), FormattingProperty::Bool(true))]);
+        assert_eq!(extract_line_length_from_lsp_options(&options), None);
+
+        let uri = Url::parse("untitled:example.py").expect("uri");
+        let resolved = resolve_lsp_format_options(&uri, None).expect("default options");
+        assert_eq!(resolved.line_length, 80);
     }
 
     #[test]
@@ -862,6 +888,106 @@ mod tests {
         assert!(!locations_overlap(&template, &adjacent_range));
     }
 
+    #[test]
+    fn fallback_tokens_cover_single_and_multiline_templates() {
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+single_line: Annotated[Template, "unknown"] = t"<div>{value}</div>"
+multiline: Annotated[Template, "unknown"] = t"""<div>
+<span>{{ brace }}</span>
+{value}
+</div>"""
+"#;
+        let mut parser = TemplateStringParser::new().expect("parser");
+        let templates = parser
+            .find_template_strings(source)
+            .expect("template discovery");
+        let single_line = templates
+            .iter()
+            .find(|template| template.variable_name.as_deref() == Some("single_line"))
+            .expect("single-line template");
+        assert_eq!(
+            server.generate_fallback_tokens(single_line, source),
+            vec![(3, 46, 21, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE)]
+        );
+
+        let multiline = templates
+            .iter()
+            .find(|template| template.variable_name.as_deref() == Some("multiline"))
+            .expect("multiline template");
+        assert_eq!(
+            server.generate_fallback_tokens(multiline, source),
+            vec![
+                (4, 44, 9, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE),
+                (5, 0, 24, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE),
+                (6, 0, 7, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE),
+                (7, 0, 9, TOKEN_TYPE_MACRO, TOKEN_MODIFIER_NONE),
+            ]
+        );
+    }
+
+    #[test]
+    fn conversion_helpers_round_trip_and_wrap_errors() {
+        let diagnostic = LintDiagnostic {
+            file: PathBuf::from("example.py"),
+            rule: "demo-rule".to_string(),
+            severity: LintSeverity::Error,
+            message: "boom".to_string(),
+            language: Some("html".to_string()),
+            start_line: 2,
+            start_column: 3,
+            end_line: 2,
+            end_column: 6,
+        };
+        let lsp_diagnostic = lint_diagnostic_to_lsp(&diagnostic);
+        assert_eq!(lsp_diagnostic.range.start.line, 1);
+        assert_eq!(lsp_diagnostic.range.start.character, 2);
+        assert_eq!(
+            lsp_diagnostic.code,
+            Some(NumberOrString::String("demo-rule".to_string()))
+        );
+
+        let location = t_linter_core::Location {
+            start_line: 4,
+            start_column: 2,
+            end_line: 5,
+            end_column: 8,
+        };
+        let range = location_to_lsp_range(&location);
+        assert_eq!(lsp_range_to_location(&range), location);
+
+        let edit = t_linter_core::TemplateEdit {
+            location: location.clone(),
+            replacement: "hello".to_string(),
+        };
+        let lsp_edits = template_edits_to_lsp(vec![edit]);
+        assert_eq!(lsp_edits.len(), 1);
+        let uri = Url::from_file_path(std::env::temp_dir().join("example.py")).expect("uri");
+        let workspace_edit = workspace_edit_for_uri(&uri, lsp_edits.clone());
+        assert_eq!(
+            workspace_edit
+                .changes
+                .as_ref()
+                .and_then(|changes| changes.get(&uri))
+                .cloned(),
+            Some(lsp_edits)
+        );
+
+        assert!(uri_to_path(&uri).is_some());
+        assert!(uri_to_path(&Url::parse("untitled:demo").expect("uri")).is_none());
+        assert_eq!(
+            internal_error(anyhow::anyhow!("oops")).code,
+            tower_lsp::jsonrpc::ErrorCode::InternalError
+        );
+        assert_eq!(TLinterConfig::default().pyright_path, None);
+        assert!(TLinterConfig::default().enable_type_checking);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn initialize_advertises_code_actions_and_formatting_capabilities() {
         let (service, _) = LspService::new(|client| {
@@ -898,6 +1024,315 @@ mod tests {
             ])
         );
         assert_eq!(options.resolve_provider, Some(false));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lifecycle_methods_update_cache_and_handle_missing_documents() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = sample_python_document();
+        let uri = write_source_file(temp.path(), "example.py", source);
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+
+        server.initialized(InitializedParams {}).await;
+        server
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "python".to_string(),
+                    version: 1,
+                    text: source.to_string(),
+                },
+            })
+            .await;
+        assert_eq!(
+            server
+                .document_cache
+                .get(&uri)
+                .expect("cached after open")
+                .value(),
+            source
+        );
+        assert!(server.diagnostic_tasks.contains_key(&uri));
+
+        server
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: source.replace("12345", "x"),
+                }],
+            })
+            .await;
+        assert!(
+            server
+                .document_cache
+                .get(&uri)
+                .expect("cached after change")
+                .contains("data-a=\"x\"")
+        );
+
+        server
+            .did_change_configuration(DidChangeConfigurationParams {
+                settings: serde_json::json!({"demo": true}),
+            })
+            .await;
+
+        let missing = Url::parse("file:///tmp/missing.py").expect("uri");
+        let err = server
+            .collect_document_format_edits(&missing, None)
+            .await
+            .expect_err("missing doc should error");
+        assert_eq!(err.code, tower_lsp::jsonrpc::ErrorCode::InvalidParams);
+
+        let no_tokens = server
+            .semantic_tokens_full(SemanticTokensParams {
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                text_document: TextDocumentIdentifier { uri: missing },
+            })
+            .await
+            .expect("semantic tokens response");
+        assert!(no_tokens.is_none());
+
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+            })
+            .await;
+        assert!(!server.document_cache.contains_key(&uri));
+        assert!(!server.diagnostic_tasks.contains_key(&uri));
+
+        server.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schedule_diagnostics_covers_file_untitled_and_cancelled_tasks() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+page: Annotated[Template, "html"] = t"<div>{value}</div>"
+"#;
+        let file_uri = write_source_file(temp.path(), "diag.py", source);
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+
+        open_cached_document(server, &file_uri, source).await;
+        assert!(server.diagnostic_tasks.contains_key(&file_uri));
+        await_scheduled_diagnostics(server, &file_uri).await;
+        assert!(server.diagnostic_tasks.is_empty());
+
+        let untitled_uri = Url::parse("untitled:diag.py").expect("untitled uri");
+        server
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: untitled_uri.clone(),
+                    language_id: "python".to_string(),
+                    version: 1,
+                    text: source.to_string(),
+                },
+            })
+            .await;
+        assert!(server.diagnostic_tasks.contains_key(&untitled_uri));
+        await_scheduled_diagnostics(server, &untitled_uri).await;
+        assert!(server.diagnostic_tasks.is_empty());
+
+        let cancelled_uri = write_source_file(temp.path(), "cancelled.py", source);
+        open_cached_document(server, &cancelled_uri, source).await;
+        server
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: cancelled_uri.clone(),
+                },
+            })
+            .await;
+        assert!(server.document_cache.get(&cancelled_uri).is_none());
+        assert!(server.diagnostic_tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn formatting_helpers_cover_range_errors_and_fallback_semantic_tokens() {
+        let temp = tempdir_with_pyproject(20);
+        let source = sample_python_document();
+        let uri = write_source_file(temp.path(), "example.py", source);
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+        open_cached_document(server, &uri, source).await;
+
+        let no_template = server
+            .format_uri(
+                &uri,
+                Some(Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 2,
+                    },
+                }),
+                None,
+            )
+            .await
+            .expect("no template response");
+        assert!(no_template.is_empty());
+
+        let multi_err = server
+            .format_uri(
+                &uri,
+                Some(Range {
+                    start: Position {
+                        line: 3,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 60,
+                    },
+                }),
+                None,
+            )
+            .await
+            .expect_err("multi template should error");
+        assert_eq!(multi_err.code, tower_lsp::jsonrpc::ErrorCode::InternalError);
+
+        let unsupported = r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "unsupported"] = t"<body>demo</body>"
+"#;
+        let unsupported_uri = write_source_file(temp.path(), "unsupported.py", unsupported);
+        open_cached_document(server, &unsupported_uri, unsupported).await;
+        let tokens = server
+            .generate_semantic_tokens(&unsupported_uri)
+            .await
+            .expect("fallback tokens");
+        assert!(!tokens.data.is_empty());
+
+        let changed = server
+            .range_formatting(DocumentRangeFormattingParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                range: Range {
+                    start: Position {
+                        line: 3,
+                        character: 25,
+                    },
+                    end: Position {
+                        line: 3,
+                        character: 55,
+                    },
+                },
+                options: FormattingOptions {
+                    tab_size: 4,
+                    insert_spaces: true,
+                    ..Default::default()
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .expect("range formatting response")
+            .expect("range formatting should produce edits for this selection");
+        assert!(!changed.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_tokens_cover_supported_unsupported_and_untyped_templates() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+typed_html: Annotated[Template, "html"] = t"<div class='card'>{value}</div>"
+unsupported: Annotated[Template, "unknown"] = t"""<odd>{{ brace }}</odd>
+<span>{value}</span>"""
+plain = t"hello {name}"
+"#;
+        let uri = write_source_file(temp.path(), "tokens.py", source);
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+        open_cached_document(server, &uri, source).await;
+
+        let response = server
+            .semantic_tokens_full(SemanticTokensParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .expect("semantic tokens response");
+        let Some(SemanticTokensResult::Tokens(tokens)) = response else {
+            panic!("expected semantic tokens");
+        };
+
+        assert!(!tokens.data.is_empty());
+
+        let absolute_tokens = semantic_token_positions(&tokens.data);
+        let typed_html_line = source
+            .lines()
+            .position(|line| line.starts_with("typed_html:"))
+            .expect("typed_html line") as u32;
+        let unsupported_line = source
+            .lines()
+            .position(|line| line.starts_with("unsupported:"))
+            .expect("unsupported line") as u32;
+        let plain_line = source
+            .lines()
+            .position(|line| line.starts_with("plain ="))
+            .expect("plain line") as u32;
+
+        assert!(absolute_tokens.iter().any(|(line, _, token_type)| {
+            *line == typed_html_line && *token_type != TOKEN_TYPE_MACRO
+        }));
+        assert!(absolute_tokens.iter().any(|(line, _, token_type)| {
+            *line == unsupported_line && *token_type == TOKEN_TYPE_MACRO
+        }));
+        assert!(
+            absolute_tokens
+                .iter()
+                .any(|(line, _, _)| *line == plain_line)
+        );
+    }
+
+    #[test]
+    fn semantic_token_conversion_and_requested_kinds_helpers_cover_remaining_paths() {
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+        let converted = server.convert_to_semantic_tokens(vec![
+            (3, 4, 2, 1, 0),
+            (3, 9, 1, 2, 0),
+            (5, 2, 3, 3, 1),
+        ]);
+
+        assert_eq!(converted[0].delta_line, 3);
+        assert_eq!(converted[0].delta_start, 4);
+        assert_eq!(converted[1].delta_line, 0);
+        assert_eq!(converted[1].delta_start, 5);
+        assert_eq!(converted[2].delta_line, 2);
+        assert_eq!(converted[2].delta_start, 2);
+
+        assert!(requested_code_action_kinds_include(
+            None,
+            &TLinterLanguageServer::source_fix_all_kind()
+        ));
+        assert!(!requested_code_action_kinds_include(
+            Some(&[CodeActionKind::QUICKFIX]),
+            &TLinterLanguageServer::source_fix_all_kind()
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1096,6 +1531,37 @@ query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
                 },
             })
             .await;
+    }
+
+    async fn await_scheduled_diagnostics(server: &TLinterLanguageServer, uri: &Url) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !server.diagnostic_tasks.contains_key(uri) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("diagnostic task timed out");
+    }
+
+    fn semantic_token_positions(tokens: &[SemanticToken]) -> Vec<(u32, u32, u32)> {
+        let mut line = 0;
+        let mut start = 0;
+        let mut absolute = Vec::with_capacity(tokens.len());
+
+        for token in tokens {
+            line += token.delta_line;
+            if token.delta_line == 0 {
+                start += token.delta_start;
+            } else {
+                start = token.delta_start;
+            }
+            absolute.push((line, start, token.token_type));
+        }
+
+        absolute
     }
 
     fn code_action_params(
