@@ -15,6 +15,11 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tracing::{debug, info};
 
+mod ruff;
+
+use ruff::RuffFormatClient;
+pub use ruff::RuffFormatConfig;
+
 const TOKEN_TYPE_MACRO: u32 = 14;
 const TOKEN_MODIFIER_NONE: u32 = 0;
 const DIAGNOSTIC_DEBOUNCE_MS: u64 = 250;
@@ -27,16 +32,24 @@ pub struct TLinterLanguageServer {
     diagnostic_tasks: Arc<DashMap<Url, tokio::task::JoinHandle<()>>>,
     parser: Arc<tokio::sync::Mutex<TemplateStringParser>>,
     highlighter: Arc<tokio::sync::Mutex<TemplateHighlighter>>,
+    config: Arc<tokio::sync::RwLock<TLinterConfig>>,
+    ruff: Arc<tokio::sync::RwLock<Option<Arc<RuffFormatClient>>>>,
 }
 
 impl TLinterLanguageServer {
     pub fn new(client: Client) -> Result<Self> {
+        Self::with_config(client, TLinterConfig::default())
+    }
+
+    pub fn with_config(client: Client, config: TLinterConfig) -> Result<Self> {
         Ok(Self {
             client,
             document_cache: Arc::new(DashMap::new()),
             diagnostic_tasks: Arc::new(DashMap::new()),
             parser: Arc::new(tokio::sync::Mutex::new(TemplateStringParser::new()?)),
             highlighter: Arc::new(tokio::sync::Mutex::new(TemplateHighlighter::new()?)),
+            config: Arc::new(tokio::sync::RwLock::new(config)),
+            ruff: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
 
@@ -104,7 +117,26 @@ impl TLinterLanguageServer {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for TLinterLanguageServer {
-    async fn initialize(&self, _: InitializeParams) -> JsonRpcResult<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> JsonRpcResult<InitializeResult> {
+        let startup_config = self.config.read().await.clone();
+        let config =
+            parse_initialization_config(params.initialization_options.clone(), startup_config);
+        *self.config.write().await = config.clone();
+        if config.ruff_format.enabled {
+            let initialize_params = serde_json::to_value(&params)
+                .map_err(|error| internal_error(anyhow::Error::new(error)))?;
+            match RuffFormatClient::start(&config.ruff_format, initialize_params).await {
+                Ok(client) => {
+                    *self.ruff.write().await = Some(Arc::new(client));
+                }
+                Err(error) => {
+                    return Err(internal_error(
+                        error.context("Failed to initialize Ruff formatter"),
+                    ));
+                }
+            }
+        }
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -183,6 +215,9 @@ impl LanguageServer for TLinterLanguageServer {
     }
 
     async fn shutdown(&self) -> JsonRpcResult<()> {
+        if let Some(ruff) = self.ruff.write().await.take() {
+            ruff.shutdown().await;
+        }
         Ok(())
     }
 
@@ -190,15 +225,73 @@ impl LanguageServer for TLinterLanguageServer {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
 
+        let forwarded = DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: params.text_document.language_id,
+                version: params.text_document.version,
+                text: text.clone(),
+            },
+        };
         self.document_cache.insert(uri.clone(), text);
+        let ruff = self.ruff.read().await.clone();
+        if let Some(ruff) = ruff {
+            match serde_json::to_value(&forwarded) {
+                Ok(value) => {
+                    if let Err(error) = ruff.did_open(value).await {
+                        self.client
+                            .log_message(
+                                MessageType::ERROR,
+                                format!("Failed to sync didOpen to Ruff: {error}"),
+                            )
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    self.client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("Failed to serialize didOpen for Ruff: {error}"),
+                        )
+                        .await;
+                }
+            }
+        }
         self.schedule_diagnostics(uri);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let uri = params.text_document.uri;
+        let uri = params.text_document.uri.clone();
 
         if let Some(change) = params.content_changes.into_iter().next() {
-            self.document_cache.insert(uri.clone(), change.text);
+            self.document_cache.insert(uri.clone(), change.text.clone());
+            let ruff = self.ruff.read().await.clone();
+            if let Some(ruff) = ruff {
+                let forwarded = DidChangeTextDocumentParams {
+                    text_document: params.text_document,
+                    content_changes: vec![change],
+                };
+                match serde_json::to_value(&forwarded) {
+                    Ok(value) => {
+                        if let Err(error) = ruff.did_change(value).await {
+                            self.client
+                                .log_message(
+                                    MessageType::ERROR,
+                                    format!("Failed to sync didChange to Ruff: {error}"),
+                                )
+                                .await;
+                        }
+                    }
+                    Err(error) => {
+                        self.client
+                            .log_message(
+                                MessageType::ERROR,
+                                format!("Failed to serialize didChange for Ruff: {error}"),
+                            )
+                            .await;
+                    }
+                }
+            }
             self.schedule_diagnostics(uri);
         }
     }
@@ -208,6 +301,29 @@ impl LanguageServer for TLinterLanguageServer {
     }
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.document_cache.remove(&params.text_document.uri);
+        let ruff = self.ruff.read().await.clone();
+        if let Some(ruff) = ruff {
+            match serde_json::to_value(&params) {
+                Ok(value) => {
+                    if let Err(error) = ruff.did_close(value).await {
+                        self.client
+                            .log_message(
+                                MessageType::ERROR,
+                                format!("Failed to sync didClose to Ruff: {error}"),
+                            )
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    self.client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("Failed to serialize didClose for Ruff: {error}"),
+                        )
+                        .await;
+                }
+            }
+        }
         if let Some((_, handle)) = self.diagnostic_tasks.remove(&params.text_document.uri) {
             handle.abort();
         }
@@ -395,9 +511,29 @@ impl TLinterLanguageServer {
             .clone();
         let options =
             resolve_lsp_format_options(uri, formatting_options).map_err(internal_error)?;
-        let edits = format_document_with_options(&text, &options).map_err(internal_error)?;
+        let ruff = self.ruff.read().await.clone();
+        let ruff_edits = if let Some(ruff) = ruff {
+            let params = DocumentFormattingParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                options: formatting_options
+                    .cloned()
+                    .unwrap_or_else(|| FormattingOptions {
+                        tab_size: 4,
+                        insert_spaces: true,
+                        ..Default::default()
+                    }),
+                work_done_progress_params: Default::default(),
+            };
+            ruff.format(&params).await.map_err(internal_error)?
+        } else {
+            Vec::new()
+        };
+        let ruff_text = apply_lsp_text_edits(&text, &ruff_edits).map_err(internal_error)?;
+        let edits = format_document_with_options(&ruff_text, &options).map_err(internal_error)?;
+        let final_text =
+            t_linter_core::apply_template_edits(&ruff_text, &edits).map_err(internal_error)?;
 
-        Ok(template_edits_to_lsp(edits))
+        final_text_edit(&text, &final_text).map_err(internal_error)
     }
 
     async fn collect_single_template_selection_format_edits(
@@ -741,11 +877,16 @@ fn internal_error(err: anyhow::Error) -> tower_lsp::jsonrpc::Error {
 }
 
 pub async fn run_server() -> Result<()> {
+    run_server_with_config(TLinterConfig::default()).await
+}
+
+pub async fn run_server_with_config(config: TLinterConfig) -> Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| {
-        TLinterLanguageServer::new(client).expect("Failed to create language server")
+    let (service, socket) = LspService::new(move |client| {
+        TLinterLanguageServer::with_config(client, config.clone())
+            .expect("Failed to create language server")
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;
@@ -753,10 +894,26 @@ pub async fn run_server() -> Result<()> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TLinterInitializationOptions {
+    #[serde(default)]
+    enable_type_checking: Option<bool>,
+    #[serde(default)]
+    pyright_path: Option<String>,
+    #[serde(default)]
+    highlight_untyped: Option<bool>,
+    #[serde(default)]
+    highlight_untyped_templates: Option<bool>,
+    #[serde(default)]
+    ruff_format: Option<RuffFormatConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TLinterConfig {
     pub enable_type_checking: bool,
     pub pyright_path: Option<String>,
     pub highlight_untyped_templates: bool,
+    pub ruff_format: RuffFormatConfig,
 }
 
 impl Default for TLinterConfig {
@@ -765,8 +922,213 @@ impl Default for TLinterConfig {
             enable_type_checking: true,
             pyright_path: None,
             highlight_untyped_templates: true,
+            ruff_format: RuffFormatConfig::default(),
         }
     }
+}
+
+fn parse_initialization_config(
+    initialization_options: Option<serde_json::Value>,
+    defaults: TLinterConfig,
+) -> TLinterConfig {
+    let Some(value) = initialization_options else {
+        return defaults;
+    };
+    let Ok(options) = serde_json::from_value::<TLinterInitializationOptions>(value) else {
+        return defaults;
+    };
+    TLinterConfig {
+        enable_type_checking: options
+            .enable_type_checking
+            .unwrap_or(defaults.enable_type_checking),
+        pyright_path: options.pyright_path,
+        highlight_untyped_templates: options
+            .highlight_untyped_templates
+            .or(options.highlight_untyped)
+            .unwrap_or(defaults.highlight_untyped_templates),
+        ruff_format: options.ruff_format.unwrap_or(defaults.ruff_format),
+    }
+}
+
+fn apply_lsp_text_edits(source: &str, edits: &[TextEdit]) -> Result<String> {
+    if edits.is_empty() {
+        return Ok(source.to_string());
+    }
+
+    let line_starts = line_start_offsets(source);
+    let mut byte_edits = edits
+        .iter()
+        .enumerate()
+        .map(|(index, edit)| {
+            let start = lsp_position_to_byte_offset(source, &line_starts, edit.range.start)?;
+            let end = lsp_position_to_byte_offset(source, &line_starts, edit.range.end)?;
+            if start > end {
+                return Err(anyhow::anyhow!("TextEdit start offset is after end offset"));
+            }
+            Ok((start, end, index, edit.new_text.as_str()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    byte_edits.sort_by_key(|(start, end, index, _)| (*start, *end, *index));
+    let mut output = String::with_capacity(
+        source.len()
+            + byte_edits
+                .iter()
+                .map(|(_, _, _, text)| text.len())
+                .sum::<usize>(),
+    );
+    let mut cursor = 0;
+    let mut edit_index = 0;
+    while edit_index < byte_edits.len() {
+        let (start, end, _, _) = byte_edits[edit_index];
+        if start < cursor {
+            return Err(anyhow::anyhow!("Overlapping TextEdit ranges"));
+        }
+        output.push_str(&source[cursor..start]);
+
+        let mut group_end = edit_index + 1;
+        while group_end < byte_edits.len()
+            && byte_edits[group_end].0 == start
+            && byte_edits[group_end].1 == end
+        {
+            group_end += 1;
+        }
+
+        if start == end {
+            let mut insertions = byte_edits[edit_index..group_end].to_vec();
+            insertions.sort_by_key(|(_, _, index, _)| *index);
+            for (_, _, _, text) in insertions {
+                output.push_str(text);
+            }
+            cursor = start;
+            edit_index = group_end;
+        } else {
+            if group_end != edit_index + 1 {
+                return Err(anyhow::anyhow!("Overlapping TextEdit ranges"));
+            }
+            output.push_str(byte_edits[edit_index].3);
+            cursor = end;
+            edit_index += 1;
+        }
+    }
+    output.push_str(&source[cursor..]);
+    Ok(output)
+}
+
+fn final_text_edit(source: &str, final_text: &str) -> Result<Vec<TextEdit>> {
+    if source == final_text {
+        return Ok(Vec::new());
+    }
+
+    let source_chars = source.chars().collect::<Vec<_>>();
+    let final_chars = final_text.chars().collect::<Vec<_>>();
+    let mut prefix = 0;
+    while prefix < source_chars.len()
+        && prefix < final_chars.len()
+        && source_chars[prefix] == final_chars[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut suffix = 0;
+    while suffix + prefix < source_chars.len()
+        && suffix + prefix < final_chars.len()
+        && source_chars[source_chars.len() - 1 - suffix]
+            == final_chars[final_chars.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let source_start = byte_offset_for_char(source, prefix);
+    let source_end = byte_offset_for_char(source, source_chars.len() - suffix);
+    let final_start = byte_offset_for_char(final_text, prefix);
+    let final_end = byte_offset_for_char(final_text, final_chars.len() - suffix);
+    let line_starts = line_start_offsets(source);
+
+    Ok(vec![TextEdit {
+        range: Range {
+            start: byte_offset_to_lsp_position(source, &line_starts, source_start)?,
+            end: byte_offset_to_lsp_position(source, &line_starts, source_end)?,
+        },
+        new_text: final_text[final_start..final_end].to_string(),
+    }])
+}
+
+fn line_start_offsets(source: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (index, byte) in source.bytes().enumerate() {
+        if byte == b'\n' {
+            starts.push(index + 1);
+        }
+    }
+    starts
+}
+
+fn lsp_position_to_byte_offset(
+    source: &str,
+    line_starts: &[usize],
+    position: Position,
+) -> Result<usize> {
+    let line_start = *line_starts
+        .get(position.line as usize)
+        .ok_or_else(|| anyhow::anyhow!("Line {} is out of bounds", position.line))?;
+    let line_end = line_starts
+        .get(position.line as usize + 1)
+        .map(|next| next.saturating_sub(1))
+        .unwrap_or(source.len());
+    let line = &source[line_start..line_end];
+    let mut utf16_units = 0_u32;
+    for (byte_offset, character) in line.char_indices() {
+        if utf16_units == position.character {
+            return Ok(line_start + byte_offset);
+        }
+        utf16_units += character.len_utf16() as u32;
+        if utf16_units > position.character {
+            return Err(anyhow::anyhow!(
+                "Character {} is inside a UTF-16 surrogate pair",
+                position.character
+            ));
+        }
+    }
+    if utf16_units == position.character {
+        Ok(line_end)
+    } else {
+        Err(anyhow::anyhow!(
+            "Character {} is out of bounds",
+            position.character
+        ))
+    }
+}
+
+fn byte_offset_to_lsp_position(
+    source: &str,
+    line_starts: &[usize],
+    offset: usize,
+) -> Result<Position> {
+    if offset > source.len() || !source.is_char_boundary(offset) {
+        return Err(anyhow::anyhow!("Invalid byte offset {offset}"));
+    }
+    let line = match line_starts.binary_search(&offset) {
+        Ok(index) => index,
+        Err(index) => index.saturating_sub(1),
+    };
+    let line_start = line_starts[line];
+    let character = source[line_start..offset]
+        .chars()
+        .map(|character| character.len_utf16() as u32)
+        .sum();
+    Ok(Position {
+        line: line as u32,
+        character,
+    })
+}
+
+fn byte_offset_for_char(source: &str, char_offset: usize) -> usize {
+    source
+        .char_indices()
+        .nth(char_offset)
+        .map(|(offset, _)| offset)
+        .unwrap_or(source.len())
 }
 
 #[cfg(test)]
@@ -986,6 +1348,133 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
         );
         assert_eq!(TLinterConfig::default().pyright_path, None);
         assert!(TLinterConfig::default().enable_type_checking);
+    }
+
+    #[test]
+    fn initialization_config_accepts_ruff_format_options() {
+        let config = parse_initialization_config(
+            Some(serde_json::json!({
+                "enableTypeChecking": false,
+                "highlightUntyped": false,
+                "ruffFormat": {
+                    "enabled": true,
+                    "command": "/tmp/ruff",
+                    "args": ["server"],
+                    "settings": {
+                        "lineLength": 100,
+                        "format": {"preview": true}
+                    }
+                }
+            })),
+            TLinterConfig::default(),
+        );
+
+        assert!(!config.enable_type_checking);
+        assert!(!config.highlight_untyped_templates);
+        assert!(config.ruff_format.enabled);
+        assert_eq!(config.ruff_format.command, "/tmp/ruff");
+        assert_eq!(config.ruff_format.settings["lineLength"], 100);
+    }
+
+    #[test]
+    fn initialization_config_preserves_startup_ruff_defaults_when_omitted() {
+        let defaults = TLinterConfig {
+            ruff_format: RuffFormatConfig {
+                enabled: true,
+                command: "/opt/ruff".to_string(),
+                args: vec!["server".to_string()],
+                settings: serde_json::json!({"lineLength": 120}),
+            },
+            ..Default::default()
+        };
+
+        let config = parse_initialization_config(
+            Some(serde_json::json!({
+                "enableTypeChecking": false
+            })),
+            defaults,
+        );
+
+        assert!(!config.enable_type_checking);
+        assert!(config.ruff_format.enabled);
+        assert_eq!(config.ruff_format.command, "/opt/ruff");
+        assert_eq!(config.ruff_format.settings["lineLength"], 120);
+    }
+
+    #[test]
+    fn lsp_text_edit_helpers_apply_utf16_and_compute_final_edit() {
+        let source = "name = '世界'\ntext = t\"<div>{ name }</div>\"\n";
+        let edits = vec![
+            TextEdit {
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 10,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 10,
+                    },
+                },
+                new_text: "!".to_string(),
+            },
+            TextEdit {
+                range: Range {
+                    start: Position {
+                        line: 1,
+                        character: 14,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 22,
+                    },
+                },
+                new_text: "{name}".to_string(),
+            },
+        ];
+        let applied = apply_lsp_text_edits(source, &edits).expect("apply edits");
+        assert_eq!(applied, "name = '世界!'\ntext = t\"<div>{name}</div>\"\n");
+
+        let final_edits = final_text_edit(source, &applied).expect("final edit");
+        assert_eq!(
+            apply_lsp_text_edits(source, &final_edits).expect("apply final edit"),
+            applied
+        );
+    }
+
+    #[test]
+    fn lsp_text_edit_helpers_reject_overlap() {
+        let source = "abcdef";
+        let edits = vec![
+            TextEdit {
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 1,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 4,
+                    },
+                },
+                new_text: "x".to_string(),
+            },
+            TextEdit {
+                range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 2,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 5,
+                    },
+                },
+                new_text: "y".to_string(),
+            },
+        ];
+
+        assert!(apply_lsp_text_edits(source, &edits).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]

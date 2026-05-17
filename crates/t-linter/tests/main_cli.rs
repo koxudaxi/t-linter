@@ -50,7 +50,11 @@ fn stats_command_succeeds() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(String::from_utf8(output.stdout).unwrap().contains("Analyzing statistics for: ."));
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("Analyzing statistics for: .")
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -108,8 +112,31 @@ fn lsp_subcommand_exits_cleanly_with_closed_stdio() {
 }
 
 #[test]
+fn lsp_subcommand_accepts_ruff_startup_options_with_closed_stdio() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_t-linter"))
+        .args([
+            "lsp",
+            "--stdio",
+            "--ruff-format",
+            "--ruff-command",
+            "ruff",
+            "--ruff-arg",
+            "server",
+        ])
+        .spawn()
+        .unwrap();
+
+    assert_eq!(
+        wait_for_child_with_timeout(&mut child, Duration::from_secs(10)).code(),
+        Some(0)
+    );
+}
+
+#[test]
 fn default_command_exits_cleanly_with_closed_stdio() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_t-linter")).spawn().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_t-linter"))
+        .spawn()
+        .unwrap();
 
     assert_eq!(
         wait_for_child_with_timeout(&mut child, Duration::from_secs(10)).code(),

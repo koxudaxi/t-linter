@@ -106,6 +106,7 @@ If you use VSCode, install the extension for seamless editor integration:
        }
      }
      ```
+     Set `"t-linter.format.runRuffFirst": true` if you want this formatter mode to run Ruff first and then t-linter in one composed formatting transaction.
    VSCode only allows one default formatter per language, which is why t-linter also exposes a save-time code action lane for template-string formatting.
 6. If semantic highlighting conflicts with another Python extension, set the Python language server to `"None"` in your workspace settings:
    ```json
@@ -191,6 +192,9 @@ Start the Language Server Protocol server for editor integration:
 
 ```bash
 t-linter lsp
+
+# Start the LSP server with composed Ruff -> t-linter document formatting
+t-linter lsp --ruff-format
 ```
 
 The LSP server provides:

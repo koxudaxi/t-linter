@@ -103,7 +103,8 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
         outputChannel,
         initializationOptions: {
             enableTypeChecking: vscode.workspace.getConfiguration('t-linter').get<boolean>('enableTypeChecking', true),
-            highlightUntyped: vscode.workspace.getConfiguration('t-linter').get<boolean>('highlightUntyped', true)
+            highlightUntyped: vscode.workspace.getConfiguration('t-linter').get<boolean>('highlightUntyped', true),
+            ruffFormat: await resolveRuffFormatOptions()
         }
     };
 
@@ -240,6 +241,69 @@ async function findBundledServerPath(context: vscode.ExtensionContext): Promise<
 
     outputChannel.appendLine(`Bundled binary is not executable: ${bundledPath}`);
     return { kind: 'not-executable', path: bundledPath };
+}
+
+async function resolveRuffFormatOptions(): Promise<Record<string, unknown>> {
+    const tlinterConfig = vscode.workspace.getConfiguration('t-linter');
+    if (!tlinterConfig.get<boolean>('format.runRuffFirst', false)) {
+        return { enabled: false };
+    }
+
+    const ruffConfig = vscode.workspace.getConfiguration('ruff');
+    const ruffPath = await firstExecutablePath(ruffConfig.get<string[]>('path', []));
+    const command = ruffPath ?? 'ruff';
+
+    return {
+        enabled: true,
+        command,
+        args: ['server'],
+        settings: collectRuffServerSettings(ruffConfig)
+    };
+}
+
+function collectRuffServerSettings(config: vscode.WorkspaceConfiguration): Record<string, unknown> {
+    const settings: Record<string, unknown> = {};
+    copySetting(config, settings, 'configuration');
+    copySetting(config, settings, 'configurationPreference');
+    copySetting(config, settings, 'exclude');
+    copySetting(config, settings, 'fixAll');
+    copySetting(config, settings, 'format');
+    copySetting(config, settings, 'lineLength');
+    copySetting(config, settings, 'lint');
+    copySetting(config, settings, 'logLevel');
+    copySetting(config, settings, 'organizeImports');
+    copySetting(config, settings, 'showSyntaxErrors');
+    return settings;
+}
+
+function copySetting(
+    config: vscode.WorkspaceConfiguration,
+    target: Record<string, unknown>,
+    key: string,
+) {
+    const inspected = config.inspect(key);
+    if (
+        inspected?.globalValue === undefined
+        && inspected?.workspaceValue === undefined
+        && inspected?.workspaceFolderValue === undefined
+        && inspected?.defaultValue === undefined
+    ) {
+        return;
+    }
+
+    const value = config.get(key);
+    if (value !== undefined) {
+        target[key] = value;
+    }
+}
+
+async function firstExecutablePath(paths: string[]): Promise<string | undefined> {
+    for (const candidate of paths) {
+        if (await checkExecutable(candidate)) {
+            return candidate;
+        }
+    }
+    return undefined;
 }
 
 async function checkExecutable(path: string): Promise<boolean> {

@@ -10,6 +10,18 @@ t-linter lsp
 
 The LSP server communicates over stdin/stdout using the standard LSP protocol.
 
+To make document formatting run Ruff before t-linter, enable the composed formatter at server startup:
+
+```bash
+t-linter lsp --ruff-format
+```
+
+By default this starts `ruff server`. Override the executable or server arguments when your editor or agent needs a pinned binary:
+
+```bash
+t-linter lsp --ruff-format --ruff-command /path/to/ruff --ruff-arg server
+```
+
 ## Features
 
 The LSP server provides:
@@ -51,6 +63,34 @@ The server advertises `textDocument/codeAction` support with two t-linter-specif
 
 The existing `textDocument/formatting` and `textDocument/rangeFormatting` endpoints remain available for backward compatibility.
 
+### Composed Ruff Formatting
+
+When Ruff formatting is enabled, t-linter handles `textDocument/formatting` transactionally:
+
+1. Request formatting edits from `ruff server`.
+2. Apply those edits to an in-memory shadow copy of the document.
+3. Run t-linter template formatting on the shadow copy.
+4. Return one final edit set from the original document to the composed result.
+
+Ruff is used only for the formatting pass. t-linter does not forward Ruff diagnostics, code actions, or workspace edits.
+
+Editors that support LSP initialization options can enable the same behavior without CLI flags:
+
+```json
+{
+  "ruffFormat": {
+    "enabled": true,
+    "command": "ruff",
+    "args": ["server"],
+    "settings": {
+      "lineLength": 100
+    }
+  }
+}
+```
+
+If both CLI flags and `initializationOptions.ruffFormat` are provided, the initialization options take precedence for that LSP session. This lets editor extensions or coding agents choose the Ruff binary and settings explicitly while keeping `t-linter lsp --ruff-format` useful for simpler clients.
+
 ### Line Length Resolution
 
 For HTML and T-HTML formatting, line length is resolved in this order:
@@ -73,7 +113,7 @@ Add t-linter as an LSP server in your project's `.claude/settings.json`:
   "lsp": {
     "t-linter": {
       "command": "t-linter",
-      "args": ["lsp"],
+      "args": ["lsp", "--ruff-format"],
       "languages": ["python"]
     }
   }
@@ -128,7 +168,7 @@ VSCode supports only one default formatter per language, which is why t-linter e
 ```lua
 vim.lsp.start({
   name = "t-linter",
-  cmd = { "t-linter", "lsp" },
+  cmd = { "t-linter", "lsp", "--ruff-format" },
   filetypes = { "python" },
 })
 ```

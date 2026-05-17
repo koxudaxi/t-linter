@@ -40,7 +40,7 @@ The extension bundles `t-linter` binaries for Linux x64, macOS x64/arm64, and Wi
 
 ### Step 2: Choose your save-time formatting mode
 
-VSCode supports only one default formatter per language. t-linter therefore supports both a formatter mode and a save-time code action mode.
+VSCode supports only one default formatter per language. t-linter therefore supports a Ruff coexistence code action mode, a composed Ruff + t-linter formatter mode, and a t-linter-only formatter mode.
 
 #### Ruff coexistence mode
 
@@ -70,6 +70,18 @@ Keep the original formatter-only workflow:
   }
 }
 ```
+
+To run Ruff first in this formatter workflow, keep t-linter as the default formatter and enable:
+
+```json
+{
+  "t-linter.format.runRuffFirst": true
+}
+```
+
+t-linter starts `ruff server`, applies Ruff edits to an in-memory shadow document, applies t-linter template formatting, and returns one composed edit set. Keep the Ruff extension installed for its settings UI; t-linter reads safe `ruff.*` settings and uses `ruff.path` when it points to an executable, otherwise `ruff` must be on `PATH`.
+
+The same composed formatter is available outside VSCode through `t-linter lsp --ruff-format` or LSP `initializationOptions.ruffFormat`.
 
 `source.fixAll.t-linter` formats every format-capable template literal in the current file. The manual `refactor.rewrite.t-linter` action appears only when your selection maps to exactly one template literal.
 
@@ -207,6 +219,7 @@ This extension contributes the following settings:
 
 - **`t-linter.enabled`**: Enable/disable the t-linter extension
 - **`t-linter.serverPath`**: Path to t-linter executable (leave empty for automatic detection)
+- **`t-linter.format.runRuffFirst`**: Run Ruff formatting before t-linter formatting when t-linter is the Python formatter (default: false)
 - **`t-linter.highlightUntyped`**: Highlight template strings without type annotations (default: true)
 - **`t-linter.enableTypeChecking`**: Enable integration with Python type checkers for cross-module resolution (default: true)
 - **`t-linter.trace.server`**: Trace communication between VSCode and the language server (off/messages/verbose)
