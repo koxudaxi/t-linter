@@ -6,7 +6,7 @@
 - [Installation](https://t-linter.koxudaxi.dev/installation/): t-linter can be installed in three ways depending on your use case.
 ## Usage
 
-- [VSCode Extension](https://t-linter.koxudaxi.dev/usage/vscode/): VSCode supports two t-linter save-time formatting modes: Ruff coexistence mode and t-linter formatter mode.
+- [VSCode Extension](https://t-linter.koxudaxi.dev/usage/vscode/): VSCode supports three t-linter save-time formatting modes: Ruff coexistence mode, composed Ruff + t-linter formatter mode, and t-linter formatter m...
 ### CLI
 
 - [Check Command](https://t-linter.koxudaxi.dev/usage/cli/check/): The `check` command validates Python template strings for syntax errors in embedded languages.
