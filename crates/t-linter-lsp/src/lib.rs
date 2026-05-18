@@ -13,7 +13,7 @@ use t_linter_core::{
 use tower_lsp::jsonrpc::Result as JsonRpcResult;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 mod ruff;
 
@@ -405,9 +405,18 @@ impl LanguageServer for TLinterLanguageServer {
         let rewrite_kind = Self::refactor_rewrite_kind();
 
         if requested_code_action_kinds_include(requested_kinds, &source_fix_all_kind) {
-            let edits = self
+            let edits = match self
                 .collect_document_format_edits(&params.text_document.uri, None)
-                .await?;
+                .await
+            {
+                Ok(edits) => edits,
+                Err(err) if is_internal_lsp_error(&err) => {
+                    self.log_skipped_code_action_error(&source_fix_all_kind, &err)
+                        .await;
+                    Vec::new()
+                }
+                Err(err) => return Err(err),
+            };
 
             if !edits.is_empty() {
                 let title = source_fix_all_title(self.ruff.read().await.is_some());
@@ -432,9 +441,9 @@ impl LanguageServer for TLinterLanguageServer {
                     &params.range,
                     None,
                 )
-                .await?
+                .await
             {
-                SelectionFormatEdits::Edits(edits) if !edits.is_empty() => {
+                Ok(SelectionFormatEdits::Edits(edits)) if !edits.is_empty() => {
                     actions.push(
                         CodeAction {
                             title: "Rewrite template string with t-linter".to_string(),
@@ -445,9 +454,16 @@ impl LanguageServer for TLinterLanguageServer {
                         .into(),
                     );
                 }
-                SelectionFormatEdits::NoTemplate
-                | SelectionFormatEdits::MultipleTemplates
-                | SelectionFormatEdits::Edits(_) => {}
+                Ok(
+                    SelectionFormatEdits::NoTemplate
+                    | SelectionFormatEdits::MultipleTemplates
+                    | SelectionFormatEdits::Edits(_),
+                ) => {}
+                Err(err) if is_internal_lsp_error(&err) => {
+                    self.log_skipped_code_action_error(&rewrite_kind, &err)
+                        .await;
+                }
+                Err(err) => return Err(err),
             }
         }
 
@@ -660,6 +676,20 @@ impl TLinterLanguageServer {
                     .await
             }
         }
+    }
+
+    async fn log_skipped_code_action_error(
+        &self,
+        kind: &CodeActionKind,
+        err: &tower_lsp::jsonrpc::Error,
+    ) {
+        warn!("Skipping {} code action: {}", kind.as_str(), err.message);
+        self.client
+            .log_message(
+                MessageType::WARNING,
+                format!("Skipping {} code action: {}", kind.as_str(), err.message),
+            )
+            .await;
     }
 
     async fn generate_semantic_tokens(&self, uri: &Url) -> Result<SemanticTokens> {
@@ -1047,6 +1077,10 @@ fn requested_code_action_kinds_include(
             .iter()
             .any(|requested_kind| code_action_kind_matches(requested_kind, action_kind))
     })
+}
+
+fn is_internal_lsp_error(err: &tower_lsp::jsonrpc::Error) -> bool {
+    matches!(err.code, tower_lsp::jsonrpc::ErrorCode::InternalError)
 }
 
 fn source_fix_all_title(ruff_enabled: bool) -> &'static str {
@@ -2346,6 +2380,55 @@ query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
             .await
             .expect("code action response");
         assert!(no_rewrite_from_fix_all_filter.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn code_action_ignores_transient_template_format_errors() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+title = "demo"
+payload: Annotated[Template, "html"] = t"""
+<html><div>{title}< /div></html>
+
+"""
+"#;
+        let uri = write_source_file(temp.path(), "example.py", source);
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+        open_cached_document(server, &uri, source).await;
+
+        let no_fix_all = server
+            .code_action(code_action_params(
+                uri.clone(),
+                full_document_range(),
+                Some(vec![TLinterLanguageServer::source_fix_all_kind()]),
+            ))
+            .await
+            .expect("code action should not fail on malformed template content");
+        assert!(no_fix_all.is_none());
+
+        let no_rewrite = server
+            .code_action(code_action_params(
+                uri,
+                Range {
+                    start: Position {
+                        line: 5,
+                        character: 20,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 20,
+                    },
+                },
+                Some(vec![TLinterLanguageServer::refactor_rewrite_kind()]),
+            ))
+            .await
+            .expect("rewrite code action should not fail on malformed template content");
+        assert!(no_rewrite.is_none());
     }
 
     #[test]
