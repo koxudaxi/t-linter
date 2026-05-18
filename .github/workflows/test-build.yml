@@ -16,7 +16,7 @@ jobs:
 
     - name: Install Ruff for LSP e2e tests
       run: |
-        uv tool install ruff==0.12.0
+        uv tool install ruff==0.15.13
         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
     
     - name: Setup Rust

@@ -3,7 +3,11 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn test_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -44,7 +48,8 @@ fn ruff_command() -> String {
 struct LspClient {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    messages: Receiver<Value>,
+    reader: Option<JoinHandle<()>>,
     next_id: i64,
 }
 
@@ -68,11 +73,21 @@ impl LspClient {
             .unwrap();
 
         let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let stdout = child.stdout.take().unwrap();
+        let (message_sender, messages) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            while let Some(message) = read_lsp_message(&mut stdout) {
+                if message_sender.send(message).is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             child,
             stdin: Some(stdin),
-            stdout,
+            messages,
+            reader: Some(reader),
             next_id: 1,
         }
     }
@@ -199,6 +214,9 @@ impl LspClient {
             wait_for_child_with_timeout(&mut self.child, Duration::from_secs(10)).code(),
             Some(0)
         );
+        if let Some(reader) = self.reader.take() {
+            reader.join().expect("LSP stdout reader panicked");
+        }
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
@@ -210,12 +228,7 @@ impl LspClient {
             "method": method,
             "params": params,
         }));
-        loop {
-            let message = self.read();
-            if message.get("id").and_then(Value::as_i64) == Some(id) {
-                return message;
-            }
-        }
+        self.wait_for_response(method, id)
     }
 
     fn request_without_params(&mut self, method: &str) -> Value {
@@ -226,8 +239,27 @@ impl LspClient {
             "id": id,
             "method": method,
         }));
+        self.wait_for_response(method, id)
+    }
+
+    fn wait_for_response(&mut self, method: &str, id: i64) -> Value {
+        let deadline = Instant::now() + LSP_REQUEST_TIMEOUT;
         loop {
-            let message = self.read();
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            let message = match self.messages.recv_timeout(remaining) {
+                Ok(message) => message,
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!(
+                        "LSP request '{method}' with id {id} timed out after {:?}",
+                        LSP_REQUEST_TIMEOUT
+                    );
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("LSP stdout reader exited before response to '{method}' id {id}");
+                }
+            };
             if message.get("id").and_then(Value::as_i64) == Some(id) {
                 return message;
             }
@@ -256,28 +288,30 @@ impl LspClient {
         stdin.write_all(&payload).unwrap();
         stdin.flush().unwrap();
     }
+}
 
-    fn read(&mut self) -> Value {
-        let mut content_length = None;
-        loop {
-            let mut line = String::new();
-            let bytes = self.stdout.read_line(&mut line).unwrap();
-            assert_ne!(bytes, 0, "LSP server closed stdout");
-            let line = line.trim_end_matches(['\r', '\n']);
-            if line.is_empty() {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':')
-                && name.eq_ignore_ascii_case("content-length")
-            {
-                content_length = Some(value.trim().parse::<usize>().unwrap());
-            }
+fn read_lsp_message(stdout: &mut BufReader<ChildStdout>) -> Option<Value> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let bytes = stdout.read_line(&mut line).unwrap();
+        if bytes == 0 {
+            return None;
         }
-        let content_length = content_length.expect("missing Content-Length");
-        let mut payload = vec![0; content_length];
-        self.stdout.read_exact(&mut payload).unwrap();
-        serde_json::from_slice(&payload).unwrap()
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = Some(value.trim().parse::<usize>().unwrap());
+        }
     }
+    let content_length = content_length.expect("missing Content-Length");
+    let mut payload = vec![0; content_length];
+    stdout.read_exact(&mut payload).unwrap();
+    Some(serde_json::from_slice(&payload).unwrap())
 }
 
 impl Drop for LspClient {
