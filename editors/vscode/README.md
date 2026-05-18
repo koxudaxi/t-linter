@@ -40,7 +40,7 @@ The extension bundles `t-linter` binaries for Linux x64, macOS x64/arm64, and Wi
 
 ### Step 2: Choose your save-time formatting mode
 
-VSCode supports only one default formatter per language. t-linter therefore supports both a formatter mode and a save-time code action mode.
+VSCode supports only one default formatter per language. t-linter therefore supports a Ruff coexistence code action mode, a composed Ruff + t-linter formatter mode, and a t-linter-only formatter mode.
 
 #### Ruff coexistence mode
 
@@ -58,9 +58,27 @@ Use Ruff for Python formatting and t-linter for template literals:
 }
 ```
 
-#### t-linter formatter mode
+#### Composed Ruff + t-linter formatter mode
 
-Keep the original formatter-only workflow:
+Use t-linter as the default formatter and run Ruff's save pipeline before template formatting:
+
+```json
+{
+  "[python]": {
+    "editor.defaultFormatter": "koxudaxi.t-linter",
+    "editor.formatOnSave": true
+  },
+  "t-linter.format.runRuffPipeline": true
+}
+```
+
+t-linter starts a Ruff LSP server, applies Ruff fixAll, import organization, and formatting edits to an in-memory shadow document, applies t-linter template formatting, and returns one composed edit set. Keep the Ruff extension installed for its settings UI; t-linter reads safe `ruff.*` settings and uses `ruff.path` when it points to an executable. Otherwise the Rust resolver tries venv/conda, workspace `.venv` or `venv`, uv projects, and then `ruff` on `PATH`.
+
+The same composed formatter is available outside VSCode through `t-linter lsp --ruff-pipeline` or LSP `initializationOptions.ruffPipeline`.
+
+#### t-linter-only formatter mode
+
+Keep the original formatter-only workflow without the Ruff pipeline:
 
 ```json
 {
@@ -207,6 +225,7 @@ This extension contributes the following settings:
 
 - **`t-linter.enabled`**: Enable/disable the t-linter extension
 - **`t-linter.serverPath`**: Path to t-linter executable (leave empty for automatic detection)
+- **`t-linter.format.runRuffPipeline`**: Run Ruff fixAll, import organization, and formatting before t-linter formatting when t-linter is the Python formatter (default: false)
 - **`t-linter.highlightUntyped`**: Highlight template strings without type annotations (default: true)
 - **`t-linter.enableTypeChecking`**: Enable integration with Python type checkers for cross-module resolution (default: true)
 - **`t-linter.trace.server`**: Trace communication between VSCode and the language server (off/messages/verbose)

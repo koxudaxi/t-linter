@@ -21,6 +21,15 @@ pub enum Commands {
     Lsp {
         #[arg(long, default_value = "true")]
         stdio: bool,
+
+        #[arg(long = "ruff-pipeline")]
+        ruff_pipeline: bool,
+
+        #[arg(long = "ruff-command")]
+        ruff_command: Option<String>,
+
+        #[arg(long = "ruff-arg", action = clap::ArgAction::Append)]
+        ruff_args: Vec<String>,
     },
     Check {
         #[arg(required = true)]

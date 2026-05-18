@@ -86,6 +86,11 @@
           "default": true,
           "description": "Highlight template strings without type annotations"
         },
+        "t-linter.format.runRuffPipeline": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run Ruff fixAll, import organization, and formatting before t-linter formatting and return one composed edit set."
+        },
         "t-linter.enableTypeChecking": {
           "type": "boolean",
           "default": true,

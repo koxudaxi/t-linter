@@ -1,11 +1,12 @@
 # VSCode Extension
 
-VSCode supports two t-linter save-time formatting modes: Ruff coexistence mode and t-linter formatter mode.
+VSCode supports three t-linter save-time formatting modes: Ruff coexistence mode, composed Ruff + t-linter formatter mode, and t-linter formatter mode.
 
 - **Ruff coexistence mode** keeps `Ruff` as the Python formatter and runs t-linter as a save-time code action for template literals.
+- **Composed Ruff + t-linter formatter mode** keeps t-linter as the Python formatter, asks Ruff for fixAll, import organization, and formatting first, then formats template literals and returns one composed edit set.
 - **t-linter formatter mode** keeps the existing formatter-only workflow for users who want t-linter to own formatting directly.
 
-This split exists because VSCode allows only one `editor.defaultFormatter` per language. t-linter therefore adds a dedicated code action lane for template-string rewrites instead of replacing Ruff.
+This split exists because VSCode allows only one `editor.defaultFormatter` per language. t-linter therefore supports either a dedicated code action lane for template-string rewrites or an explicit composed formatter path.
 
 ## Recommended Setup
 
@@ -32,9 +33,27 @@ You can also run the manual range action from the Command Palette or lightbulb U
 - `refactor.rewrite.t-linter` rewrites exactly one selected template literal
 - the action is hidden when the selection covers zero templates or spans multiple templates
 
+### Composed Ruff + t-linter Formatter Mode
+
+Use this when you want one formatter request to run the Ruff save pipeline first and t-linter second. t-linter starts a Ruff LSP server, forwards document sync to it, applies Ruff fixAll, import organization, and formatting edits to an in-memory shadow document, applies t-linter template formatting to that shadow document, and returns one final edit set to VSCode.
+
+```json
+{
+  "t-linter.format.runRuffPipeline": true,
+  "[python]": {
+    "editor.defaultFormatter": "koxudaxi.t-linter",
+    "editor.formatOnSave": true
+  }
+}
+```
+
+Keep the Ruff extension installed for its settings UI and project configuration support. t-linter reads the safe `ruff.*` VSCode settings it can pass to the Ruff server. When `ruff.path` points to an executable, VSCode passes it as `ruffPipeline.command`; otherwise the Rust LSP resolver tries active venv/conda, workspace `.venv` or `venv`, uv projects, and then `ruff` on `PATH`. Do not configure Ruff as the Python `editor.defaultFormatter` in this mode, because t-linter owns the formatter request and delegates the Ruff passes internally.
+
+This is the VSCode wrapper around the LSP-level `ruffPipeline` startup configuration. Other editors and coding agents can enable the same behavior with `t-linter lsp --ruff-pipeline` or by passing `initializationOptions.ruffPipeline`; see the [LSP server guide](./cli/lsp.md#ruff-save-pipeline).
+
 ### t-linter Formatter Mode
 
-Use this when you want t-linter to stay the active formatter for Python files.
+Use this when you want t-linter to stay the active formatter for Python files without invoking Ruff.
 
 ```json
 {
