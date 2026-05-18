@@ -389,9 +389,11 @@ impl LanguageServer for TLinterLanguageServer {
                 .await?;
 
             if !edits.is_empty() {
+                let title = source_fix_all_title(self.ruff.read().await.is_some());
+
                 actions.push(
                     CodeAction {
-                        title: "Format template strings with t-linter".to_string(),
+                        title: title.to_string(),
                         kind: Some(source_fix_all_kind),
                         edit: Some(workspace_edit_for_uri(&params.text_document.uri, edits)),
                         is_preferred: Some(true),
@@ -843,6 +845,14 @@ fn requested_code_action_kinds_include(
             .iter()
             .any(|requested_kind| code_action_kind_matches(requested_kind, action_kind))
     })
+}
+
+fn source_fix_all_title(ruff_enabled: bool) -> &'static str {
+    if ruff_enabled {
+        "Format Python and template strings with Ruff and t-linter"
+    } else {
+        "Format template strings with t-linter"
+    }
 }
 
 fn code_action_kind_matches(requested_kind: &CodeActionKind, action_kind: &CodeActionKind) -> bool {
@@ -1867,6 +1877,7 @@ plain = t"hello {name}"
             action.kind,
             Some(TLinterLanguageServer::source_fix_all_kind())
         );
+        assert_eq!(action.title, source_fix_all_title(false));
         let edit = action.edit.as_ref().expect("workspace edit");
         assert_eq!(
             edit.changes
@@ -1991,6 +2002,18 @@ query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
             .await
             .expect("code action response");
         assert!(no_rewrite_from_fix_all_filter.is_none());
+    }
+
+    #[test]
+    fn source_fix_all_title_mentions_ruff_when_composed_formatting_is_enabled() {
+        assert_eq!(
+            source_fix_all_title(false),
+            "Format template strings with t-linter"
+        );
+        assert_eq!(
+            source_fix_all_title(true),
+            "Format Python and template strings with Ruff and t-linter"
+        );
     }
 
     fn tempdir_with_pyproject(line_length: usize) -> TempDir {
