@@ -135,7 +135,10 @@ impl LspClient {
                 ]
             }),
         );
-        assert!(response.get("error").is_none(), "initialize failed: {response}");
+        assert!(
+            response.get("error").is_none(),
+            "initialize failed: {response}"
+        );
         self.notify("initialized", json!({}));
     }
 
@@ -186,7 +189,10 @@ impl LspClient {
 
     fn shutdown(mut self) {
         let response = self.request_without_params("shutdown");
-        assert!(response.get("error").is_none(), "shutdown failed: {response}");
+        assert!(
+            response.get("error").is_none(),
+            "shutdown failed: {response}"
+        );
         self.notify_without_params("exit");
         drop(self.stdin.take());
         assert_eq!(
@@ -246,12 +252,7 @@ impl LspClient {
     fn write(&mut self, message: Value) {
         let payload = serde_json::to_vec(&message).unwrap();
         let stdin = self.stdin.as_mut().expect("stdin is open");
-        write!(
-            stdin,
-            "Content-Length: {}\r\n\r\n",
-            payload.len()
-        )
-        .unwrap();
+        write!(stdin, "Content-Length: {}\r\n\r\n", payload.len()).unwrap();
         stdin.write_all(&payload).unwrap();
         stdin.flush().unwrap();
     }
@@ -381,7 +382,10 @@ fn lsp_document_formatting_runs_real_ruff_pipeline_then_t_linter() {
     client.did_open(&uri, source);
 
     let response = client.document_formatting(&uri);
-    assert!(response.get("error").is_none(), "formatting failed: {response}");
+    assert!(
+        response.get("error").is_none(),
+        "formatting failed: {response}"
+    );
     let edits = response["result"].as_array().expect("formatting edits");
     let formatted = apply_text_edits(source, edits);
 
@@ -404,7 +408,10 @@ fn lsp_source_fix_all_runs_real_ruff_pipeline_then_t_linter() {
     client.did_open(&uri, source);
 
     let response = client.source_fix_all(&uri, source.lines().count() as u32);
-    assert!(response.get("error").is_none(), "codeAction failed: {response}");
+    assert!(
+        response.get("error").is_none(),
+        "codeAction failed: {response}"
+    );
     let actions = response["result"].as_array().expect("code actions");
     assert_eq!(actions.len(), 1, "expected one t-linter fixAll action");
     assert_eq!(actions[0]["kind"], "source.fixAll.t-linter");

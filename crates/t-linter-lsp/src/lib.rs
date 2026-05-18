@@ -564,19 +564,17 @@ impl TLinterLanguageServer {
         let mut shadow_text = text.to_string();
         let mut shadow_version = version;
 
-        for actions in [
-            ruff.source_fix_all(&ruff_code_action_params(uri, &shadow_text))
-                .await?,
-            ruff.organize_imports(&ruff_code_action_params(uri, &shadow_text))
-                .await?,
-        ] {
-            let next_text = apply_ruff_code_actions(uri, &shadow_text, &actions)?;
-            if next_text != shadow_text {
-                shadow_text = next_text;
-                shadow_version = shadow_version.saturating_add(1);
-                sync_ruff_shadow_document(ruff, uri, shadow_version, &shadow_text).await?;
-            }
-        }
+        let actions = ruff
+            .source_fix_all(&ruff_code_action_params(uri, &shadow_text))
+            .await?;
+        apply_ruff_code_action_step(ruff, uri, &mut shadow_text, &mut shadow_version, &actions)
+            .await?;
+
+        let actions = ruff
+            .organize_imports(&ruff_code_action_params(uri, &shadow_text))
+            .await?;
+        apply_ruff_code_action_step(ruff, uri, &mut shadow_text, &mut shadow_version, &actions)
+            .await?;
 
         let ruff_document_format_edits = ruff
             .format(&DocumentFormattingParams {
@@ -929,6 +927,23 @@ fn full_lsp_range(text: &str) -> Range {
         end: byte_offset_to_lsp_position(text, &line_starts, text.len())
             .expect("document end is always a valid LSP position"),
     }
+}
+
+async fn apply_ruff_code_action_step(
+    ruff: &RuffPipelineClient,
+    uri: &Url,
+    shadow_text: &mut String,
+    shadow_version: &mut i32,
+    actions: &[CodeAction],
+) -> Result<()> {
+    let next_text = apply_ruff_code_actions(uri, shadow_text, actions)?;
+    if next_text != *shadow_text {
+        *shadow_text = next_text;
+        *shadow_version = shadow_version.saturating_add(1);
+        sync_ruff_shadow_document(ruff, uri, *shadow_version, shadow_text).await?;
+    }
+
+    Ok(())
 }
 
 async fn sync_ruff_shadow_document(

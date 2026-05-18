@@ -58,9 +58,27 @@ Use Ruff for Python formatting and t-linter for template literals:
 }
 ```
 
-#### t-linter formatter mode
+#### Composed Ruff + t-linter formatter mode
 
-Keep the original formatter-only workflow:
+Use t-linter as the default formatter and run Ruff's save pipeline before template formatting:
+
+```json
+{
+  "[python]": {
+    "editor.defaultFormatter": "koxudaxi.t-linter",
+    "editor.formatOnSave": true
+  },
+  "t-linter.format.runRuffPipeline": true
+}
+```
+
+t-linter starts a Ruff LSP server, applies Ruff fixAll, import organization, and formatting edits to an in-memory shadow document, applies t-linter template formatting, and returns one composed edit set. Keep the Ruff extension installed for its settings UI; t-linter reads safe `ruff.*` settings and uses `ruff.path` when it points to an executable. Otherwise the Rust resolver tries venv/conda, workspace `.venv` or `venv`, uv projects, and then `ruff` on `PATH`.
+
+The same composed formatter is available outside VSCode through `t-linter lsp --ruff-pipeline` or LSP `initializationOptions.ruffPipeline`.
+
+#### t-linter-only formatter mode
+
+Keep the original formatter-only workflow without the Ruff pipeline:
 
 ```json
 {
@@ -70,18 +88,6 @@ Keep the original formatter-only workflow:
   }
 }
 ```
-
-To run the Ruff save pipeline first in this formatter workflow, keep t-linter as the default formatter and enable:
-
-```json
-{
-  "t-linter.format.runRuffPipeline": true
-}
-```
-
-t-linter starts a Ruff LSP server, applies Ruff fixAll, import organization, and formatting edits to an in-memory shadow document, applies t-linter template formatting, and returns one composed edit set. Keep the Ruff extension installed for its settings UI; t-linter reads safe `ruff.*` settings and uses `ruff.path` when it points to an executable. Otherwise the Rust resolver tries venv/conda, workspace `.venv` or `venv`, uv projects, and then `ruff` on `PATH`.
-
-The same composed formatter is available outside VSCode through `t-linter lsp --ruff-pipeline` or LSP `initializationOptions.ruffPipeline`.
 
 `source.fixAll.t-linter` formats every format-capable template literal in the current file. The manual `refactor.rewrite.t-linter` action appears only when your selection maps to exactly one template literal.
 
