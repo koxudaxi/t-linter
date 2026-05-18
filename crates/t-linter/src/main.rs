@@ -26,17 +26,17 @@ fn init_logging(default_filter: &str) {
 }
 
 fn lsp_config(
-    ruff_format: bool,
-    ruff_command: String,
+    ruff_pipeline: bool,
+    ruff_command: Option<String>,
     ruff_args: Vec<String>,
 ) -> t_linter_lsp::TLinterConfig {
     let mut config = t_linter_lsp::TLinterConfig::default();
-    if ruff_format {
-        config.ruff_format = t_linter_lsp::RuffFormatConfig {
+    if ruff_pipeline {
+        config.ruff_pipeline = t_linter_lsp::RuffPipelineConfig {
             enabled: true,
             command: ruff_command,
             args: if ruff_args.is_empty() {
-                t_linter_lsp::RuffFormatConfig::default().args
+                t_linter_lsp::RuffPipelineConfig::default().args
             } else {
                 ruff_args
             },
@@ -53,13 +53,13 @@ async fn main() {
     let exit_code = match cli.command {
         Some(t_linter_cli::Commands::Lsp {
             stdio: _,
-            ruff_format,
+            ruff_pipeline,
             ruff_command,
             ruff_args,
         }) => {
             init_logging("info,tower_lsp=warn,t_linter=debug");
             match t_linter_lsp::run_server_with_config(lsp_config(
-                ruff_format,
+                ruff_pipeline,
                 ruff_command,
                 ruff_args,
             ))

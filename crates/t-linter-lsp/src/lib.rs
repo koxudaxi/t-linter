@@ -17,8 +17,8 @@ use tracing::{debug, info};
 
 mod ruff;
 
-use ruff::RuffFormatClient;
-pub use ruff::RuffFormatConfig;
+use ruff::RuffPipelineClient;
+pub use ruff::RuffPipelineConfig;
 
 const TOKEN_TYPE_MACRO: u32 = 14;
 const TOKEN_MODIFIER_NONE: u32 = 0;
@@ -28,12 +28,18 @@ const REFACTOR_REWRITE_T_LINTER: &str = "refactor.rewrite.t-linter";
 
 pub struct TLinterLanguageServer {
     client: Client,
-    document_cache: Arc<DashMap<Url, String>>,
+    document_cache: Arc<DashMap<Url, DocumentState>>,
     diagnostic_tasks: Arc<DashMap<Url, tokio::task::JoinHandle<()>>>,
     parser: Arc<tokio::sync::Mutex<TemplateStringParser>>,
     highlighter: Arc<tokio::sync::Mutex<TemplateHighlighter>>,
     config: Arc<tokio::sync::RwLock<TLinterConfig>>,
-    ruff: Arc<tokio::sync::RwLock<Option<Arc<RuffFormatClient>>>>,
+    ruff: Arc<tokio::sync::RwLock<Option<Arc<RuffPipelineClient>>>>,
+}
+
+#[derive(Debug, Clone)]
+struct DocumentState {
+    text: String,
+    version: i32,
 }
 
 impl TLinterLanguageServer {
@@ -122,16 +128,23 @@ impl LanguageServer for TLinterLanguageServer {
         let config =
             parse_initialization_config(params.initialization_options.clone(), startup_config);
         *self.config.write().await = config.clone();
-        if config.ruff_format.enabled {
+        if config.ruff_pipeline.enabled {
             let initialize_params = serde_json::to_value(&params)
                 .map_err(|error| internal_error(anyhow::Error::new(error)))?;
-            match RuffFormatClient::start(&config.ruff_format, initialize_params).await {
+            let workspace_roots = workspace_roots_from_initialize_params(&params);
+            match RuffPipelineClient::start(
+                &config.ruff_pipeline,
+                initialize_params,
+                &workspace_roots,
+            )
+            .await
+            {
                 Ok(client) => {
                     *self.ruff.write().await = Some(Arc::new(client));
                 }
                 Err(error) => {
                     return Err(internal_error(
-                        error.context("Failed to initialize Ruff formatter"),
+                        error.context("Failed to initialize Ruff pipeline"),
                     ));
                 }
             }
@@ -224,16 +237,18 @@ impl LanguageServer for TLinterLanguageServer {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
+        let version = params.text_document.version;
 
         let forwarded = DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: uri.clone(),
                 language_id: params.text_document.language_id,
-                version: params.text_document.version,
+                version,
                 text: text.clone(),
             },
         };
-        self.document_cache.insert(uri.clone(), text);
+        self.document_cache
+            .insert(uri.clone(), DocumentState { text, version });
         let ruff = self.ruff.read().await.clone();
         if let Some(ruff) = ruff {
             match serde_json::to_value(&forwarded) {
@@ -264,7 +279,13 @@ impl LanguageServer for TLinterLanguageServer {
         let uri = params.text_document.uri.clone();
 
         if let Some(change) = params.content_changes.into_iter().next() {
-            self.document_cache.insert(uri.clone(), change.text.clone());
+            self.document_cache.insert(
+                uri.clone(),
+                DocumentState {
+                    text: change.text.clone(),
+                    version: params.text_document.version,
+                },
+            );
             let ruff = self.ruff.read().await.clone();
             if let Some(ruff) = ruff {
                 let forwarded = DidChangeTextDocumentParams {
@@ -458,7 +479,10 @@ impl TLinterLanguageServer {
         let handle = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(DIAGNOSTIC_DEBOUNCE_MS)).await;
 
-            let Some(text) = document_cache.get(&task_uri).map(|entry| entry.clone()) else {
+            let Some(text) = document_cache
+                .get(&task_uri)
+                .map(|entry| entry.text.clone())
+            else {
                 diagnostic_tasks.remove(&task_uri);
                 return;
             };
@@ -506,36 +530,71 @@ impl TLinterLanguageServer {
         uri: &Url,
         formatting_options: Option<&FormattingOptions>,
     ) -> JsonRpcResult<Vec<TextEdit>> {
-        let text = self
+        let state = self
             .document_cache
             .get(uri)
             .ok_or_else(|| tower_lsp::jsonrpc::Error::invalid_params("Document not found"))?
             .clone();
+        let text = state.text;
         let options =
             resolve_lsp_format_options(uri, formatting_options).map_err(internal_error)?;
         let ruff = self.ruff.read().await.clone();
-        let ruff_edits = if let Some(ruff) = ruff {
-            let params = DocumentFormattingParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                options: formatting_options
-                    .cloned()
-                    .unwrap_or_else(|| FormattingOptions {
-                        tab_size: 4,
-                        insert_spaces: true,
-                        ..Default::default()
-                    }),
-                work_done_progress_params: Default::default(),
-            };
-            ruff.format(&params).await.map_err(internal_error)?
+        let ruff_text = if let Some(ruff) = ruff {
+            self.apply_ruff_pipeline(&ruff, uri, &text, state.version, formatting_options)
+                .await
+                .map_err(internal_error)?
         } else {
-            Vec::new()
+            text.clone()
         };
-        let ruff_text = apply_lsp_text_edits(&text, &ruff_edits).map_err(internal_error)?;
         let edits = format_document_with_options(&ruff_text, &options).map_err(internal_error)?;
         let final_text =
             t_linter_core::apply_template_edits(&ruff_text, &edits).map_err(internal_error)?;
 
         final_text_edit(&text, &final_text).map_err(internal_error)
+    }
+
+    async fn apply_ruff_pipeline(
+        &self,
+        ruff: &RuffPipelineClient,
+        uri: &Url,
+        text: &str,
+        version: i32,
+        formatting_options: Option<&FormattingOptions>,
+    ) -> Result<String> {
+        let mut shadow_text = text.to_string();
+        let mut shadow_version = version;
+
+        for actions in [
+            ruff.source_fix_all(&ruff_code_action_params(uri, &shadow_text))
+                .await?,
+            ruff.organize_imports(&ruff_code_action_params(uri, &shadow_text))
+                .await?,
+        ] {
+            let next_text = apply_ruff_code_actions(uri, &shadow_text, &actions)?;
+            if next_text != shadow_text {
+                shadow_text = next_text;
+                shadow_version = shadow_version.saturating_add(1);
+                sync_ruff_shadow_document(ruff, uri, shadow_version, &shadow_text).await?;
+            }
+        }
+
+        let ruff_document_format_edits = ruff
+            .format(&DocumentFormattingParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                options: formatting_options
+                    .cloned()
+                    .unwrap_or_else(default_formatting_options),
+                work_done_progress_params: Default::default(),
+            })
+            .await?;
+        let next_text = apply_lsp_text_edits(&shadow_text, &ruff_document_format_edits)?;
+        if next_text != shadow_text {
+            shadow_text = next_text;
+            shadow_version = shadow_version.saturating_add(1);
+            sync_ruff_shadow_document(ruff, uri, shadow_version, &shadow_text).await?;
+        }
+
+        Ok(shadow_text)
     }
 
     async fn collect_single_template_selection_format_edits(
@@ -548,6 +607,7 @@ impl TLinterLanguageServer {
             .document_cache
             .get(uri)
             .ok_or_else(|| tower_lsp::jsonrpc::Error::invalid_params("Document not found"))?
+            .text
             .clone();
         let options =
             resolve_lsp_format_options(uri, formatting_options).map_err(internal_error)?;
@@ -609,6 +669,7 @@ impl TLinterLanguageServer {
             .document_cache
             .get(uri)
             .ok_or_else(|| anyhow::anyhow!("Document not found in cache"))?
+            .text
             .clone();
 
         debug!("Generating semantic tokens for: {}", uri);
@@ -836,6 +897,132 @@ fn workspace_edit_for_uri(uri: &Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
     WorkspaceEdit::new(HashMap::from([(uri.clone(), edits)]))
 }
 
+fn default_formatting_options() -> FormattingOptions {
+    FormattingOptions {
+        tab_size: 4,
+        insert_spaces: true,
+        ..Default::default()
+    }
+}
+
+fn ruff_code_action_params(uri: &Url, text: &str) -> CodeActionParams {
+    CodeActionParams {
+        text_document: TextDocumentIdentifier { uri: uri.clone() },
+        range: full_lsp_range(text),
+        context: CodeActionContext {
+            diagnostics: Vec::new(),
+            only: None,
+            trigger_kind: None,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    }
+}
+
+fn full_lsp_range(text: &str) -> Range {
+    let line_starts = line_start_offsets(text);
+    Range {
+        start: Position {
+            line: 0,
+            character: 0,
+        },
+        end: byte_offset_to_lsp_position(text, &line_starts, text.len())
+            .expect("document end is always a valid LSP position"),
+    }
+}
+
+async fn sync_ruff_shadow_document(
+    ruff: &RuffPipelineClient,
+    uri: &Url,
+    version: i32,
+    text: &str,
+) -> Result<()> {
+    ruff.did_change(serde_json::to_value(DidChangeTextDocumentParams {
+        text_document: VersionedTextDocumentIdentifier {
+            uri: uri.clone(),
+            version,
+        },
+        content_changes: vec![TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: text.to_string(),
+        }],
+    })?)
+    .await
+}
+
+fn apply_ruff_code_actions(uri: &Url, source: &str, actions: &[CodeAction]) -> Result<String> {
+    let mut text = source.to_string();
+    for action in actions {
+        let Some(edit) = &action.edit else {
+            continue;
+        };
+        text = apply_workspace_edit_for_uri(uri, &text, edit)?;
+    }
+    Ok(text)
+}
+
+fn apply_workspace_edit_for_uri(uri: &Url, source: &str, edit: &WorkspaceEdit) -> Result<String> {
+    let mut text = source.to_string();
+    if let Some(changes) = &edit.changes {
+        for (edit_uri, edits) in changes {
+            if edit_uri != uri {
+                return Err(anyhow::anyhow!(
+                    "Ruff returned edits for unsupported URI {edit_uri}"
+                ));
+            }
+            text = apply_lsp_text_edits(&text, edits)?;
+        }
+    }
+
+    if let Some(document_changes) = &edit.document_changes {
+        match document_changes {
+            DocumentChanges::Edits(edits) => {
+                for edit in edits {
+                    if edit.text_document.uri != *uri {
+                        return Err(anyhow::anyhow!(
+                            "Ruff returned documentChanges for unsupported URI {}",
+                            edit.text_document.uri
+                        ));
+                    }
+                    text = apply_lsp_text_edits(&text, &text_document_edit_edits(edit)?)?;
+                }
+            }
+            DocumentChanges::Operations(operations) => {
+                for operation in operations {
+                    match operation {
+                        DocumentChangeOperation::Edit(edit) => {
+                            if edit.text_document.uri != *uri {
+                                return Err(anyhow::anyhow!(
+                                    "Ruff returned documentChanges for unsupported URI {}",
+                                    edit.text_document.uri
+                                ));
+                            }
+                            text = apply_lsp_text_edits(&text, &text_document_edit_edits(edit)?)?;
+                        }
+                        DocumentChangeOperation::Op(_) => {
+                            return Err(anyhow::anyhow!(
+                                "Ruff returned unsupported resource operation"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(text)
+}
+
+fn text_document_edit_edits(edit: &TextDocumentEdit) -> Result<Vec<TextEdit>> {
+    edit.edits
+        .iter()
+        .map(|edit| match edit {
+            OneOf::Left(edit) => Ok(edit.clone()),
+            OneOf::Right(edit) => Ok(edit.text_edit.clone()),
+        })
+        .collect()
+}
+
 fn requested_code_action_kinds_include(
     requested_kinds: Option<&[CodeActionKind]>,
     action_kind: &CodeActionKind,
@@ -849,7 +1036,7 @@ fn requested_code_action_kinds_include(
 
 fn source_fix_all_title(ruff_enabled: bool) -> &'static str {
     if ruff_enabled {
-        "Format Python and template strings with Ruff and t-linter"
+        "Apply Ruff pipeline and format template strings with t-linter"
     } else {
         "Format template strings with t-linter"
     }
@@ -886,6 +1073,30 @@ fn internal_error(err: anyhow::Error) -> tower_lsp::jsonrpc::Error {
     }
 }
 
+fn workspace_roots_from_initialize_params(params: &InitializeParams) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(workspace_folders) = &params.workspace_folders {
+        roots.extend(
+            workspace_folders
+                .iter()
+                .filter_map(|folder| folder.uri.to_file_path().ok()),
+        );
+    }
+    if let Some(root_uri) = &params.root_uri
+        && let Ok(path) = root_uri.to_file_path()
+    {
+        roots.push(path);
+    }
+    if roots.is_empty()
+        && let Ok(current_dir) = std::env::current_dir()
+    {
+        roots.push(current_dir);
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 pub async fn run_server() -> Result<()> {
     run_server_with_config(TLinterConfig::default()).await
 }
@@ -915,7 +1126,7 @@ struct TLinterInitializationOptions {
     #[serde(default)]
     highlight_untyped_templates: Option<bool>,
     #[serde(default)]
-    ruff_format: Option<RuffFormatConfig>,
+    ruff_pipeline: Option<RuffPipelineConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -923,7 +1134,7 @@ pub struct TLinterConfig {
     pub enable_type_checking: bool,
     pub pyright_path: Option<String>,
     pub highlight_untyped_templates: bool,
-    pub ruff_format: RuffFormatConfig,
+    pub ruff_pipeline: RuffPipelineConfig,
 }
 
 impl Default for TLinterConfig {
@@ -932,7 +1143,7 @@ impl Default for TLinterConfig {
             enable_type_checking: true,
             pyright_path: None,
             highlight_untyped_templates: true,
-            ruff_format: RuffFormatConfig::default(),
+            ruff_pipeline: RuffPipelineConfig::default(),
         }
     }
 }
@@ -956,7 +1167,7 @@ fn parse_initialization_config(
             .highlight_untyped_templates
             .or(options.highlight_untyped)
             .unwrap_or(defaults.highlight_untyped_templates),
-        ruff_format: options.ruff_format.unwrap_or(defaults.ruff_format),
+        ruff_pipeline: options.ruff_pipeline.unwrap_or(defaults.ruff_pipeline),
     }
 }
 
@@ -1361,12 +1572,12 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
     }
 
     #[test]
-    fn initialization_config_accepts_ruff_format_options() {
+    fn initialization_config_accepts_ruff_pipeline_options() {
         let config = parse_initialization_config(
             Some(serde_json::json!({
                 "enableTypeChecking": false,
                 "highlightUntyped": false,
-                "ruffFormat": {
+                "ruffPipeline": {
                     "enabled": true,
                     "command": "/tmp/ruff",
                     "args": ["server"],
@@ -1381,17 +1592,17 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
 
         assert!(!config.enable_type_checking);
         assert!(!config.highlight_untyped_templates);
-        assert!(config.ruff_format.enabled);
-        assert_eq!(config.ruff_format.command, "/tmp/ruff");
-        assert_eq!(config.ruff_format.settings["lineLength"], 100);
+        assert!(config.ruff_pipeline.enabled);
+        assert_eq!(config.ruff_pipeline.command.as_deref(), Some("/tmp/ruff"));
+        assert_eq!(config.ruff_pipeline.settings["lineLength"], 100);
     }
 
     #[test]
     fn initialization_config_preserves_startup_ruff_defaults_when_omitted() {
         let defaults = TLinterConfig {
-            ruff_format: RuffFormatConfig {
+            ruff_pipeline: RuffPipelineConfig {
                 enabled: true,
-                command: "/opt/ruff".to_string(),
+                command: Some("/opt/ruff".to_string()),
                 args: vec!["server".to_string()],
                 settings: serde_json::json!({"lineLength": 120}),
             },
@@ -1406,9 +1617,9 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
         );
 
         assert!(!config.enable_type_checking);
-        assert!(config.ruff_format.enabled);
-        assert_eq!(config.ruff_format.command, "/opt/ruff");
-        assert_eq!(config.ruff_format.settings["lineLength"], 120);
+        assert!(config.ruff_pipeline.enabled);
+        assert_eq!(config.ruff_pipeline.command.as_deref(), Some("/opt/ruff"));
+        assert_eq!(config.ruff_pipeline.settings["lineLength"], 120);
     }
 
     #[test]
@@ -1487,6 +1698,122 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
         assert!(apply_lsp_text_edits(source, &edits).is_err());
     }
 
+    #[test]
+    fn full_lsp_range_ends_at_document_end() {
+        assert_eq!(
+            full_lsp_range("abc").end,
+            Position {
+                line: 0,
+                character: 3
+            }
+        );
+        assert_eq!(
+            full_lsp_range("abc\n").end,
+            Position {
+                line: 1,
+                character: 0
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_edit_helpers_apply_changes_and_document_changes() {
+        let uri = Url::parse("file:///tmp/example.py").expect("uri");
+        let changes_edit = WorkspaceEdit {
+            changes: Some(HashMap::from([(
+                uri.clone(),
+                vec![TextEdit {
+                    range: Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 1,
+                        },
+                    },
+                    new_text: "b".to_string(),
+                }],
+            )])),
+            document_changes: None,
+            change_annotations: None,
+        };
+        assert_eq!(
+            apply_workspace_edit_for_uri(&uri, "a\n", &changes_edit).expect("changes edit"),
+            "b\n"
+        );
+
+        let document_changes_edit = WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: None,
+                },
+                edits: vec![OneOf::Left(TextEdit {
+                    range: Range {
+                        start: Position {
+                            line: 0,
+                            character: 1,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 1,
+                        },
+                    },
+                    new_text: "y".to_string(),
+                })],
+            }])),
+            change_annotations: None,
+        };
+        assert_eq!(
+            apply_workspace_edit_for_uri(&uri, "x\n", &document_changes_edit)
+                .expect("documentChanges edit"),
+            "xy\n"
+        );
+    }
+
+    #[test]
+    fn workspace_edit_helpers_reject_other_uri_and_resource_operations() {
+        let uri = Url::parse("file:///tmp/example.py").expect("uri");
+        let other_uri = Url::parse("file:///tmp/other.py").expect("other uri");
+        let other_uri_edit = WorkspaceEdit {
+            changes: Some(HashMap::from([(
+                other_uri.clone(),
+                vec![TextEdit {
+                    range: Range {
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                    },
+                    new_text: "x".to_string(),
+                }],
+            )])),
+            document_changes: None,
+            change_annotations: None,
+        };
+        assert!(apply_workspace_edit_for_uri(&uri, "", &other_uri_edit).is_err());
+
+        let resource_operation_edit = WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                    uri: other_uri,
+                    options: None,
+                    annotation_id: None,
+                })),
+            ])),
+            change_annotations: None,
+        };
+        assert!(apply_workspace_edit_for_uri(&uri, "", &resource_operation_edit).is_err());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn initialize_advertises_code_actions_and_formatting_capabilities() {
         let (service, _) = LspService::new(|client| {
@@ -1551,7 +1878,8 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
                 .document_cache
                 .get(&uri)
                 .expect("cached after open")
-                .value(),
+                .value()
+                .text,
             source
         );
         assert!(server.diagnostic_tasks.contains_key(&uri));
@@ -1574,6 +1902,7 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
                 .document_cache
                 .get(&uri)
                 .expect("cached after change")
+                .text
                 .contains("data-a=\"x\"")
         );
 
@@ -2012,7 +2341,7 @@ query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
         );
         assert_eq!(
             source_fix_all_title(true),
-            "Format Python and template strings with Ruff and t-linter"
+            "Apply Ruff pipeline and format template strings with t-linter"
         );
     }
 

@@ -22,11 +22,11 @@ pub enum Commands {
         #[arg(long, default_value = "true")]
         stdio: bool,
 
-        #[arg(long = "ruff-format")]
-        ruff_format: bool,
+        #[arg(long = "ruff-pipeline")]
+        ruff_pipeline: bool,
 
-        #[arg(long = "ruff-command", default_value = "ruff")]
-        ruff_command: String,
+        #[arg(long = "ruff-command")]
+        ruff_command: Option<String>,
 
         #[arg(long = "ruff-arg", action = clap::ArgAction::Append)]
         ruff_args: Vec<String>,

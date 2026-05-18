@@ -104,7 +104,7 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
         initializationOptions: {
             enableTypeChecking: vscode.workspace.getConfiguration('t-linter').get<boolean>('enableTypeChecking', true),
             highlightUntyped: vscode.workspace.getConfiguration('t-linter').get<boolean>('highlightUntyped', true),
-            ruffFormat: await resolveRuffFormatOptions()
+            ruffPipeline: await resolveRuffPipelineOptions()
         }
     };
 
@@ -243,22 +243,23 @@ async function findBundledServerPath(context: vscode.ExtensionContext): Promise<
     return { kind: 'not-executable', path: bundledPath };
 }
 
-async function resolveRuffFormatOptions(): Promise<Record<string, unknown>> {
+async function resolveRuffPipelineOptions(): Promise<Record<string, unknown>> {
     const tlinterConfig = vscode.workspace.getConfiguration('t-linter');
-    if (!tlinterConfig.get<boolean>('format.runRuffFirst', false)) {
+    if (!tlinterConfig.get<boolean>('format.runRuffPipeline', false)) {
         return { enabled: false };
     }
 
     const ruffConfig = vscode.workspace.getConfiguration('ruff');
     const ruffPath = await firstExecutablePath(ruffConfig.get<string[]>('path', []));
-    const command = ruffPath ?? 'ruff';
-
-    return {
+    const options: Record<string, unknown> = {
         enabled: true,
-        command,
         args: ['server'],
         settings: collectRuffServerSettings(ruffConfig)
     };
+    if (ruffPath) {
+        options.command = ruffPath;
+    }
+    return options;
 }
 
 function collectRuffServerSettings(config: vscode.WorkspaceConfiguration): Record<string, unknown> {

@@ -71,17 +71,17 @@ Keep the original formatter-only workflow:
 }
 ```
 
-To run Ruff first in this formatter workflow, keep t-linter as the default formatter and enable:
+To run the Ruff save pipeline first in this formatter workflow, keep t-linter as the default formatter and enable:
 
 ```json
 {
-  "t-linter.format.runRuffFirst": true
+  "t-linter.format.runRuffPipeline": true
 }
 ```
 
-t-linter starts `ruff server`, applies Ruff edits to an in-memory shadow document, applies t-linter template formatting, and returns one composed edit set. Keep the Ruff extension installed for its settings UI; t-linter reads safe `ruff.*` settings and uses `ruff.path` when it points to an executable, otherwise `ruff` must be on `PATH`.
+t-linter starts a Ruff LSP server, applies Ruff fixAll, import organization, and formatting edits to an in-memory shadow document, applies t-linter template formatting, and returns one composed edit set. Keep the Ruff extension installed for its settings UI; t-linter reads safe `ruff.*` settings and uses `ruff.path` when it points to an executable. Otherwise the Rust resolver tries venv/conda, workspace `.venv` or `venv`, uv projects, and then `ruff` on `PATH`.
 
-The same composed formatter is available outside VSCode through `t-linter lsp --ruff-format` or LSP `initializationOptions.ruffFormat`.
+The same composed formatter is available outside VSCode through `t-linter lsp --ruff-pipeline` or LSP `initializationOptions.ruffPipeline`.
 
 `source.fixAll.t-linter` formats every format-capable template literal in the current file. The manual `refactor.rewrite.t-linter` action appears only when your selection maps to exactly one template literal.
 
@@ -219,7 +219,7 @@ This extension contributes the following settings:
 
 - **`t-linter.enabled`**: Enable/disable the t-linter extension
 - **`t-linter.serverPath`**: Path to t-linter executable (leave empty for automatic detection)
-- **`t-linter.format.runRuffFirst`**: Run Ruff formatting before t-linter formatting when t-linter is the Python formatter (default: false)
+- **`t-linter.format.runRuffPipeline`**: Run Ruff fixAll, import organization, and formatting before t-linter formatting when t-linter is the Python formatter (default: false)
 - **`t-linter.highlightUntyped`**: Highlight template strings without type annotations (default: true)
 - **`t-linter.enableTypeChecking`**: Enable integration with Python type checkers for cross-module resolution (default: true)
 - **`t-linter.trace.server`**: Trace communication between VSCode and the language server (off/messages/verbose)
