@@ -4,6 +4,37 @@ All notable changes to this project are documented in this file.
 This changelog is generated from GitHub Releases and may include manual corrections when release metadata needs adjustment.
 
 ---
+## [0.8.0](https://github.com/koxudaxi/t-linter/releases/tag/0.8.0) - 2026-05-31
+
+## Breaking Changes
+
+
+### CLI Changes
+* `--ruff-format` flag renamed to `--ruff-pipeline` - Users invoking the LSP server via `t-linter lsp --ruff-format` must update to `t-linter lsp --ruff-pipeline` (#44)
+* `--ruff-command` default changed from `"ruff"` to auto-discovery - The flag is now optional; when omitted, the server searches `VIRTUAL_ENV`, `CONDA_PREFIX`, workspace `.venv`/`venv` directories, and `uv run` before falling back to `ruff` on `PATH`. Users who relied on the implicit `"ruff"` default should verify the auto-discovered binary matches expectations (#44)
+
+### LSP Protocol Changes
+* `ruffFormat` initialization option renamed to `ruffPipeline` - LSP clients that pass `ruffFormat` in `initializationOptions` must rename the key to `ruffPipeline`. The `command` field inside this object is now optional (omit to enable auto-discovery) (#44)
+* Ruff pipeline now runs fixAll and organizeImports before formatting - Previously the pipeline only ran `textDocument/formatting` against Ruff. It now executes `source.fixAll.ruff`, `source.organizeImports.ruff`, and then formatting in sequence, which may produce additional edits compared to the old behavior (#44)
+
+### Configuration Changes
+* VS Code setting `t-linter.format.runRuffFirst` renamed to `t-linter.format.runRuffPipeline` - Users with this setting in their VS Code `settings.json` must update the key name (#44)
+
+### Default Behavior Changes
+* Code action errors from the Ruff pipeline are now silently skipped - When Ruff returns transient errors during code action generation (e.g., `source.fixAll`), the LSP server now logs a warning and returns an empty action list instead of propagating the error to the client. This improves resilience but may mask Ruff configuration problems that previously surfaced as visible errors (#44)
+
+## What's Changed
+* Fix tdom highlighting by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/39
+* Improve coverage for lsp and main by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/40
+* Add Ruff save pipeline for LSP by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/43
+* Handle transient code action format errors by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/44
+* Avoid tox format hangs from broad import scans by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/45
+
+
+**Full Changelog**: https://github.com/koxudaxi/t-linter/compare/0.7.0...0.8.0
+
+---
+
 ## [0.7.0](https://github.com/koxudaxi/t-linter/releases/tag/0.7.0) - 2026-03-24
 
 ## Breaking Changes
