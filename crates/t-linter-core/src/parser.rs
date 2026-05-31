@@ -2656,8 +2656,14 @@ fn import_matches_resolution_filter(
     let Some(filter) = filter else {
         return true;
     };
-    filter.contains(root_identifier_text(alias))
-        || filter.contains(root_identifier_text(import_path))
+    let alias_root = root_identifier_text(alias);
+    let import_root = root_identifier_text(import_path);
+
+    if alias_root != import_root {
+        return filter.contains(alias_root);
+    }
+
+    filter.contains(alias_root)
 }
 
 fn module_path_matches_resolution_filter(
@@ -7372,6 +7378,25 @@ render_html(page)
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("html".to_string()));
         assert!(loaded_typed_api);
+    }
+
+    #[test]
+    fn test_template_relevant_import_filter_does_not_match_alias_by_module_root() {
+        let mut filter = HashSet::new();
+        filter.insert("typed_api".to_string());
+
+        assert!(!import_matches_resolution_filter(
+            "api",
+            "typed_api",
+            Some(&filter)
+        ));
+
+        filter.insert("api".to_string());
+        assert!(import_matches_resolution_filter(
+            "api",
+            "typed_api",
+            Some(&filter)
+        ));
     }
 
     #[test]
