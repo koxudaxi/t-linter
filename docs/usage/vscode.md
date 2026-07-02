@@ -66,6 +66,19 @@ Use this when you want t-linter to stay the active formatter for Python files wi
 
 This mode continues to use `textDocument/formatting` and `textDocument/rangeFormatting` for backward compatibility.
 
+## Interpolation Type Checking
+
+Interpolation value type checking is optional and currently checks JSON templates only. It requires `ty`; t-linter starts `ty server` in the background and maps assignment diagnostics back to the original interpolation expression.
+
+```json
+{
+  "t-linter.typeChecking.enabled": true,
+  "t-linter.typeChecking.tyPath": "/path/to/ty"
+}
+```
+
+`t-linter.typeChecking.tyPath` is optional. Leave it empty to let the language server discover `ty` from the active virtual environment, workspace `.venv`/`venv`, uv project, or `PATH`.
+
 ## Bundled Binary Matrix
 
 The extension bundles `t-linter` on these platforms:

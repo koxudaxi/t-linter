@@ -14,9 +14,10 @@ jobs:
     - name: Set up uv
       uses: astral-sh/setup-uv@v7
 
-    - name: Install Ruff for LSP e2e tests
+    - name: Install LSP e2e tools
       run: |
         uv tool install ruff==0.15.13
+        uv tool install ty==0.0.56
         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
     
     - name: Setup Rust

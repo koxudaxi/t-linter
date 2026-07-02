@@ -1,0 +1,834 @@
+use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    process::{Child, ChildStdin, Command},
+    sync::{Mutex, oneshot},
+};
+use tower_lsp::{
+    Client,
+    lsp_types::{
+        ClientCapabilities, Diagnostic, DiagnosticClientCapabilities, DocumentDiagnosticParams,
+        DocumentDiagnosticReport, DocumentDiagnosticReportResult, GeneralClientCapabilities,
+        InitializeParams, MessageType, PartialResultParams, PositionEncodingKind,
+        TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+        TextDocumentItem, Url, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
+        WorkspaceClientCapabilities, WorkspaceFolder,
+    },
+};
+use tracing::warn;
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const TESTED_TY_VERSION_RANGE: &str = "0.0.11..=0.0.56";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TypeCheckerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default = "default_ty_args")]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub python: Option<String>,
+}
+
+impl Default for TypeCheckerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: None,
+            args: default_ty_args(),
+            python: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegotiatedEncoding {
+    Utf8,
+    Utf16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TyLaunchConfig {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl TyLaunchConfig {
+    fn new(command: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            command: command.into(),
+            args,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TypeCheckerClient {
+    inner: Arc<TypeCheckerClientInner>,
+    child: Mutex<Child>,
+    position_encoding: NegotiatedEncoding,
+    server_version: Option<String>,
+}
+
+#[derive(Debug)]
+struct TypeCheckerClientInner {
+    stdin: Mutex<ChildStdin>,
+    next_id: AtomicU64,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>,
+    open_documents: Mutex<HashMap<Url, i32>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RpcError {
+    code: i64,
+    message: String,
+    #[allow(dead_code)]
+    data: Option<Value>,
+}
+
+#[derive(Debug)]
+pub struct TypeCheckerState {
+    pub config: TypeCheckerConfig,
+    pub workspace_roots: Vec<PathBuf>,
+    pub client: Option<Arc<TypeCheckerClient>>,
+    pub consecutive_failures: u8,
+    pub disabled: bool,
+}
+
+impl TypeCheckerState {
+    pub fn new(config: TypeCheckerConfig, workspace_roots: Vec<PathBuf>) -> Self {
+        Self {
+            config,
+            workspace_roots,
+            client: None,
+            consecutive_failures: 0,
+            disabled: false,
+        }
+    }
+}
+
+impl TypeCheckerClient {
+    pub async fn start(config: &TypeCheckerConfig, workspace_roots: &[PathBuf]) -> Result<Self> {
+        let candidates = ty_launch_candidates(config, workspace_roots);
+        if candidates.is_empty() {
+            return Err(anyhow!("no ty launch candidates available"));
+        }
+
+        let explicit = explicit_command(config).is_some();
+        let mut last_error = None;
+        for launch in candidates {
+            match Self::start_with_launch(config, &launch, workspace_roots).await {
+                Ok(client) => {
+                    tracing::info!(
+                        "Started ty server with command: {} {}",
+                        launch.command,
+                        launch.args.join(" ")
+                    );
+                    return Ok(client);
+                }
+                Err(error) if explicit => return Err(error),
+                Err(error) => {
+                    warn!(
+                        "failed to start ty candidate {} {}: {error}",
+                        launch.command,
+                        launch.args.join(" ")
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("failed to start ty server")))
+    }
+
+    async fn start_with_launch(
+        config: &TypeCheckerConfig,
+        launch: &TyLaunchConfig,
+        workspace_roots: &[PathBuf],
+    ) -> Result<Self> {
+        let mut child = Command::new(&launch.command)
+            .args(&launch.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("failed to spawn ty server: {}", launch.command))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("ty server did not expose stdin"))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("ty server did not expose stdout"))?;
+        let inner = Arc::new(TypeCheckerClientInner {
+            stdin: Mutex::new(stdin),
+            next_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            open_documents: Mutex::new(HashMap::new()),
+        });
+        let reader_inner = Arc::clone(&inner);
+        tokio::spawn(async move {
+            loop {
+                let message = match read_message(&mut stdout).await {
+                    Ok(Some(message)) => message,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!("failed to read ty server message: {error}");
+                        break;
+                    }
+                };
+                if let Some(id) = message.get("id").and_then(Value::as_u64) {
+                    let result = if let Some(error) = message.get("error") {
+                        serde_json::from_value::<RpcError>(error.clone())
+                            .map(Err)
+                            .unwrap_or_else(|error| {
+                                Err(RpcError {
+                                    code: -32603,
+                                    message: format!("invalid ty error response: {error}"),
+                                    data: None,
+                                })
+                            })
+                    } else {
+                        Ok(message.get("result").cloned().unwrap_or(Value::Null))
+                    };
+                    if let Some(sender) = reader_inner.pending.lock().await.remove(&id) {
+                        let _ = sender.send(result);
+                    }
+                }
+            }
+        });
+
+        let mut client = Self {
+            inner,
+            child: Mutex::new(child),
+            position_encoding: NegotiatedEncoding::Utf16,
+            server_version: None,
+        };
+
+        let initialize = client
+            .request("initialize", initialize_params(config, workspace_roots)?)
+            .await;
+        let initialize = match initialize {
+            Ok(value) => value,
+            Err(error) => {
+                client.terminate().await;
+                return Err(error);
+            }
+        };
+        client.position_encoding = negotiated_position_encoding(&initialize);
+        client.server_version = initialize
+            .pointer("/serverInfo/version")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        if let Err(error) = client.notify("initialized", json!({})).await {
+            client.terminate().await;
+            return Err(error);
+        }
+        Ok(client)
+    }
+
+    pub async fn open_or_update_shadow(&self, uri: &Url, text: &str, version: i32) -> Result<()> {
+        enum SyncAction {
+            Open(i32),
+            Change(i32),
+        }
+
+        let action = {
+            let mut open_documents = self.inner.open_documents.lock().await;
+            match open_documents.get_mut(uri) {
+                Some(shadow_version) => {
+                    *shadow_version = shadow_version.saturating_add(1).max(version);
+                    SyncAction::Change(*shadow_version)
+                }
+                None => {
+                    let shadow_version = version.max(1);
+                    open_documents.insert(uri.clone(), shadow_version);
+                    SyncAction::Open(shadow_version)
+                }
+            }
+        };
+
+        match action {
+            SyncAction::Open(version) => {
+                self.notify(
+                    "textDocument/didOpen",
+                    json!({
+                        "textDocument": TextDocumentItem {
+                            uri: uri.clone(),
+                            language_id: "python".to_string(),
+                            version,
+                            text: text.to_string(),
+                        }
+                    }),
+                )
+                .await
+            }
+            SyncAction::Change(version) => {
+                self.notify(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": VersionedTextDocumentIdentifier {
+                            uri: uri.clone(),
+                            version,
+                        },
+                        "contentChanges": [TextDocumentContentChangeEvent {
+                            range: None,
+                            range_length: None,
+                            text: text.to_string(),
+                        }]
+                    }),
+                )
+                .await
+            }
+        }
+    }
+
+    pub async fn pull_diagnostics(&self, uri: &Url) -> Result<Vec<Diagnostic>> {
+        let params = DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let result = self
+            .request("textDocument/diagnostic", serde_json::to_value(params)?)
+            .await?;
+        match serde_json::from_value::<DocumentDiagnosticReportResult>(result)
+            .context("ty returned invalid diagnostic report")?
+        {
+            DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(report)) => {
+                Ok(report.full_document_diagnostic_report.items)
+            }
+            DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Unchanged(_))
+            | DocumentDiagnosticReportResult::Partial(_) => Ok(Vec::new()),
+        }
+    }
+
+    pub fn position_encoding(&self) -> NegotiatedEncoding {
+        self.position_encoding
+    }
+
+    pub fn server_version(&self) -> Option<&str> {
+        self.server_version.as_deref()
+    }
+
+    pub async fn close_shadow(&self, uri: &Url) -> Result<()> {
+        let removed = self.inner.open_documents.lock().await.remove(uri).is_some();
+        if !removed {
+            return Ok(());
+        }
+        self.notify(
+            "textDocument/didClose",
+            json!({
+                "textDocument": TextDocumentIdentifier { uri: uri.clone() }
+            }),
+        )
+        .await
+    }
+
+    pub async fn shutdown(&self) {
+        let _ = self.request("shutdown", Value::Null).await;
+        let _ = self.notify("exit", Value::Null).await;
+        self.terminate().await;
+    }
+
+    async fn terminate(&self) {
+        let mut child = self.child.lock().await;
+        match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+            Ok(Ok(_)) => {}
+            _ => {
+                let _ = child.kill().await;
+            }
+        }
+    }
+
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
+        let (sender, receiver) = oneshot::channel();
+        self.inner.pending.lock().await.insert(id, sender);
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        if let Err(error) = self.write(message).await {
+            self.inner.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+
+        let response = match tokio::time::timeout(REQUEST_TIMEOUT, receiver).await {
+            Ok(response) => {
+                response.with_context(|| format!("ty request {method} response channel closed"))?
+            }
+            Err(error) => {
+                self.inner.pending.lock().await.remove(&id);
+                return Err(error).with_context(|| format!("ty request {method} timed out"));
+            }
+        };
+        response.map_err(|error| {
+            anyhow!(
+                "ty request {method} failed: {} ({})",
+                error.message,
+                error.code
+            )
+        })
+    }
+
+    async fn notify(&self, method: &str, params: Value) -> Result<()> {
+        self.write(json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))
+        .await
+    }
+
+    async fn write(&self, message: Value) -> Result<()> {
+        let mut stdin = self.inner.stdin.lock().await;
+        write_message(&mut *stdin, &message).await?;
+        Ok(())
+    }
+}
+
+pub async fn ensure_type_checker(
+    state: &Mutex<TypeCheckerState>,
+    lsp_client: &Client,
+) -> Option<Arc<TypeCheckerClient>> {
+    let mut state = state.lock().await;
+    if state.disabled || !state.config.enabled {
+        return None;
+    }
+    if let Some(client) = &state.client {
+        return Some(Arc::clone(client));
+    }
+
+    match TypeCheckerClient::start(&state.config, &state.workspace_roots).await {
+        Ok(client) => {
+            if let Some(version) = client.server_version()
+                && !tested_ty_version(version)
+            {
+                lsp_client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!(
+                            "t-linter interpolation type check was tested against ty {TESTED_TY_VERSION_RANGE}; found {version}"
+                        ),
+                    )
+                    .await;
+            }
+            state.consecutive_failures = 0;
+            let client = Arc::new(client);
+            state.client = Some(Arc::clone(&client));
+            Some(client)
+        }
+        Err(error) => {
+            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+            if state.consecutive_failures >= 3 {
+                state.disabled = true;
+            }
+            let disabled = state.disabled;
+            drop(state);
+            lsp_client
+                .log_message(
+                    MessageType::WARNING,
+                    if disabled {
+                        format!(
+                            "Disabled t-linter interpolation type check after repeated ty startup failures: {error}"
+                        )
+                    } else {
+                        format!("Failed to start ty for interpolation type check: {error}")
+                    },
+                )
+                .await;
+            None
+        }
+    }
+}
+
+pub fn ty_launch_candidates(
+    config: &TypeCheckerConfig,
+    workspace_roots: &[PathBuf],
+) -> Vec<TyLaunchConfig> {
+    if let Some(command) = explicit_command(config) {
+        return vec![TyLaunchConfig::new(command, ty_args(config))];
+    }
+
+    let mut candidates = Vec::new();
+    for env_name in ["VIRTUAL_ENV", "CONDA_PREFIX"] {
+        if let Some(path) = std::env::var_os(env_name)
+            .map(PathBuf::from)
+            .and_then(|prefix| first_existing_ty(&environment_ty_paths(&prefix)))
+        {
+            candidates.push(TyLaunchConfig::new(path_string(path), ty_args(config)));
+        }
+    }
+
+    for root in workspace_roots {
+        for relative in workspace_ty_relative_paths() {
+            let path = root.join(relative);
+            if is_executable_file(&path) {
+                candidates.push(TyLaunchConfig::new(path_string(path), ty_args(config)));
+            }
+        }
+    }
+
+    for root in workspace_roots {
+        if is_uv_project(root) {
+            candidates.push(TyLaunchConfig::new("uv", uv_args(root)));
+        }
+    }
+
+    candidates.push(TyLaunchConfig::new("ty", ty_args(config)));
+    dedupe_launch_candidates(candidates)
+}
+
+fn initialize_params(config: &TypeCheckerConfig, workspace_roots: &[PathBuf]) -> Result<Value> {
+    let root_uri = workspace_roots
+        .first()
+        .and_then(|root| Url::from_file_path(root).ok());
+    let workspace_folders = workspace_roots
+        .iter()
+        .filter_map(|root| {
+            let uri = Url::from_file_path(root).ok()?;
+            Some(WorkspaceFolder {
+                name: root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("workspace")
+                    .to_string(),
+                uri,
+            })
+        })
+        .collect::<Vec<_>>();
+    let params = InitializeParams {
+        process_id: None,
+        root_uri,
+        capabilities: ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                workspace_folders: Some(true),
+                ..Default::default()
+            }),
+            text_document: Some(TextDocumentClientCapabilities {
+                diagnostic: Some(DiagnosticClientCapabilities {
+                    dynamic_registration: Some(false),
+                    related_document_support: Some(false),
+                }),
+                ..Default::default()
+            }),
+            general: Some(GeneralClientCapabilities {
+                position_encodings: Some(vec![
+                    PositionEncodingKind::UTF8,
+                    PositionEncodingKind::UTF16,
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        workspace_folders: Some(workspace_folders),
+        initialization_options: config.python.as_ref().map(|python| {
+            json!({
+                "settings": {
+                    "python": python
+                }
+            })
+        }),
+        ..Default::default()
+    };
+    serde_json::to_value(params).context("failed to serialize ty initialize params")
+}
+
+fn negotiated_position_encoding(initialize_result: &Value) -> NegotiatedEncoding {
+    match initialize_result
+        .pointer("/capabilities/positionEncoding")
+        .and_then(Value::as_str)
+    {
+        Some("utf-8") => NegotiatedEncoding::Utf8,
+        _ => NegotiatedEncoding::Utf16,
+    }
+}
+
+fn tested_ty_version(version: &str) -> bool {
+    let Some((major, minor, patch)) = parse_semver_triplet(version) else {
+        return false;
+    };
+    major == 0 && minor == 0 && (11..=56).contains(&patch)
+}
+
+fn parse_semver_triplet(version: &str) -> Option<(u64, u64, u64)> {
+    let version = version.strip_prefix("ty ").unwrap_or(version);
+    let mut parts = version
+        .split(|character: char| !character.is_ascii_digit() && character != '.')
+        .find(|part| !part.is_empty())?
+        .split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn explicit_command(config: &TypeCheckerConfig) -> Option<String> {
+    config
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn ty_args(config: &TypeCheckerConfig) -> Vec<String> {
+    if config.args.is_empty() {
+        default_ty_args()
+    } else {
+        config.args.clone()
+    }
+}
+
+fn default_ty_args() -> Vec<String> {
+    vec!["server".to_string()]
+}
+
+fn uv_args(root: &Path) -> Vec<String> {
+    vec![
+        "run".to_string(),
+        "--project".to_string(),
+        root.display().to_string(),
+        "--frozen".to_string(),
+        "--no-progress".to_string(),
+        "ty".to_string(),
+        "server".to_string(),
+    ]
+}
+
+fn environment_ty_paths(prefix: &Path) -> Vec<PathBuf> {
+    environment_ty_paths_for_platform(prefix, cfg!(windows))
+}
+
+fn environment_ty_paths_for_platform(prefix: &Path, windows: bool) -> Vec<PathBuf> {
+    if windows {
+        vec![
+            prefix.join("Scripts").join("ty.exe"),
+            prefix.join("bin").join("ty.exe"),
+            prefix.join("bin").join("ty"),
+        ]
+    } else {
+        vec![prefix.join("bin").join("ty")]
+    }
+}
+
+fn workspace_ty_relative_paths() -> Vec<PathBuf> {
+    workspace_ty_relative_paths_for_platform(cfg!(windows))
+}
+
+fn workspace_ty_relative_paths_for_platform(windows: bool) -> Vec<PathBuf> {
+    if windows {
+        vec![
+            PathBuf::from(".venv").join("Scripts").join("ty.exe"),
+            PathBuf::from("venv").join("Scripts").join("ty.exe"),
+            PathBuf::from(".venv").join("bin").join("ty.exe"),
+            PathBuf::from("venv").join("bin").join("ty.exe"),
+            PathBuf::from(".venv").join("bin").join("ty"),
+            PathBuf::from("venv").join("bin").join("ty"),
+        ]
+    } else {
+        vec![
+            PathBuf::from(".venv").join("bin").join("ty"),
+            PathBuf::from("venv").join("bin").join("ty"),
+        ]
+    }
+}
+
+fn first_existing_ty(paths: &[PathBuf]) -> Option<PathBuf> {
+    paths.iter().find(|path| is_executable_file(path)).cloned()
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn is_uv_project(root: &Path) -> bool {
+    if root.join("uv.lock").is_file() {
+        return true;
+    }
+    let pyproject = root.join("pyproject.toml");
+    let Ok(content) = std::fs::read_to_string(pyproject) else {
+        return false;
+    };
+    content.contains("[tool.uv") || content.contains("[dependency-groups")
+}
+
+fn dedupe_launch_candidates(candidates: Vec<TyLaunchConfig>) -> Vec<TyLaunchConfig> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for candidate in candidates {
+        let key = (candidate.command.clone(), candidate.args.clone());
+        if seen.insert(key) {
+            deduped.push(candidate);
+        }
+    }
+    deduped
+}
+
+fn path_string(path: PathBuf) -> String {
+    path.display().to_string()
+}
+
+async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Option<Value>> {
+    let mut header = Vec::with_capacity(128);
+    let mut byte = [0_u8; 1];
+    loop {
+        match reader.read_exact(&mut byte).await {
+            Ok(_) => header.push(byte[0]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::UnexpectedEof && header.is_empty() =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
+        if header.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if header.len() > 16 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ty JSON-RPC header exceeded 16KiB",
+            ));
+        }
+    }
+
+    let header = std::str::from_utf8(&header)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut content_length = None;
+    for line in header.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length =
+                Some(value.trim().parse::<usize>().map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                })?);
+        }
+    }
+
+    let Some(content_length) = content_length else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ty JSON-RPC message missing Content-Length",
+        ));
+    };
+
+    let mut payload = vec![0; content_length];
+    reader.read_exact(&mut payload).await?;
+    serde_json::from_slice(&payload)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+async fn write_message<W: AsyncWrite + Unpin>(writer: &mut W, message: &Value) -> Result<()> {
+    let payload = serde_json::to_vec(message)?;
+    writer
+        .write_all(format!("Content-Length: {}\r\n\r\n", payload.len()).as_bytes())
+        .await?;
+    writer.write_all(&payload).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn type_checker_config_defaults_to_disabled() {
+        let config: TypeCheckerConfig =
+            serde_json::from_value(json!({"enabled": true, "command": "/tmp/ty"})).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.command.as_deref(), Some("/tmp/ty"));
+        assert_eq!(config.args, default_ty_args());
+        assert_eq!(TypeCheckerConfig::default().enabled, false);
+    }
+
+    #[test]
+    fn ty_launch_candidates_use_explicit_command_first() {
+        let config = TypeCheckerConfig {
+            enabled: true,
+            command: Some("/opt/ty".to_string()),
+            args: vec!["server".to_string()],
+            python: None,
+        };
+        assert_eq!(
+            ty_launch_candidates(&config, &[]),
+            vec![TyLaunchConfig::new("/opt/ty", vec!["server".to_string()])]
+        );
+    }
+
+    #[test]
+    fn ty_launch_candidates_include_workspace_uv_and_path_fallback() {
+        let temp = TempDir::new().expect("tempdir");
+        std::fs::write(temp.path().join("uv.lock"), "").expect("uv lock");
+        let candidates = ty_launch_candidates(&TypeCheckerConfig::default(), &[temp.path().into()]);
+        assert!(candidates.iter().any(|candidate| candidate.command == "uv"));
+        assert!(candidates.iter().any(|candidate| candidate.command == "ty"));
+    }
+
+    #[test]
+    fn ty_version_range_accepts_tested_versions_only() {
+        assert!(tested_ty_version("0.0.11"));
+        assert!(tested_ty_version("ty 0.0.56"));
+        assert!(!tested_ty_version("0.0.10"));
+        assert!(!tested_ty_version("0.0.57"));
+        assert!(!tested_ty_version("1.0.0"));
+    }
+
+    #[test]
+    fn negotiated_encoding_prefers_utf8_response() {
+        assert_eq!(
+            negotiated_position_encoding(&json!({
+                "capabilities": {
+                    "positionEncoding": "utf-8"
+                }
+            })),
+            NegotiatedEncoding::Utf8
+        );
+        assert_eq!(
+            negotiated_position_encoding(&json!({})),
+            NegotiatedEncoding::Utf16
+        );
+    }
+}

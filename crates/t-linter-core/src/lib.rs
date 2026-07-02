@@ -5,6 +5,7 @@ pub mod highlighter;
 pub mod lint;
 pub mod parser;
 pub mod project_config;
+pub mod shadow;
 
 pub use formatting::{
     FormatError, FormatOptions, TemplateEdit, apply_template_edits, format_document,
@@ -22,6 +23,7 @@ pub use parser::{
 pub use project_config::{
     ProjectConfig, find_config_root, load_project_config, load_project_config_for_path,
 };
+pub use shadow::{ShadowCheckSite, ShadowDocument, synthesize_for_type_check};
 
 pub fn init() -> Result<()> {
     tracing::info!("t-linter-core initialized");

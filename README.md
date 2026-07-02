@@ -35,6 +35,7 @@ t-linter validates and formats embedded languages inside Python template strings
 - 🧹 **Formatting** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML templates
 - 🎨 **Syntax Highlighting** - Smart highlighting via LSP semantic tokens
 - 🔧 **Type-based Detection** - Understands `Annotated[Template, "html"]` and type aliases
+- 🧪 **Interpolation Type Checking** - Optional LSP diagnostics for JSON interpolation values through `ty`
 - 🧩 **Callee Inference** - Detects backend languages from helpers such as `tdom.html(...)`
 - 🚀 **Fast** - Single Rust binary with Tree-sitter parsers
 
@@ -208,8 +209,23 @@ The LSP server provides:
 
 - **Semantic Tokens** — syntax highlighting for embedded languages
 - **Diagnostics** — real-time validation with 250ms debouncing
+- **Interpolation Type Checking** — optional JSON interpolation value diagnostics through `ty`
 - **Document Formatting** — full document and range formatting
 - **Code Actions** — `source.fixAll.t-linter` for document-level rewrites and `refactor.rewrite.t-linter` for single-template selection rewrites
+
+Interpolation value type checking is opt-in and currently applies to JSON templates only. Enable it from an LSP client with initialization options:
+
+```json
+{
+  "typeChecking": {
+    "enabled": true,
+    "command": "/path/to/ty",
+    "args": ["server"]
+  }
+}
+```
+
+When `command` is omitted, t-linter searches active virtual environments, workspace `.venv`/`venv`, uv projects, and then `ty` on `PATH`.
 
 #### Claude Code
 

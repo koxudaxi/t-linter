@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use t_linter_core::{
-    FormatOptions as CoreFormatOptions, LintDiagnostic, TemplateHighlighter, TemplateStringInfo,
-    TemplateStringParser, format_document_range_with_options, format_document_with_options,
-    lint_source, load_project_config_for_path,
+    FormatOptions as CoreFormatOptions, LintDiagnostic, ShadowDocument, TemplateHighlighter,
+    TemplateStringInfo, TemplateStringParser, format_document_range_with_options,
+    format_document_with_options, lint_source, load_project_config_for_path,
+    synthesize_for_type_check,
 };
 use tower_lsp::jsonrpc::Result as JsonRpcResult;
 use tower_lsp::lsp_types::*;
@@ -16,15 +17,20 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tracing::{debug, info, warn};
 
 mod ruff;
+mod type_checker;
 
 use ruff::RuffPipelineClient;
 pub use ruff::RuffPipelineConfig;
+pub use type_checker::TypeCheckerConfig;
+use type_checker::{NegotiatedEncoding, TypeCheckerState, ensure_type_checker};
 
 const TOKEN_TYPE_MACRO: u32 = 14;
 const TOKEN_MODIFIER_NONE: u32 = 0;
 const DIAGNOSTIC_DEBOUNCE_MS: u64 = 250;
 const SOURCE_FIX_ALL_T_LINTER: &str = "source.fixAll.t-linter";
 const REFACTOR_REWRITE_T_LINTER: &str = "refactor.rewrite.t-linter";
+const INTERPOLATION_TYPE_RULE: &str = "interpolation-type-error";
+const TY_INVALID_ASSIGNMENT_RULE: &str = "invalid-assignment";
 
 pub struct TLinterLanguageServer {
     client: Client,
@@ -34,6 +40,7 @@ pub struct TLinterLanguageServer {
     highlighter: Arc<tokio::sync::Mutex<TemplateHighlighter>>,
     config: Arc<tokio::sync::RwLock<TLinterConfig>>,
     ruff: Arc<tokio::sync::RwLock<Option<Arc<RuffPipelineClient>>>>,
+    type_checker: Arc<tokio::sync::Mutex<TypeCheckerState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +55,7 @@ impl TLinterLanguageServer {
     }
 
     pub fn with_config(client: Client, config: TLinterConfig) -> Result<Self> {
+        let type_checker_config = config.type_checking.clone();
         Ok(Self {
             client,
             document_cache: Arc::new(DashMap::new()),
@@ -56,6 +64,10 @@ impl TLinterLanguageServer {
             highlighter: Arc::new(tokio::sync::Mutex::new(TemplateHighlighter::new()?)),
             config: Arc::new(tokio::sync::RwLock::new(config)),
             ruff: Arc::new(tokio::sync::RwLock::new(None)),
+            type_checker: Arc::new(tokio::sync::Mutex::new(TypeCheckerState::new(
+                type_checker_config,
+                Vec::new(),
+            ))),
         })
     }
 
@@ -128,10 +140,20 @@ impl LanguageServer for TLinterLanguageServer {
         let config =
             parse_initialization_config(params.initialization_options.clone(), startup_config);
         *self.config.write().await = config.clone();
+        let workspace_roots = workspace_roots_from_initialize_params(&params);
+        *self.type_checker.lock().await =
+            TypeCheckerState::new(config.type_checking.clone(), workspace_roots.clone());
+        if config.pyright_path.is_some() {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    "t-linter.pyrightPath is deprecated and has no effect; use typeChecking.command with ty",
+                )
+                .await;
+        }
         if config.ruff_pipeline.enabled {
             let initialize_params = serde_json::to_value(&params)
                 .map_err(|error| internal_error(anyhow::Error::new(error)))?;
-            let workspace_roots = workspace_roots_from_initialize_params(&params);
             match RuffPipelineClient::start(
                 &config.ruff_pipeline,
                 initialize_params,
@@ -230,6 +252,10 @@ impl LanguageServer for TLinterLanguageServer {
     async fn shutdown(&self) -> JsonRpcResult<()> {
         if let Some(ruff) = self.ruff.write().await.take() {
             ruff.shutdown().await;
+        }
+        let type_checker = self.type_checker.lock().await.client.take();
+        if let Some(type_checker) = type_checker {
+            type_checker.shutdown().await;
         }
         Ok(())
     }
@@ -344,6 +370,17 @@ impl LanguageServer for TLinterLanguageServer {
                         .await;
                 }
             }
+        }
+        let type_checker = self.type_checker.lock().await.client.clone();
+        if let Some(type_checker) = type_checker
+            && let Err(error) = type_checker.close_shadow(&params.text_document.uri).await
+        {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("Failed to close ty shadow document: {error}"),
+                )
+                .await;
         }
         if let Some((_, handle)) = self.diagnostic_tasks.remove(&params.text_document.uri) {
             handle.abort();
@@ -490,14 +527,15 @@ impl TLinterLanguageServer {
         let client = self.client.clone();
         let document_cache = Arc::clone(&self.document_cache);
         let diagnostic_tasks = Arc::clone(&self.diagnostic_tasks);
+        let type_checker_state = Arc::clone(&self.type_checker);
         let task_uri = uri.clone();
 
         let handle = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(DIAGNOSTIC_DEBOUNCE_MS)).await;
 
-            let Some(text) = document_cache
+            let Some((text, version)) = document_cache
                 .get(&task_uri)
-                .map(|entry| entry.text.clone())
+                .map(|entry| (entry.text.clone(), entry.version))
             else {
                 diagnostic_tasks.remove(&task_uri);
                 return;
@@ -518,8 +556,8 @@ impl TLinterLanguageServer {
                 Ok(result) => result
                     .diagnostics
                     .iter()
-                    .map(lint_diagnostic_to_lsp)
-                    .collect::<Vec<_>>(),
+                    .map(|diagnostic| lint_diagnostic_to_lsp(diagnostic, &text))
+                    .collect::<Result<Vec<_>>>(),
                 Err(err) => {
                     client
                         .log_message(
@@ -531,10 +569,89 @@ impl TLinterLanguageServer {
                     return;
                 }
             };
+            let diagnostics = match diagnostics {
+                Ok(diagnostics) => diagnostics,
+                Err(err) => {
+                    client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!(
+                                "Diagnostic range conversion failed for {}: {}",
+                                task_uri, err
+                            ),
+                        )
+                        .await;
+                    diagnostic_tasks.remove(&task_uri);
+                    return;
+                }
+            };
 
             client
-                .publish_diagnostics(task_uri.clone(), diagnostics, None)
+                .publish_diagnostics(task_uri.clone(), diagnostics.clone(), Some(version))
                 .await;
+
+            let type_checking_enabled = {
+                let state = type_checker_state.lock().await;
+                state.config.enabled && !state.disabled
+            };
+            if type_checking_enabled {
+                match synthesize_for_type_check(&path, &text) {
+                    Ok(Some(shadow)) => {
+                        if let Some(checker) =
+                            ensure_type_checker(&type_checker_state, &client).await
+                        {
+                            match run_interpolation_type_check(
+                                &checker, &task_uri, &text, version, &shadow,
+                            )
+                            .await
+                            {
+                                Ok(type_diagnostics) if !type_diagnostics.is_empty() => {
+                                    let current_version =
+                                        document_cache.get(&task_uri).map(|entry| entry.version);
+                                    if current_version == Some(version) {
+                                        let mut merged = Vec::with_capacity(
+                                            diagnostics.len() + type_diagnostics.len(),
+                                        );
+                                        merged.extend(diagnostics);
+                                        merged.extend(type_diagnostics);
+                                        client
+                                            .publish_diagnostics(
+                                                task_uri.clone(),
+                                                merged,
+                                                Some(version),
+                                            )
+                                            .await;
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    client
+                                        .log_message(
+                                            MessageType::WARNING,
+                                            format!(
+                                                "Interpolation type check failed for {}: {}",
+                                                task_uri, error
+                                            ),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        client
+                            .log_message(
+                                MessageType::WARNING,
+                                format!(
+                                    "Failed to synthesize interpolation type-check shadow for {}: {}",
+                                    task_uri, error
+                                ),
+                            )
+                            .await;
+                    }
+                }
+            }
             diagnostic_tasks.remove(&task_uri);
         });
 
@@ -625,7 +742,7 @@ impl TLinterLanguageServer {
             .clone();
         let options =
             resolve_lsp_format_options(uri, formatting_options).map_err(internal_error)?;
-        let location = lsp_range_to_location(range);
+        let location = lsp_range_to_location(range, &text).map_err(internal_error)?;
         let mut parser = self.parser.lock().await;
         let templates = parser
             .find_template_strings(&text)
@@ -647,7 +764,9 @@ impl TLinterLanguageServer {
 
         let edits = format_document_range_with_options(&text, &location, &options)
             .map_err(internal_error)?;
-        Ok(SelectionFormatEdits::Edits(template_edits_to_lsp(edits)))
+        Ok(SelectionFormatEdits::Edits(
+            template_edits_to_lsp(edits, &text).map_err(internal_error)?,
+        ))
     }
 
     async fn format_uri(
@@ -865,64 +984,209 @@ fn json_value_to_usize(value: &FormattingProperty) -> Option<usize> {
     }
 }
 
-fn lint_diagnostic_to_lsp(diagnostic: &LintDiagnostic) -> Diagnostic {
-    Diagnostic {
-        range: Range {
-            start: Position {
-                line: diagnostic.start_line.saturating_sub(1) as u32,
-                character: diagnostic.start_column.saturating_sub(1) as u32,
-            },
-            end: Position {
-                line: diagnostic.end_line.saturating_sub(1) as u32,
-                character: diagnostic.end_column.saturating_sub(1) as u32,
-            },
-        },
+fn lint_diagnostic_to_lsp(diagnostic: &LintDiagnostic, source: &str) -> Result<Diagnostic> {
+    let location = t_linter_core::Location {
+        start_line: diagnostic.start_line,
+        start_column: diagnostic.start_column,
+        end_line: diagnostic.end_line,
+        end_column: diagnostic.end_column,
+    };
+    Ok(Diagnostic {
+        range: location_to_lsp_range(&location, source)?,
         severity: Some(DiagnosticSeverity::ERROR),
         code: Some(NumberOrString::String(diagnostic.rule.clone())),
         source: Some("t-linter".to_string()),
         message: diagnostic.message.clone(),
         ..Default::default()
-    }
+    })
 }
 
-fn location_to_lsp_range(location: &t_linter_core::Location) -> Range {
-    Range {
-        start: Position {
-            line: location.start_line.saturating_sub(1) as u32,
-            character: location.start_column.saturating_sub(1) as u32,
-        },
-        end: Position {
-            line: location.end_line.saturating_sub(1) as u32,
-            character: location.end_column.saturating_sub(1) as u32,
-        },
-    }
+fn location_to_lsp_range(location: &t_linter_core::Location, source: &str) -> Result<Range> {
+    let line_starts = line_start_offsets(source);
+    let start = location_position_to_byte_offset(
+        source,
+        &line_starts,
+        location.start_line,
+        location.start_column,
+    )?;
+    let end = location_position_to_byte_offset(
+        source,
+        &line_starts,
+        location.end_line,
+        location.end_column,
+    )?;
+    Ok(Range {
+        start: byte_offset_to_lsp_position(source, &line_starts, start)?,
+        end: byte_offset_to_lsp_position(source, &line_starts, end)?,
+    })
 }
 
-fn lsp_range_to_location(range: &Range) -> t_linter_core::Location {
-    t_linter_core::Location {
+fn lsp_range_to_location(range: &Range, source: &str) -> Result<t_linter_core::Location> {
+    let line_starts = line_start_offsets(source);
+    let start = lsp_position_to_byte_offset(source, &line_starts, range.start)?;
+    let end = lsp_position_to_byte_offset(source, &line_starts, range.end)?;
+    Ok(t_linter_core::Location {
         start_line: range.start.line as usize + 1,
-        start_column: range.start.character as usize + 1,
+        start_column: byte_column_for_offset(&line_starts, range.start.line as usize, start)? + 1,
         end_line: range.end.line as usize + 1,
-        end_column: range.end.character as usize + 1,
-    }
+        end_column: byte_column_for_offset(&line_starts, range.end.line as usize, end)? + 1,
+    })
 }
 
 fn uri_to_path(uri: &Url) -> Option<PathBuf> {
     uri.to_file_path().ok()
 }
 
-fn template_edits_to_lsp(edits: Vec<t_linter_core::TemplateEdit>) -> Vec<TextEdit> {
+fn template_edits_to_lsp(
+    edits: Vec<t_linter_core::TemplateEdit>,
+    source: &str,
+) -> Result<Vec<TextEdit>> {
     edits
         .into_iter()
-        .map(|edit| TextEdit {
-            range: location_to_lsp_range(&edit.location),
-            new_text: edit.replacement,
+        .map(|edit| {
+            Ok(TextEdit {
+                range: location_to_lsp_range(&edit.location, source)?,
+                new_text: edit.replacement,
+            })
         })
         .collect()
 }
 
 fn workspace_edit_for_uri(uri: &Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
     WorkspaceEdit::new(HashMap::from([(uri.clone(), edits)]))
+}
+
+async fn run_interpolation_type_check(
+    checker: &type_checker::TypeCheckerClient,
+    uri: &Url,
+    source: &str,
+    version: i32,
+    shadow: &ShadowDocument,
+) -> Result<Vec<Diagnostic>> {
+    checker
+        .open_or_update_shadow(uri, &shadow.text, version)
+        .await?;
+    let diagnostics = checker.pull_diagnostics(uri).await?;
+    remap_interpolation_type_diagnostics(shadow, source, &diagnostics, checker.position_encoding())
+}
+
+fn remap_interpolation_type_diagnostics(
+    shadow: &ShadowDocument,
+    source: &str,
+    diagnostics: &[Diagnostic],
+    encoding: NegotiatedEncoding,
+) -> Result<Vec<Diagnostic>> {
+    let mut candidates = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic_rule_code(diagnostic) == Some(TY_INVALID_ASSIGNMENT_RULE))
+        .map(|diagnostic| {
+            Ok((
+                diagnostic_range_to_byte_range(&shadow.text, &diagnostic.range, encoding)?,
+                diagnostic,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    candidates.sort_by_key(|(range, _)| range.start);
+
+    let mut remapped = Vec::new();
+    for site in &shadow.sites {
+        let Some((_, diagnostic)) = candidates
+            .iter()
+            .filter(|(range, _)| ranges_intersect(range, &site.shadow_rhs_byte_range))
+            .min_by_key(|(range, _)| range.start)
+        else {
+            continue;
+        };
+        remapped.push(Diagnostic {
+            range: location_to_lsp_range(&site.original_location, source)?,
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String(INTERPOLATION_TYPE_RULE.to_string())),
+            source: Some("t-linter (ty)".to_string()),
+            message: interpolation_type_message(diagnostic, site),
+            ..Default::default()
+        });
+    }
+    Ok(remapped)
+}
+
+fn diagnostic_rule_code(diagnostic: &Diagnostic) -> Option<&str> {
+    match diagnostic.code.as_ref()? {
+        NumberOrString::String(code) => Some(code.as_str()),
+        NumberOrString::Number(_) => None,
+    }
+}
+
+fn interpolation_type_message(
+    diagnostic: &Diagnostic,
+    site: &t_linter_core::ShadowCheckSite,
+) -> String {
+    if let Some(found) = found_type_from_ty_message(&diagnostic.message) {
+        return format!(
+            "Interpolation value of type `{found}` is not assignable to json template (expected: {})",
+            compact_expected_type(&site.expected_type)
+        );
+    }
+    diagnostic.message.clone()
+}
+
+fn found_type_from_ty_message(message: &str) -> Option<&str> {
+    for marker in ["found `", "Object of type `"] {
+        let Some(start) = message.find(marker).map(|start| start + marker.len()) else {
+            continue;
+        };
+        let end = message[start..].find('`')?;
+        return Some(&message[start..start + end]);
+    }
+    None
+}
+
+fn compact_expected_type(expected_type: &str) -> String {
+    expected_type
+        .replace("dict[str, object]", "dict")
+        .replace("list[object]", "list")
+}
+
+fn diagnostic_range_to_byte_range(
+    source: &str,
+    range: &Range,
+    encoding: NegotiatedEncoding,
+) -> Result<std::ops::Range<usize>> {
+    let line_starts = line_start_offsets(source);
+    let start = match encoding {
+        NegotiatedEncoding::Utf8 => utf8_position_to_byte_offset(source, &line_starts, range.start),
+        NegotiatedEncoding::Utf16 => lsp_position_to_byte_offset(source, &line_starts, range.start),
+    }?;
+    let end = match encoding {
+        NegotiatedEncoding::Utf8 => utf8_position_to_byte_offset(source, &line_starts, range.end),
+        NegotiatedEncoding::Utf16 => lsp_position_to_byte_offset(source, &line_starts, range.end),
+    }?;
+    Ok(start..end)
+}
+
+fn utf8_position_to_byte_offset(
+    source: &str,
+    line_starts: &[usize],
+    position: Position,
+) -> Result<usize> {
+    let line_start = *line_starts
+        .get(position.line as usize)
+        .ok_or_else(|| anyhow::anyhow!("Line {} is out of bounds", position.line))?;
+    let line_end = line_starts
+        .get(position.line as usize + 1)
+        .map(|next| next.saturating_sub(1))
+        .unwrap_or(source.len());
+    let offset = line_start + position.character as usize;
+    if offset > line_end {
+        return Err(anyhow::anyhow!(
+            "UTF-8 character {} is out of bounds",
+            position.character
+        ));
+    }
+    Ok(offset)
+}
+
+fn ranges_intersect(left: &std::ops::Range<usize>, right: &std::ops::Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
 }
 
 fn default_formatting_options() -> FormattingOptions {
@@ -1176,6 +1440,8 @@ struct TLinterInitializationOptions {
     highlight_untyped_templates: Option<bool>,
     #[serde(default)]
     ruff_pipeline: Option<RuffPipelineConfig>,
+    #[serde(default)]
+    type_checking: Option<TypeCheckerConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1184,6 +1450,7 @@ pub struct TLinterConfig {
     pub pyright_path: Option<String>,
     pub highlight_untyped_templates: bool,
     pub ruff_pipeline: RuffPipelineConfig,
+    pub type_checking: TypeCheckerConfig,
 }
 
 impl Default for TLinterConfig {
@@ -1193,6 +1460,7 @@ impl Default for TLinterConfig {
             pyright_path: None,
             highlight_untyped_templates: true,
             ruff_pipeline: RuffPipelineConfig::default(),
+            type_checking: TypeCheckerConfig::default(),
         }
     }
 }
@@ -1217,6 +1485,7 @@ fn parse_initialization_config(
             .or(options.highlight_untyped)
             .unwrap_or(defaults.highlight_untyped_templates),
         ruff_pipeline: options.ruff_pipeline.unwrap_or(defaults.ruff_pipeline),
+        type_checking: options.type_checking.unwrap_or(defaults.type_checking),
     }
 }
 
@@ -1332,6 +1601,41 @@ fn line_start_offsets(source: &str) -> Vec<usize> {
         }
     }
     starts
+}
+
+fn location_position_to_byte_offset(
+    source: &str,
+    line_starts: &[usize],
+    line: usize,
+    column: usize,
+) -> Result<usize> {
+    let line_index = line.saturating_sub(1);
+    let line_start = *line_starts
+        .get(line_index)
+        .ok_or_else(|| anyhow::anyhow!("Line {line} is out of bounds"))?;
+    let line_end = line_starts
+        .get(line_index + 1)
+        .map(|next| next.saturating_sub(1))
+        .unwrap_or(source.len());
+    let offset = line_start + column.saturating_sub(1);
+    if offset > line_end {
+        return Err(anyhow::anyhow!("Column {column} is out of bounds"));
+    }
+    Ok(offset)
+}
+
+fn byte_column_for_offset(
+    line_starts: &[usize],
+    line_index: usize,
+    offset: usize,
+) -> Result<usize> {
+    let line_start = *line_starts
+        .get(line_index)
+        .ok_or_else(|| anyhow::anyhow!("Line {line_index} is out of bounds"))?;
+    if offset < line_start {
+        return Err(anyhow::anyhow!("Offset {offset} is before line start"));
+    }
+    Ok(offset - line_start)
 }
 
 fn lsp_position_to_byte_offset(
@@ -1565,6 +1869,7 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
 
     #[test]
     fn conversion_helpers_round_trip_and_wrap_errors() {
+        let source = "alpha\n  beta\nthird\n line four\nabcdefghi\n";
         let diagnostic = LintDiagnostic {
             file: PathBuf::from("example.py"),
             rule: "demo-rule".to_string(),
@@ -1576,7 +1881,7 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
             end_line: 2,
             end_column: 6,
         };
-        let lsp_diagnostic = lint_diagnostic_to_lsp(&diagnostic);
+        let lsp_diagnostic = lint_diagnostic_to_lsp(&diagnostic, source).expect("diagnostic");
         assert_eq!(lsp_diagnostic.range.start.line, 1);
         assert_eq!(lsp_diagnostic.range.start.character, 2);
         assert_eq!(
@@ -1590,14 +1895,17 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
             end_line: 5,
             end_column: 8,
         };
-        let range = location_to_lsp_range(&location);
-        assert_eq!(lsp_range_to_location(&range), location);
+        let range = location_to_lsp_range(&location, source).expect("range");
+        assert_eq!(
+            lsp_range_to_location(&range, source).expect("location"),
+            location
+        );
 
         let edit = t_linter_core::TemplateEdit {
             location: location.clone(),
             replacement: "hello".to_string(),
         };
-        let lsp_edits = template_edits_to_lsp(vec![edit]);
+        let lsp_edits = template_edits_to_lsp(vec![edit], source).expect("lsp edits");
         assert_eq!(lsp_edits.len(), 1);
         let uri = Url::from_file_path(std::env::temp_dir().join("example.py")).expect("uri");
         let workspace_edit = workspace_edit_for_uri(&uri, lsp_edits.clone());
@@ -1618,6 +1926,75 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
         );
         assert_eq!(TLinterConfig::default().pyright_path, None);
         assert!(TLinterConfig::default().enable_type_checking);
+        assert!(!TLinterConfig::default().type_checking.enabled);
+    }
+
+    #[test]
+    fn interpolation_type_diagnostics_are_filtered_and_remapped() {
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+名前 = object()
+age = 1
+payload: Annotated[Template, "json"] = t'{{"name": {名前}, "age": {age}}}'
+"#;
+        let shadow = synthesize_for_type_check(PathBuf::from("example.py").as_path(), source)
+            .expect("shadow synthesis")
+            .expect("shadow document");
+        let site = shadow
+            .sites
+            .iter()
+            .find(|site| site.expression == "名前")
+            .expect("name site");
+        let shadow_line_starts = line_start_offsets(&shadow.text);
+        let shadow_line_start = shadow_line_starts[site.shadow_line];
+        let matching = Diagnostic {
+            range: Range {
+                start: Position {
+                    line: site.shadow_line as u32,
+                    character: (site.shadow_rhs_byte_range.start - shadow_line_start) as u32,
+                },
+                end: Position {
+                    line: site.shadow_line as u32,
+                    character: (site.shadow_rhs_byte_range.end - shadow_line_start) as u32,
+                },
+            },
+            code: Some(NumberOrString::String(
+                TY_INVALID_ASSIGNMENT_RULE.to_string(),
+            )),
+            message: "Type `User` is not assignable; found `User`".to_string(),
+            ..Default::default()
+        };
+        let ignored = Diagnostic {
+            range: matching.range,
+            code: Some(NumberOrString::String("unresolved-reference".to_string())),
+            message: "unresolved".to_string(),
+            ..Default::default()
+        };
+
+        let remapped = remap_interpolation_type_diagnostics(
+            &shadow,
+            source,
+            &[ignored, matching],
+            NegotiatedEncoding::Utf8,
+        )
+        .expect("remap");
+
+        assert_eq!(remapped.len(), 1);
+        assert_eq!(
+            remapped[0].code,
+            Some(NumberOrString::String(INTERPOLATION_TYPE_RULE.to_string()))
+        );
+        assert_eq!(remapped[0].source.as_deref(), Some("t-linter (ty)"));
+        assert!(remapped[0].message.contains("`User`"));
+        assert_eq!(
+            remapped[0].range.start.line,
+            site.original_location.start_line as u32 - 1
+        );
+        assert_eq!(
+            remapped[0].range.end.character - remapped[0].range.start.character,
+            2
+        );
     }
 
     #[test]
@@ -1634,6 +2011,12 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
                         "lineLength": 100,
                         "format": {"preview": true}
                     }
+                },
+                "typeChecking": {
+                    "enabled": true,
+                    "command": "/tmp/ty",
+                    "args": ["server"],
+                    "python": "/tmp/python"
                 }
             })),
             TLinterConfig::default(),
@@ -1644,6 +2027,9 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
         assert!(config.ruff_pipeline.enabled);
         assert_eq!(config.ruff_pipeline.command.as_deref(), Some("/tmp/ruff"));
         assert_eq!(config.ruff_pipeline.settings["lineLength"], 100);
+        assert!(config.type_checking.enabled);
+        assert_eq!(config.type_checking.command.as_deref(), Some("/tmp/ty"));
+        assert_eq!(config.type_checking.python.as_deref(), Some("/tmp/python"));
     }
 
     #[test]

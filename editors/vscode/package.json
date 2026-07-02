@@ -91,10 +91,20 @@
           "default": false,
           "description": "Run Ruff fixAll, import organization, and formatting before t-linter formatting and return one composed edit set."
         },
+        "t-linter.typeChecking.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Type-check interpolation values in typed template strings using ty."
+        },
+        "t-linter.typeChecking.tyPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to a ty executable for interpolation value type checking. Leave empty to let t-linter discover ty."
+        },
         "t-linter.enableTypeChecking": {
           "type": "boolean",
           "default": true,
-          "description": "Enable integration with Python type checkers for cross-module type resolution"
+          "description": "Legacy setting for built-in template language inference. It does not enable interpolation value type checking."
         }
       }
     },

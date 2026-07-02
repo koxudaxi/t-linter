@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "t-linter"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1202,7 +1202,7 @@ dependencies = [
 
 [[package]]
 name = "t-linter-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "t-linter-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "regex",
@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "t-linter-lsp"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "dashmap 6.1.0",
