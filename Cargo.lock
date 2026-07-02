@@ -1689,7 +1689,7 @@ dependencies = [
 [[package]]
 name = "tstring-json"
 version = "0.2.1"
-source = "git+https://github.com/koxudaxi/tstring-structured-data?branch=interpolation-type-requirements#ad18a4efd1c5f039e90377315d52573dc9c331ff"
+source = "git+https://github.com/koxudaxi/tstring-structured-data?branch=interpolation-type-requirements#16c91772bc85702e65588369e81897d918068b07"
 dependencies = [
  "serde_json",
  "tstring-syntax",
@@ -1698,7 +1698,7 @@ dependencies = [
 [[package]]
 name = "tstring-syntax"
 version = "0.2.1"
-source = "git+https://github.com/koxudaxi/tstring-structured-data?branch=interpolation-type-requirements#ad18a4efd1c5f039e90377315d52573dc9c331ff"
+source = "git+https://github.com/koxudaxi/tstring-structured-data?branch=interpolation-type-requirements#16c91772bc85702e65588369e81897d918068b07"
 dependencies = [
  "num-bigint",
 ]
@@ -1726,7 +1726,7 @@ dependencies = [
 [[package]]
 name = "tstring-toml"
 version = "0.2.1"
-source = "git+https://github.com/koxudaxi/tstring-structured-data?branch=interpolation-type-requirements#ad18a4efd1c5f039e90377315d52573dc9c331ff"
+source = "git+https://github.com/koxudaxi/tstring-structured-data?branch=interpolation-type-requirements#16c91772bc85702e65588369e81897d918068b07"
 dependencies = [
  "serde_json",
  "toml 0.9.12+spec-1.1.0",
@@ -1736,7 +1736,7 @@ dependencies = [
 [[package]]
 name = "tstring-yaml"
 version = "0.2.1"
-source = "git+https://github.com/koxudaxi/tstring-structured-data?branch=interpolation-type-requirements#ad18a4efd1c5f039e90377315d52573dc9c331ff"
+source = "git+https://github.com/koxudaxi/tstring-structured-data?branch=interpolation-type-requirements#16c91772bc85702e65588369e81897d918068b07"
 dependencies = [
  "saphyr",
  "saphyr-parser",

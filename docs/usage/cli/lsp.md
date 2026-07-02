@@ -28,7 +28,7 @@ The LSP server provides:
 
 - **Semantic Tokens** — syntax highlighting for embedded languages in template strings
 - **Diagnostics** — real-time validation of embedded language syntax (debounced at 250ms)
-- **Interpolation Type Checking** — optional JSON interpolation value diagnostics through `ty`
+- **Interpolation Type Checking** — optional JSON, YAML, and TOML interpolation value diagnostics through `ty`
 - **Document Formatting** — full document formatting of template literals
 - **Range Formatting** — format a single template literal by selecting its range
 - **Code Actions** — save-time and manual rewrite actions for VSCode and other editors
@@ -53,9 +53,9 @@ For HTML, T-HTML, JSON, YAML, and TOML templates:
 
 ### Interpolation Type Checking
 
-Interpolation value type checking is opt-in and currently applies to JSON templates only. When enabled, t-linter starts a separate `ty server`, sends it an in-memory shadow copy of the open Python document, and maps `ty` assignment diagnostics back to the original interpolation expression.
+Interpolation value type checking is opt-in and applies to JSON, YAML, and TOML templates. When enabled, t-linter starts a separate `ty server`, sends it an in-memory shadow copy of the open Python document, and maps `ty` assignment diagnostics back to the original interpolation expression.
 
-For example, a `User` object interpolated into `Annotated[Template, "json"]` is reported on the `{user}` expression, while JSON-compatible values such as `int`, `str`, `list`, and `dict` are accepted.
+For example, a `User` object interpolated into a structured-data value position is reported on the `{user}` expression, while backend-compatible values such as `int`, `str`, `list`, and `dict` are accepted.
 
 Enable it from an LSP client with initialization options:
 

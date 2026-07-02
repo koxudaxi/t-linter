@@ -94,12 +94,12 @@
         "t-linter.typeChecking.enabled": {
           "type": "boolean",
           "default": false,
-          "description": "Enable JSON-only interpolation value type checking in typed template strings using ty."
+          "description": "Enable JSON, YAML, and TOML interpolation value type checking in typed template strings using ty."
         },
         "t-linter.typeChecking.tyPath": {
           "type": "string",
           "default": "",
-          "description": "Optional path to a ty executable for JSON interpolation value type checking. Leave empty to let t-linter discover ty."
+          "description": "Optional path to a ty executable for interpolation value type checking. Leave empty to let t-linter discover ty."
         },
         "t-linter.enableTypeChecking": {
           "type": "boolean",

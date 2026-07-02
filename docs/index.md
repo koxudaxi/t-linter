@@ -20,7 +20,7 @@ t-linter validates and formats embedded languages inside Python template strings
 - **Formatting** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML templates
 - **Syntax Highlighting** - Smart highlighting via LSP semantic tokens
 - **Type-based Detection** - Understands `Annotated[Template, "html"]` and type aliases
-- **Interpolation Type Checking** - Optional LSP diagnostics for JSON interpolation values through `ty`
+- **Interpolation Type Checking** - Optional LSP diagnostics for JSON, YAML, and TOML interpolation values through `ty`
 - **Callee Inference** - Detects backend languages from helpers such as `tdom.html(...)`
 - **Fast** - Single Rust binary with Tree-sitter parsers
 

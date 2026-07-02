@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::Path;
@@ -30,6 +31,7 @@ pub struct ShadowDocument {
 struct PendingInsertion {
     text: String,
     sites: Vec<PendingSite>,
+    datetime_imported: bool,
 }
 
 #[derive(Debug)]
@@ -60,6 +62,7 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
         .context("Failed to parse source")?;
     let line_starts = line_start_offsets(source);
     let prefix = available_shadow_prefix(source);
+    let datetime_alias = format!("{prefix}datetime");
     let mut insertions = BTreeMap::<usize, PendingInsertion>::new();
 
     for ((template_index, template), requirements) in templates
@@ -96,11 +99,20 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
                 "{prefix}{template_index}_{}",
                 interpolation.interpolation_index
             );
-            let lhs = format!("; {name}: \"{}\" = ", requirement.expected_python_type);
+            let annotation =
+                shadow_annotation_type(&requirement.expected_python_type, &datetime_alias);
+            let lhs = format!("; {name}: \"{annotation}\" = ");
             debug_assert!(!lhs.contains('\n'));
             debug_assert!(!interpolation.expression.contains('\n'));
 
             let insertion = insertions.entry(statement_end).or_default();
+            if requires_datetime_alias(&requirement.expected_python_type)
+                && !insertion.datetime_imported
+            {
+                insertion.text.push_str("; import datetime as ");
+                insertion.text.push_str(&datetime_alias);
+                insertion.datetime_imported = true;
+            }
             let rhs_start = insertion.text.len() + lhs.len();
             insertion.text.push_str(&lhs);
             insertion.text.push_str(&interpolation.expression);
@@ -181,6 +193,17 @@ fn type_requirements_by_template(
             }
         })
         .collect()
+}
+
+fn requires_datetime_alias(expected_type: &str) -> bool {
+    expected_type.contains("datetime.")
+}
+
+fn shadow_annotation_type<'a>(expected_type: &'a str, datetime_alias: &str) -> Cow<'a, str> {
+    if !requires_datetime_alias(expected_type) {
+        return Cow::Borrowed(expected_type);
+    }
+    Cow::Owned(expected_type.replace("datetime.", &format!("{datetime_alias}.")))
 }
 
 fn interpolation_by_index(
@@ -419,6 +442,31 @@ def outer(user):
 "#;
         let shadow = synthesize(source).expect("shadow");
         assert_eq!(shadow.sites.len(), 2);
+        assert_python_parses(&shadow.text);
+    }
+
+    #[test]
+    fn datetime_types_use_shadow_alias_without_shifting_lines() {
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+def run_toml(template: Annotated[Template, "toml"]) -> None: ...
+
+def handler(created, label):
+    payload: Annotated[Template, "toml"] = t'when = {created}\nlabel = "{label}"'
+    run_toml(payload)
+"#;
+        let shadow = synthesize(source).expect("shadow");
+
+        assert_eq!(line_count(&shadow.text), line_count(source));
+        assert!(shadow.text.contains("; import datetime as __tl_datetime; __tl_0_0: \"str | int | float | bool | __tl_datetime.date | __tl_datetime.time | __tl_datetime.datetime | list[object] | dict[str, object]\" = created"));
+        assert!(shadow.text.contains("__tl_0_1: \"str\" = label"));
+        assert_eq!(shadow.sites[0].expected_description, "toml value");
+        assert!(shadow.sites[0].expected_type.contains("datetime.date"));
+        assert_eq!(
+            &shadow.text[shadow.sites[0].shadow_rhs_byte_range.clone()],
+            "created"
+        );
         assert_python_parses(&shadow.text);
     }
 

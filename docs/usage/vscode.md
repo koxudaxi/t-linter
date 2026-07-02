@@ -68,7 +68,7 @@ This mode continues to use `textDocument/formatting` and `textDocument/rangeForm
 
 ## Interpolation Type Checking
 
-Interpolation value type checking is optional and currently checks JSON templates only. It requires `ty`; t-linter starts `ty server` in the background and maps assignment diagnostics back to the original interpolation expression.
+Interpolation value type checking is optional and checks JSON, YAML, and TOML templates. It requires `ty`; t-linter starts `ty server` in the background and maps assignment diagnostics back to the original interpolation expression.
 
 ```json
 {

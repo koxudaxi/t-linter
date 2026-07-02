@@ -59,7 +59,7 @@ This changelog is generated from GitHub Releases and may include manual correcti
 
 ### Added
 * Add `textDocument/codeAction` support with `source.fixAll.t-linter` and `refactor.rewrite.t-linter` for VSCode save-time formatting and manual single-template rewrites.
-* Add opt-in LSP interpolation value type checking for JSON templates through `ty`.
+* Add opt-in LSP interpolation value type checking for JSON, YAML, and TOML templates through `ty`.
 
 ### Changed
 * Keep `textDocument/formatting` and `textDocument/rangeFormatting` for backward compatibility while documenting Ruff coexistence mode for VSCode.

@@ -342,17 +342,23 @@ class User:
     name: str
 
 def run_json(template: Annotated[Template, "json"]) -> None: ...
+def run_yaml(template: Annotated[Template, "yaml"]) -> None: ...
+def run_toml(template: Annotated[Template, "toml"]) -> None: ...
 
 def handler(user: User, age: int) -> None:
-    payload = t'{{"name": {user}, "label": "{age}", "age": {age}, "tag": {1 + 2}, "note": {user!s}}}'
-    run_json(payload)
+    payload_json = t'{{"name": {user}, "label": "{age}", "age": {age}, "tag": {1 + 2}, "note": {user!s}}}'
+    run_json(payload_json)
+    payload_yaml = t'{user}: {age}\nlabel: "{age}"\n'
+    run_yaml(payload_yaml)
+    payload_toml = t'{user} = {age}\nlabel = "{age}"\n'
+    run_toml(payload_toml)
 "#
 }
 
-fn expected_payload_span(source: &str, marker: &str) -> (u64, u64, u64) {
+fn expected_payload_span(source: &str, assignment: &str, marker: &str) -> (u64, u64, u64) {
     let line = source
         .lines()
-        .position(|line| line.trim_start().starts_with("payload ="))
+        .position(|line| line.trim_start().starts_with(assignment))
         .expect("payload line") as u64;
     let payload_line = source.lines().nth(line as usize).expect("payload line");
     let marker_start = payload_line.find(marker).expect("interpolation marker");
@@ -369,6 +375,19 @@ fn assert_diagnostic_span(diagnostic: &Value, span: (u64, u64, u64)) {
     assert_eq!(diagnostic["range"]["start"]["character"], start);
     assert_eq!(diagnostic["range"]["end"]["line"], line);
     assert_eq!(diagnostic["range"]["end"]["character"], end);
+}
+
+fn diagnostic_with_message<'a>(diagnostics: &'a [&Value], needle: &str) -> &'a Value {
+    diagnostics
+        .iter()
+        .copied()
+        .find(|diagnostic| {
+            diagnostic["message"]
+                .as_str()
+                .expect("message")
+                .contains(needle)
+        })
+        .unwrap_or_else(|| panic!("missing diagnostic containing {needle:?}: {diagnostics:?}"))
 }
 
 #[test]
@@ -392,35 +411,37 @@ fn lsp_reports_interpolation_type_error_from_real_ty() {
         .iter()
         .filter(|diagnostic| diagnostic["code"] == TYPE_DIAGNOSTIC_RULE)
         .collect::<Vec<_>>();
-    assert_eq!(type_diagnostics.len(), 2, "diagnostics: {diagnostics:?}");
+    assert_eq!(type_diagnostics.len(), 6, "diagnostics: {diagnostics:?}");
 
     for diagnostic in &type_diagnostics {
         assert_eq!(diagnostic["source"], "t-linter (ty)");
         assert_eq!(diagnostic["severity"], 2);
     }
 
-    let user_span = expected_payload_span(source, "{user}");
-    let label_age_span = expected_payload_span(source, "\"label\": \"{age}\"");
-    let user_diagnostic = type_diagnostics
-        .iter()
-        .find(|diagnostic| {
-            diagnostic["message"]
-                .as_str()
-                .expect("message")
-                .contains("json value")
-        })
-        .expect("json value diagnostic");
-    let label_age_diagnostic = type_diagnostics
-        .iter()
-        .find(|diagnostic| {
-            diagnostic["message"]
-                .as_str()
-                .expect("message")
-                .contains("json string fragment")
-        })
-        .expect("json string fragment diagnostic");
-    assert_diagnostic_span(user_diagnostic, user_span);
-    assert_diagnostic_span(label_age_diagnostic, label_age_span);
+    assert_diagnostic_span(
+        diagnostic_with_message(&type_diagnostics, "json value"),
+        expected_payload_span(source, "payload_json =", "{user}"),
+    );
+    assert_diagnostic_span(
+        diagnostic_with_message(&type_diagnostics, "json string fragment"),
+        expected_payload_span(source, "payload_json =", "\"label\": \"{age}\""),
+    );
+    assert_diagnostic_span(
+        diagnostic_with_message(&type_diagnostics, "yaml mapping key"),
+        expected_payload_span(source, "payload_yaml =", "{user}"),
+    );
+    assert_diagnostic_span(
+        diagnostic_with_message(&type_diagnostics, "yaml scalar fragment"),
+        expected_payload_span(source, "payload_yaml =", "label: \"{age}\""),
+    );
+    assert_diagnostic_span(
+        diagnostic_with_message(&type_diagnostics, "toml key"),
+        expected_payload_span(source, "payload_toml =", "{user}"),
+    );
+    assert_diagnostic_span(
+        diagnostic_with_message(&type_diagnostics, "toml string fragment"),
+        expected_payload_span(source, "payload_toml =", "label = \"{age}\""),
+    );
 
     client.shutdown();
     let _ = fs::remove_dir_all(dir);

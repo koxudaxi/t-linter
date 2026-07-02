@@ -9,6 +9,7 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 ### Added
 - Save-time formatting support through the `source.fixAll.t-linter` code action
 - Manual single-template rewrite support through `refactor.rewrite.t-linter`
+- JSON, YAML, and TOML interpolation value type checking settings for `ty`
 
 ### Changed
 - Document Ruff coexistence mode alongside the existing t-linter formatter mode

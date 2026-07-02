@@ -48,7 +48,9 @@ impl TemplateBackend {
     ) -> BackendResult<Vec<InterpolationTypeRequirement>> {
         match self {
             Self::Json => backend_json::interpolation_type_requirements(input),
-            Self::Html | Self::Thtml | Self::Tdom | Self::Yaml | Self::Toml => Ok(Vec::new()),
+            Self::Yaml => backend_yaml::interpolation_type_requirements(input),
+            Self::Toml => backend_toml::interpolation_type_requirements(input),
+            Self::Html | Self::Thtml | Self::Tdom => Ok(Vec::new()),
         }
     }
 }
@@ -88,6 +90,48 @@ mod tests {
         assert_eq!(requirements[0].expected_description, "json object key");
         assert_eq!(requirements[1].expected_description, "json value");
         assert_eq!(requirements[2].expected_description, "json string fragment");
+    }
+
+    #[test]
+    fn yaml_backend_delegates_contextual_type_requirements() {
+        let input = TemplateInput::from_segments(vec![
+            interpolation(0, "key"),
+            TemplateSegment::StaticText(": ".to_string()),
+            interpolation(1, "value"),
+            TemplateSegment::StaticText("\nlabel: \"".to_string()),
+            interpolation(2, "label"),
+            TemplateSegment::StaticText("\"".to_string()),
+        ]);
+
+        let requirements = TemplateBackend::Yaml
+            .interpolation_type_requirements(&input)
+            .expect("requirements");
+
+        assert_eq!(requirements.len(), 3);
+        assert_eq!(requirements[0].expected_description, "yaml mapping key");
+        assert_eq!(requirements[1].expected_description, "yaml value");
+        assert_eq!(requirements[2].expected_description, "yaml scalar fragment");
+    }
+
+    #[test]
+    fn toml_backend_delegates_contextual_type_requirements() {
+        let input = TemplateInput::from_segments(vec![
+            interpolation(0, "key"),
+            TemplateSegment::StaticText(" = ".to_string()),
+            interpolation(1, "value"),
+            TemplateSegment::StaticText("\nlabel = \"".to_string()),
+            interpolation(2, "label"),
+            TemplateSegment::StaticText("\"".to_string()),
+        ]);
+
+        let requirements = TemplateBackend::Toml
+            .interpolation_type_requirements(&input)
+            .expect("requirements");
+
+        assert_eq!(requirements.len(), 3);
+        assert_eq!(requirements[0].expected_description, "toml key");
+        assert_eq!(requirements[1].expected_description, "toml value");
+        assert_eq!(requirements[2].expected_description, "toml string fragment");
     }
 
     #[test]

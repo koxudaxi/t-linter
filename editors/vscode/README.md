@@ -228,6 +228,8 @@ This extension contributes the following settings:
 - **`t-linter.format.runRuffPipeline`**: Run Ruff fixAll, import organization, and formatting before t-linter formatting when t-linter is the Python formatter (default: false)
 - **`t-linter.highlightUntyped`**: Highlight template strings without type annotations (default: true)
 - **`t-linter.enableTypeChecking`**: Enable integration with Python type checkers for cross-module resolution (default: true)
+- **`t-linter.typeChecking.enabled`**: Enable JSON, YAML, and TOML interpolation value type checking through `ty` (default: false)
+- **`t-linter.typeChecking.tyPath`**: Optional path to a `ty` executable for interpolation value type checking
 - **`t-linter.trace.server`**: Trace communication between VSCode and the language server (off/messages/verbose)
 
 ## Commands
