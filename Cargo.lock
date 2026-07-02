@@ -1678,9 +1678,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-html"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d310fc49fad51ee70d65f166180da9afb3f4215713d37932bcb4bbe096050f7"
+checksum = "ebc0c7cdf7c69c9f8e9b2caed3692195a8b172e95db551336e9a4289d2ceeba2"
 dependencies = [
  "tstring-format-doc",
  "tstring-syntax",
@@ -1688,8 +1688,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-json"
-version = "0.2.1"
-source = "git+https://github.com/koxudaxi/tstring-structured-data?branch=interpolation-type-requirements#16c91772bc85702e65588369e81897d918068b07"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d11225e8d0fc7181b49733d521c536a83901afd7c1753a7f5cff0d7695c9c716"
 dependencies = [
  "serde_json",
  "tstring-syntax",
@@ -1697,17 +1698,18 @@ dependencies = [
 
 [[package]]
 name = "tstring-syntax"
-version = "0.2.1"
-source = "git+https://github.com/koxudaxi/tstring-structured-data?branch=interpolation-type-requirements#16c91772bc85702e65588369e81897d918068b07"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e6021e5e8f36304512dedeb70fce2c8f75a37eb6d823d1747b02e31c5fadd75"
 dependencies = [
  "num-bigint",
 ]
 
 [[package]]
 name = "tstring-tdom"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b78b60a90e0d0a0da142b8131eb46b48a665cb24fec10c28d9bfdc68f04c8b5f"
+checksum = "15059bc9d8f0dd4e00b3c8e75df0fc13af4187ff20d70e0ea34ab3b98c6250c9"
 dependencies = [
  "tstring-format-doc",
  "tstring-syntax",
@@ -1715,9 +1717,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-thtml"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "494554964c4c74209092ead155422bece35ed53fa7e2fc9a1349f0ef346043c7"
+checksum = "6a550333e52f7211095cb5a3fbd8c4ea78a7aa869e7c21a11a732a7487f1a052"
 dependencies = [
  "tstring-html",
  "tstring-syntax",
@@ -1725,8 +1727,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-toml"
-version = "0.2.1"
-source = "git+https://github.com/koxudaxi/tstring-structured-data?branch=interpolation-type-requirements#16c91772bc85702e65588369e81897d918068b07"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28501b4db4b7dba80cf60e1ece2ab3b2db9e717f1ccaa6dcf4a4617a67b7c1c2"
 dependencies = [
  "serde_json",
  "toml 0.9.12+spec-1.1.0",
@@ -1735,8 +1738,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-yaml"
-version = "0.2.1"
-source = "git+https://github.com/koxudaxi/tstring-structured-data?branch=interpolation-type-requirements#16c91772bc85702e65588369e81897d918068b07"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8618c0d78c2647dd4b5f90b81042f547b2c178e3b2ecf9204c96fc5b0144e20e"
 dependencies = [
  "saphyr",
  "saphyr-parser",
