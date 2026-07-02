@@ -96,7 +96,7 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
                 "{prefix}{template_index}_{}",
                 interpolation.interpolation_index
             );
-            let lhs = format!("; {name}: \"{}\" = ", requirement.expected_type);
+            let lhs = format!("; {name}: \"{}\" = ", requirement.expected_python_type);
             debug_assert!(!lhs.contains('\n'));
             debug_assert!(!interpolation.expression.contains('\n'));
 
@@ -110,7 +110,7 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
                 original_location: interpolation.location.clone(),
                 template_index,
                 interpolation_index: interpolation.interpolation_index,
-                expected_type: requirement.expected_type.to_string(),
+                expected_type: requirement.expected_python_type,
                 expected_description: requirement.expected_description.to_string(),
                 expression: interpolation.expression.clone(),
             });
@@ -155,7 +155,7 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
 
 fn type_requirements_by_template(
     templates: &[TemplateStringInfo],
-) -> Vec<Vec<crate::backend::InterpolationTypeRequirement>> {
+) -> Vec<Vec<tstring_syntax::InterpolationTypeRequirement>> {
     templates
         .iter()
         .map(|template| {
