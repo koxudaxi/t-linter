@@ -329,19 +329,31 @@ class User:
 def run_json(template: Annotated[Template, "json"]) -> None: ...
 
 def handler(user: User, age: int) -> None:
-    payload = t'{{"name": {user}, "age": {age}, "tag": {1 + 2}, "note": {user!s}}}'
+    payload = t'{{"name": {user}, "label": "{age}", "age": {age}, "tag": {1 + 2}, "note": {user!s}}}'
     run_json(payload)
 "#
 }
 
-fn expected_user_span(source: &str) -> (u64, u64, u64) {
+fn expected_payload_span(source: &str, marker: &str) -> (u64, u64, u64) {
     let line = source
         .lines()
         .position(|line| line.trim_start().starts_with("payload ="))
         .expect("payload line") as u64;
     let payload_line = source.lines().nth(line as usize).expect("payload line");
-    let start = payload_line.find("{user}").expect("user interpolation") as u64 + 1;
-    (line, start, start + "user".len() as u64)
+    let marker_start = payload_line.find(marker).expect("interpolation marker");
+    let interpolation_start = marker.find('{').expect("interpolation start") + 1;
+    let interpolation_end = marker.find('}').expect("interpolation end");
+    let start = (marker_start + interpolation_start) as u64;
+    let end = (marker_start + interpolation_end) as u64;
+    (line, start, end)
+}
+
+fn assert_diagnostic_span(diagnostic: &Value, span: (u64, u64, u64)) {
+    let (line, start, end) = span;
+    assert_eq!(diagnostic["range"]["start"]["line"], line);
+    assert_eq!(diagnostic["range"]["start"]["character"], start);
+    assert_eq!(diagnostic["range"]["end"]["line"], line);
+    assert_eq!(diagnostic["range"]["end"]["character"], end);
 }
 
 #[test]
@@ -365,24 +377,35 @@ fn lsp_reports_interpolation_type_error_from_real_ty() {
         .iter()
         .filter(|diagnostic| diagnostic["code"] == TYPE_DIAGNOSTIC_RULE)
         .collect::<Vec<_>>();
-    assert_eq!(type_diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
+    assert_eq!(type_diagnostics.len(), 2, "diagnostics: {diagnostics:?}");
 
-    let diagnostic = type_diagnostics[0];
-    assert_eq!(diagnostic["source"], "t-linter (ty)");
-    assert_eq!(diagnostic["severity"], 2);
-    assert!(
-        diagnostic["message"]
-            .as_str()
-            .expect("message")
-            .contains("json template"),
-        "diagnostic: {diagnostic:?}"
-    );
+    for diagnostic in &type_diagnostics {
+        assert_eq!(diagnostic["source"], "t-linter (ty)");
+        assert_eq!(diagnostic["severity"], 2);
+    }
 
-    let (line, start, end) = expected_user_span(source);
-    assert_eq!(diagnostic["range"]["start"]["line"], line);
-    assert_eq!(diagnostic["range"]["start"]["character"], start);
-    assert_eq!(diagnostic["range"]["end"]["line"], line);
-    assert_eq!(diagnostic["range"]["end"]["character"], end);
+    let user_span = expected_payload_span(source, "{user}");
+    let label_age_span = expected_payload_span(source, "\"label\": \"{age}\"");
+    let user_diagnostic = type_diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic["message"]
+                .as_str()
+                .expect("message")
+                .contains("json value")
+        })
+        .expect("json value diagnostic");
+    let label_age_diagnostic = type_diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic["message"]
+                .as_str()
+                .expect("message")
+                .contains("json string fragment")
+        })
+        .expect("json string fragment diagnostic");
+    assert_diagnostic_span(user_diagnostic, user_span);
+    assert_diagnostic_span(label_age_diagnostic, label_age_span);
 
     client.shutdown();
     let _ = fs::remove_dir_all(dir);

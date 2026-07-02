@@ -1122,7 +1122,8 @@ fn interpolation_type_message(
 ) -> String {
     if let Some(found) = found_type_from_ty_message(&diagnostic.message) {
         return format!(
-            "Interpolation value of type `{found}` is not assignable to json template (expected: {})",
+            "Interpolation value of type `{found}` is not assignable to {} (expected: {})",
+            site.expected_description,
             compact_expected_type(&site.expected_type)
         );
     }

@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+pub(crate) mod backend;
 pub mod formatting;
 pub mod highlighter;
 pub mod lint;

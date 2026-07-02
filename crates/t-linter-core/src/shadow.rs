@@ -5,10 +5,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
-use crate::{Location, TemplatePart, TemplateStringParser};
-
-const JSON_EXPECTED_TYPE: &str =
-    "str | int | float | bool | None | dict[str, object] | list[object]";
+use crate::backend::TemplateBackend;
+use crate::{InterpolationInfo, Location, TemplatePart, TemplateStringInfo, TemplateStringParser};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShadowCheckSite {
@@ -18,6 +16,7 @@ pub struct ShadowCheckSite {
     pub template_index: usize,
     pub interpolation_index: usize,
     pub expected_type: String,
+    pub expected_description: String,
     pub expression: String,
 }
 
@@ -40,16 +39,15 @@ struct PendingSite {
     template_index: usize,
     interpolation_index: usize,
     expected_type: String,
+    expected_description: String,
     expression: String,
 }
 
 pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<ShadowDocument>> {
     let mut template_parser = TemplateStringParser::new()?;
     let templates = template_parser.find_template_strings_in_file(source, path)?;
-    if templates
-        .iter()
-        .all(|template| expected_type_for(template.language.as_deref()).is_none())
-    {
+    let requirements_by_template = type_requirements_by_template(&templates);
+    if requirements_by_template.iter().all(Vec::is_empty) {
         return Ok(None);
     }
 
@@ -64,10 +62,14 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
     let prefix = available_shadow_prefix(source);
     let mut insertions = BTreeMap::<usize, PendingInsertion>::new();
 
-    for (template_index, template) in templates.iter().enumerate() {
-        let Some(expected_type) = expected_type_for(template.language.as_deref()) else {
+    for ((template_index, template), requirements) in templates
+        .iter()
+        .enumerate()
+        .zip(requirements_by_template.into_iter())
+    {
+        if requirements.is_empty() {
             continue;
-        };
+        }
         let template_start = location_start_byte(source, &line_starts, &template.location)?;
         let Some(statement_end) =
             enclosing_simple_statement_end(tree.root_node(), template_start, source.len())
@@ -80,8 +82,10 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
             continue;
         };
 
-        for part in &template.parts {
-            let TemplatePart::Interpolation(interpolation) = part else {
+        for requirement in requirements {
+            let Some(interpolation) =
+                interpolation_by_index(template, requirement.interpolation_index)
+            else {
                 continue;
             };
             if should_skip_interpolation(interpolation, source, &line_starts, tree.root_node())? {
@@ -92,7 +96,7 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
                 "{prefix}{template_index}_{}",
                 interpolation.interpolation_index
             );
-            let lhs = format!("; {name}: \"{expected_type}\" = ");
+            let lhs = format!("; {name}: \"{}\" = ", requirement.expected_type);
             debug_assert!(!lhs.contains('\n'));
             debug_assert!(!interpolation.expression.contains('\n'));
 
@@ -106,7 +110,8 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
                 original_location: interpolation.location.clone(),
                 template_index,
                 interpolation_index: interpolation.interpolation_index,
-                expected_type: expected_type.to_string(),
+                expected_type: requirement.expected_type.to_string(),
+                expected_description: requirement.expected_description.to_string(),
                 expression: interpolation.expression.clone(),
             });
         }
@@ -138,6 +143,7 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
             template_index: site.template_index,
             interpolation_index: site.interpolation_index,
             expected_type: site.expected_type,
+            expected_description: site.expected_description,
             expression: site.expression,
         }));
     }
@@ -147,11 +153,47 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
     Ok(Some(ShadowDocument { text, sites }))
 }
 
-fn expected_type_for(language: Option<&str>) -> Option<&'static str> {
-    match language {
-        Some("json") => Some(JSON_EXPECTED_TYPE),
+fn type_requirements_by_template(
+    templates: &[TemplateStringInfo],
+) -> Vec<Vec<crate::backend::InterpolationTypeRequirement>> {
+    templates
+        .iter()
+        .map(|template| {
+            let Some(language) = template.language.as_deref() else {
+                return Vec::new();
+            };
+            let Some(backend) = TemplateBackend::for_language(language) else {
+                return Vec::new();
+            };
+            match backend.interpolation_type_requirements(&template.to_template_input()) {
+                Ok(requirements) => requirements,
+                Err(error) => {
+                    tracing::debug!(
+                        "Skipping interpolation type requirements for {} template at {}:{}: {}",
+                        language,
+                        template.location.start_line,
+                        template.location.start_column,
+                        error.message
+                    );
+                    Vec::new()
+                }
+            }
+        })
+        .collect()
+}
+
+fn interpolation_by_index(
+    template: &TemplateStringInfo,
+    interpolation_index: usize,
+) -> Option<&InterpolationInfo> {
+    template.parts.iter().find_map(|part| match part {
+        TemplatePart::Interpolation(interpolation)
+            if interpolation.interpolation_index == interpolation_index =>
+        {
+            Some(interpolation)
+        }
         _ => None,
-    }
+    })
 }
 
 fn should_skip_interpolation(
