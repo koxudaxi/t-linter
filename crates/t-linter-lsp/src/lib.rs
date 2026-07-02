@@ -253,7 +253,11 @@ impl LanguageServer for TLinterLanguageServer {
         if let Some(ruff) = self.ruff.write().await.take() {
             ruff.shutdown().await;
         }
-        let type_checker = self.type_checker.lock().await.client.take();
+        let type_checker = {
+            let mut state = self.type_checker.lock().await;
+            state.shutdown = true;
+            state.client.take()
+        };
         if let Some(type_checker) = type_checker {
             type_checker.shutdown().await;
         }

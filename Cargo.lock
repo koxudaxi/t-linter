@@ -1197,6 +1197,7 @@ dependencies = [
  "t-linter-cli",
  "t-linter-lsp",
  "tokio",
+ "tower-lsp",
  "tracing-subscriber",
 ]
 

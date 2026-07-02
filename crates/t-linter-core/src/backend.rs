@@ -18,13 +18,15 @@ pub(crate) enum TemplateBackend {
 
 impl TemplateBackend {
     pub(crate) fn for_language(language: &str) -> Option<Self> {
-        match language {
-            "html" => Some(Self::Html),
-            "thtml" => Some(Self::Thtml),
-            "tdom" => Some(Self::Tdom),
-            "json" => Some(Self::Json),
-            "yaml" | "yml" => Some(Self::Yaml),
-            "toml" => Some(Self::Toml),
+        let language = language.trim();
+        match language.len() {
+            3 if language.eq_ignore_ascii_case("yml") => Some(Self::Yaml),
+            4 if language.eq_ignore_ascii_case("html") => Some(Self::Html),
+            4 if language.eq_ignore_ascii_case("tdom") => Some(Self::Tdom),
+            4 if language.eq_ignore_ascii_case("json") => Some(Self::Json),
+            4 if language.eq_ignore_ascii_case("yaml") => Some(Self::Yaml),
+            4 if language.eq_ignore_ascii_case("toml") => Some(Self::Toml),
+            5 if language.eq_ignore_ascii_case("thtml") => Some(Self::Thtml),
             _ => None,
         }
     }
@@ -86,6 +88,22 @@ mod tests {
         assert_eq!(requirements[0].expected_description, "json object key");
         assert_eq!(requirements[1].expected_description, "json value");
         assert_eq!(requirements[2].expected_description, "json string fragment");
+    }
+
+    #[test]
+    fn backend_lookup_normalizes_language_names() {
+        assert_eq!(
+            TemplateBackend::for_language(" JSON "),
+            Some(TemplateBackend::Json)
+        );
+        assert_eq!(
+            TemplateBackend::for_language("YML"),
+            Some(TemplateBackend::Yaml)
+        );
+        assert_eq!(
+            TemplateBackend::for_language("Html"),
+            Some(TemplateBackend::Html)
+        );
     }
 
     #[test]

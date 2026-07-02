@@ -130,6 +130,7 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
     let mut cursor = 0;
     for (offset, insertion) in insertions {
         debug_assert!(!insertion.text.contains('\n'));
+        let shadow_line = line_index_for_offset(&line_starts, offset);
         text.push_str(&source[cursor..offset]);
         let insertion_start = text.len();
         text.push_str(&insertion.text);
@@ -138,7 +139,7 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
         sites.extend(insertion.sites.into_iter().map(|site| ShadowCheckSite {
             shadow_rhs_byte_range: insertion_start + site.rhs_relative_range.start
                 ..insertion_start + site.rhs_relative_range.end,
-            shadow_line: site.original_location.start_line.saturating_sub(1),
+            shadow_line,
             original_location: site.original_location,
             template_index: site.template_index,
             interpolation_index: site.interpolation_index,
@@ -322,6 +323,12 @@ fn line_start_offsets(source: &str) -> Vec<usize> {
     starts
 }
 
+fn line_index_for_offset(line_starts: &[usize], offset: usize) -> usize {
+    line_starts
+        .partition_point(|line_start| *line_start <= offset)
+        .saturating_sub(1)
+}
+
 fn line_count(source: &str) -> usize {
     source.bytes().filter(|byte| *byte == b'\n').count() + 1
 }
@@ -384,6 +391,12 @@ run_json(
 "#;
         let shadow = synthesize(source).expect("shadow");
         assert!(shadow.text.contains("other,\n); __tl_0_0:"));
+        let insertion_line = shadow
+            .text
+            .lines()
+            .position(|line| line.contains("); __tl_0_0:"))
+            .expect("insertion line");
+        assert_eq!(shadow.sites[0].shadow_line, insertion_line);
         assert_eq!(
             &shadow.text[shadow.sites[0].shadow_rhs_byte_range.clone()],
             "user"

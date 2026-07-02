@@ -64,7 +64,7 @@ This changelog is generated from GitHub Releases and may include manual correcti
 ### Changed
 * Keep `textDocument/formatting` and `textDocument/rangeFormatting` for backward compatibility while documenting Ruff coexistence mode for VSCode.
 * Make multiline template rewrites prefer triple-double-quoted output when promoting a single-line literal, which keeps Ruff and t-linter save pipelines convergent.
-* Publish LSP diagnostics with document versions and convert byte-based parser columns to UTF-16 LSP ranges.
+* Publish LSP diagnostics with document versions and convert byte-based parser columns to negotiated UTF-8/UTF-16 LSP ranges.
 
 ---
 ## [0.6.2](https://github.com/koxudaxi/t-linter/releases/tag/0.6.2) - 2026-03-24

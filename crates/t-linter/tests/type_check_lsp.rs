@@ -6,6 +6,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tower_lsp::lsp_types::Url;
 
 const LSP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const TYPE_DIAGNOSTIC_RULE: &str = "interpolation-type-error";
@@ -58,7 +59,7 @@ impl LspClient {
             .current_dir(workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .unwrap();
 
@@ -316,7 +317,21 @@ fn wait_for_child_with_timeout(child: &mut Child, timeout: Duration) -> ExitStat
 }
 
 fn file_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
+    Url::from_file_path(path).expect("file URI").to_string()
+}
+
+#[test]
+fn file_uri_round_trips_special_path_characters() {
+    let dir = test_dir("uri special chars");
+    let file = dir.join("space #hash.py");
+    let uri = file_uri(&file);
+    let parsed = Url::parse(&uri).expect("file URI parses");
+
+    assert_eq!(parsed.to_file_path().expect("file path"), file);
+    assert!(!uri.contains(' '));
+    assert!(!uri.contains('#'));
+
+    let _ = fs::remove_dir_all(dir);
 }
 
 fn type_check_input() -> &'static str {

@@ -16,7 +16,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::{Child, ChildStdin, Command},
-    sync::{Mutex, oneshot},
+    sync::{Mutex, OwnedMutexGuard, oneshot},
 };
 use tower_lsp::{
     Client,
@@ -110,6 +110,8 @@ pub struct TypeCheckerState {
     pub client: Option<Arc<TypeCheckerClient>>,
     pub consecutive_failures: u8,
     pub disabled: bool,
+    pub shutdown: bool,
+    startup: Arc<Mutex<()>>,
 }
 
 impl TypeCheckerState {
@@ -120,6 +122,8 @@ impl TypeCheckerState {
             client: None,
             consecutive_failures: 0,
             disabled: false,
+            shutdown: false,
+            startup: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -332,6 +336,21 @@ impl TypeCheckerClient {
         self.server_version.as_deref()
     }
 
+    async fn is_running(&self) -> bool {
+        let mut child = self.child.lock().await;
+        match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(status)) => {
+                tracing::warn!("ty server exited before reuse: {status}");
+                false
+            }
+            Err(error) => {
+                tracing::warn!("failed to inspect ty server process: {error}");
+                false
+            }
+        }
+    }
+
     pub async fn close_shadow(&self, uri: &Url) -> Result<()> {
         let removed = self.inner.open_documents.lock().await.remove(uri).is_some();
         if !removed {
@@ -415,53 +434,173 @@ pub async fn ensure_type_checker(
     state: &Mutex<TypeCheckerState>,
     lsp_client: &Client,
 ) -> Option<Arc<TypeCheckerClient>> {
-    let mut state = state.lock().await;
-    if state.disabled || !state.config.enabled {
-        return None;
-    }
-    if let Some(client) = &state.client {
-        return Some(Arc::clone(client));
+    enum StartupAction {
+        Disabled,
+        Reuse(Arc<TypeCheckerClient>),
+        Start(Arc<Mutex<()>>),
     }
 
-    match TypeCheckerClient::start(&state.config, &state.workspace_roots).await {
-        Ok(client) => {
-            if let Some(version) = client.server_version()
-                && !tested_ty_version(version)
-            {
+    enum StoreResult {
+        Discard,
+        Existing(Arc<TypeCheckerClient>),
+        Stored,
+    }
+
+    loop {
+        let action = {
+            let state = state.lock().await;
+            if state.shutdown || state.disabled || !state.config.enabled {
+                StartupAction::Disabled
+            } else if let Some(client) = &state.client {
+                StartupAction::Reuse(Arc::clone(client))
+            } else {
+                StartupAction::Start(Arc::clone(&state.startup))
+            }
+        };
+
+        let (config, workspace_roots, _startup): (
+            TypeCheckerConfig,
+            Vec<PathBuf>,
+            Option<OwnedMutexGuard<()>>,
+        ) = match action {
+            StartupAction::Disabled => return None,
+            StartupAction::Reuse(client) => {
+                if client.is_running().await {
+                    return Some(client);
+                }
+                let mut state = state.lock().await;
+                if state
+                    .client
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &client))
+                {
+                    state.client = None;
+                }
+                continue;
+            }
+            StartupAction::Start(startup) => {
+                let startup = startup.lock_owned().await;
+                loop {
+                    let snapshot = {
+                        let state = state.lock().await;
+                        if state.shutdown || state.disabled || !state.config.enabled {
+                            return None;
+                        }
+                        match &state.client {
+                            Some(client) => Err(Arc::clone(client)),
+                            None => Ok((state.config.clone(), state.workspace_roots.clone())),
+                        }
+                    };
+                    match snapshot {
+                        Ok((config, workspace_roots)) => {
+                            break (config, workspace_roots, Some(startup));
+                        }
+                        Err(client) if client.is_running().await => return Some(client),
+                        Err(client) => {
+                            let mut state = state.lock().await;
+                            if state
+                                .client
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, &client))
+                            {
+                                state.client = None;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        match TypeCheckerClient::start(&config, &workspace_roots).await {
+            Ok(client) => {
+                let version_warning = client
+                    .server_version()
+                    .filter(|version| !tested_ty_version(version))
+                    .map(ToOwned::to_owned);
+                let client = Arc::new(client);
+                let store_result = {
+                    let mut state = state.lock().await;
+                    if state.shutdown
+                        || state.disabled
+                        || !state.config.enabled
+                        || state.config != config
+                        || state.workspace_roots != workspace_roots
+                    {
+                        StoreResult::Discard
+                    } else if let Some(existing) = &state.client {
+                        StoreResult::Existing(Arc::clone(existing))
+                    } else {
+                        state.consecutive_failures = 0;
+                        state.client = Some(Arc::clone(&client));
+                        StoreResult::Stored
+                    }
+                };
+
+                match store_result {
+                    StoreResult::Discard => {
+                        client.shutdown().await;
+                        return None;
+                    }
+                    StoreResult::Existing(existing) => {
+                        client.shutdown().await;
+                        if existing.is_running().await {
+                            return Some(existing);
+                        }
+                        let mut state = state.lock().await;
+                        if state
+                            .client
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &existing))
+                        {
+                            state.client = None;
+                        }
+                    }
+                    StoreResult::Stored => {
+                        if let Some(version) = version_warning {
+                            lsp_client
+                                .log_message(
+                                    MessageType::WARNING,
+                                    format!(
+                                        "t-linter interpolation type check was tested against ty {TESTED_TY_VERSION_RANGE}; found {version}"
+                                    ),
+                                )
+                                .await;
+                        }
+                        return Some(client);
+                    }
+                }
+            }
+            Err(error) => {
+                let disabled = {
+                    let mut state = state.lock().await;
+                    if state.shutdown
+                        || state.disabled
+                        || !state.config.enabled
+                        || state.config != config
+                        || state.workspace_roots != workspace_roots
+                    {
+                        return None;
+                    }
+                    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                    if state.consecutive_failures >= 3 {
+                        state.disabled = true;
+                    }
+                    state.disabled
+                };
                 lsp_client
                     .log_message(
                         MessageType::WARNING,
-                        format!(
-                            "t-linter interpolation type check was tested against ty {TESTED_TY_VERSION_RANGE}; found {version}"
-                        ),
+                        if disabled {
+                            format!(
+                                "Disabled t-linter interpolation type check after repeated ty startup failures: {error}"
+                            )
+                        } else {
+                            format!("Failed to start ty for interpolation type check: {error}")
+                        },
                     )
                     .await;
+                return None;
             }
-            state.consecutive_failures = 0;
-            let client = Arc::new(client);
-            state.client = Some(Arc::clone(&client));
-            Some(client)
-        }
-        Err(error) => {
-            state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-            if state.consecutive_failures >= 3 {
-                state.disabled = true;
-            }
-            let disabled = state.disabled;
-            drop(state);
-            lsp_client
-                .log_message(
-                    MessageType::WARNING,
-                    if disabled {
-                        format!(
-                            "Disabled t-linter interpolation type check after repeated ty startup failures: {error}"
-                        )
-                    } else {
-                        format!("Failed to start ty for interpolation type check: {error}")
-                    },
-                )
-                .await;
-            None
         }
     }
 }
@@ -830,5 +969,36 @@ mod tests {
             negotiated_position_encoding(&json!({})),
             NegotiatedEncoding::Utf16
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_liveness_detects_exited_child() {
+        let mut child = Command::new(std::env::current_exe().expect("current exe"))
+            .arg("--help")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn short-lived child");
+        let stdin = child.stdin.take().expect("child stdin");
+        let client = TypeCheckerClient {
+            inner: Arc::new(TypeCheckerClientInner {
+                stdin: Mutex::new(stdin),
+                next_id: AtomicU64::new(1),
+                pending: Mutex::new(HashMap::new()),
+                open_documents: Mutex::new(HashMap::new()),
+            }),
+            child: Mutex::new(child),
+            position_encoding: NegotiatedEncoding::Utf16,
+            server_version: None,
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.is_running().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("child exits");
     }
 }
