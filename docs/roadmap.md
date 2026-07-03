@@ -14,4 +14,3 @@
 ## Planned
 
 - **Cross-file Type Resolution** — Track type aliases across module boundaries
-- **Auto-completion** — Context-aware completions within template strings

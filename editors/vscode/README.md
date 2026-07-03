@@ -135,25 +135,12 @@ Bundled binary support matrix:
 | Windows x64 | ✅ | No |
 | Other platforms | — | Yes |
 
-### Optional: PEP 750 Support with Patched Pyright
+### Python Language Server
 
-Since PEP 750 template strings (`t"..."`) are not yet supported in the official Pyright extension, you can install a patched version that adds PEP 750 t-string support:
-
-1. **Download the patched Pyright extension**:
-   - Go to [Patched Pyright Releases](https://github.com/koxudaxi/pyright/releases/tag/untagged-7b5f847f7a434b72a328)
-   - Download the `.vsix` file
-
-2. **Install the patched extension**:
-   - Open VSCode
-   - Press `Ctrl+Shift+P` (Cmd+Shift+P on macOS)
-   - Type "Extensions: Install from VSIX..."
-   - Select the downloaded `.vsix` file
-
-3. **Disable the original Pyright extension** (if installed):
-   - Go to Extensions tab
-   - Find "Pyright" and click "Disable"
-
-This patched version enables Pyright to recognize and type-check PEP 750 template strings, providing better integration with t-linter for comprehensive template string analysis.
+t-linter handles template diagnostics, highlighting, formatting, and supported
+cross-module template-language inference itself. Keep your normal Python
+language server enabled for Python completions, navigation, and non-template
+type checking.
 
 ## Usage
 
@@ -281,8 +268,7 @@ If you see "t-linter binary not found":
 
 ## Known Issues
 
-- Cross-module type resolution requires a Python type checker (Pyright/Pylsp) to be installed
-- Limited to single-file analysis scope in the current version
+- t-linter does not provide Python completions or navigation.
 
 ## Contributing
 

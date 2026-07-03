@@ -393,4 +393,3 @@ For `html`, `<title>{value}</title>` is allowed and treated as escaped text.
 - ✅ **Formatting (`format` command)** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML
 - 🚧 **Statistics (`stats` command)** - Analyze template string usage across codebases
 - 📋 **Cross-file Type Resolution** - Track type aliases across module boundaries
-- 📋 **Auto-completion** - Context-aware completions within template strings
