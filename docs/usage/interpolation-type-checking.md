@@ -112,12 +112,12 @@ Examples of backend decisions:
 |---|---|
 | JSON object key | `str` |
 | JSON string fragment | `str` |
-| JSON value | `str | int | float | bool | None | dict[str, object] | list[object]` |
-| YAML mapping key or value | `str | int | float | bool | None | datetime.date | datetime.time | datetime.datetime | list[object] | dict[object, object]` |
+| JSON value | `str \| int \| float \| bool \| None \| dict[str, object] \| list[object]` |
+| YAML mapping key or value | `str \| int \| float \| bool \| None \| datetime.date \| datetime.time \| datetime.datetime \| list[object] \| dict[object, object]` |
 | YAML scalar or metadata fragment | `str` |
 | TOML key | `str` |
 | TOML string fragment | `str` |
-| TOML value | `str | int | float | bool | datetime.date | datetime.time | datetime.datetime | list[object] | dict[str, object]` |
+| TOML value | `str \| int \| float \| bool \| datetime.date \| datetime.time \| datetime.datetime \| list[object] \| dict[str, object]` |
 
 HTML, T-HTML, and TDOM currently return no interpolation type requirements.
 Tree-sitter-only languages such as CSS, JavaScript, and SQL are also not part of
