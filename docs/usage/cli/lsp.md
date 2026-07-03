@@ -89,7 +89,7 @@ The server advertises `textDocument/codeAction` support with two t-linter-specif
 - **`source.fixAll.t-linter`** — document-level formatting for all format-capable template literals in the file
 - **`refactor.rewrite.t-linter`** — selection-based rewrite for exactly one template literal
 
-`source.fixAll.t-linter` returns a direct `WorkspaceEdit` instead of a follow-up command so save-time execution stays deterministic.
+`source.fixAll.t-linter` returns a direct `WorkspaceEdit` for clients that do not support `codeAction/resolve`. Clients that advertise lazy `edit` resolution receive lightweight actions first, and t-linter computes the edit only when the selected action is resolved.
 
 `refactor.rewrite.t-linter` is returned only when the requested range maps to exactly one template literal. If the selection hits no templates, or spans multiple templates, the server returns no action.
 

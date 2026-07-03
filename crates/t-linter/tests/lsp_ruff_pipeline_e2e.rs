@@ -102,10 +102,14 @@ impl LspClient {
                 "capabilities": {
                     "workspace": {
                         "configuration": true,
-                        "workspaceFolders": true
+                        "workspaceFolders": true,
+                        "workspaceEdit": {
+                            "documentChanges": true
+                        }
                     },
                     "textDocument": {
                         "codeAction": {
+                            "dataSupport": true,
                             "codeActionLiteralSupport": {
                                 "codeActionKind": {
                                     "valueSet": [
@@ -200,6 +204,28 @@ impl LspClient {
                 }
             }),
         )
+    }
+
+    fn rewrite_template(&mut self, uri: &str, line: u32, start: u32, end: u32) -> Value {
+        self.request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": line, "character": start },
+                    "end": { "line": line, "character": end }
+                },
+                "context": {
+                    "diagnostics": [],
+                    "only": ["refactor.rewrite.t-linter"],
+                    "triggerKind": 1
+                }
+            }),
+        )
+    }
+
+    fn code_action_resolve(&mut self, action: &Value) -> Value {
+        self.request("codeAction/resolve", action.clone())
     }
 
     fn shutdown(mut self) {
@@ -391,8 +417,17 @@ fn apply_text_edits(source: &str, edits: &[Value]) -> String {
 }
 
 fn apply_workspace_edit(source: &str, uri: &str, edit: &Value) -> String {
-    let edits = edit["changes"][uri].as_array().expect("changes for URI");
-    apply_text_edits(source, edits)
+    if let Some(edits) = edit["changes"][uri].as_array() {
+        return apply_text_edits(source, edits);
+    }
+
+    for change in edit["documentChanges"].as_array().expect("documentChanges") {
+        if change["textDocument"]["uri"].as_str() == Some(uri) {
+            let edits = change["edits"].as_array().expect("document edits");
+            return apply_text_edits(source, edits);
+        }
+    }
+    panic!("workspace edit did not contain edits for {uri}");
 }
 
 fn messy_python_with_template() -> &'static str {
@@ -401,6 +436,14 @@ fn messy_python_with_template() -> &'static str {
 
 fn expected_python_with_template() -> &'static str {
     "from string.templatelib import Template\nfrom typing import Annotated\n\ntitle = \"demo\"\nnumbers = [1, 2, 3]\npayload: Annotated[Template, \"toml\"] = t\"title = {title}\"\n"
+}
+
+fn messy_rewrite_template() -> &'static str {
+    "from typing import Annotated\nfrom string.templatelib import Template\n\nclass Card:\n    pass\n\ntitle = \"demo\"\ntemplate: Annotated[Template, \"tdom\"] = t'<{Card} title = {title}><span class = \"badge\" >ok</span></{Card}>'\n"
+}
+
+fn expected_rewrite_template() -> &'static str {
+    "from typing import Annotated\nfrom string.templatelib import Template\n\nclass Card:\n    pass\n\ntitle = \"demo\"\ntemplate: Annotated[Template, \"tdom\"] = t'<{Card} title={title}><span class=\"badge\">ok</span></{Card}>'\n"
 }
 
 #[test]
@@ -449,9 +492,63 @@ fn lsp_source_fix_all_runs_real_ruff_pipeline_then_t_linter() {
     let actions = response["result"].as_array().expect("code actions");
     assert_eq!(actions.len(), 1, "expected one t-linter fixAll action");
     assert_eq!(actions[0]["kind"], "source.fixAll.t-linter");
+    assert!(
+        actions[0].get("edit").is_none(),
+        "code action should defer edit until resolve: {}",
+        actions[0]
+    );
 
-    let formatted = apply_workspace_edit(source, &uri, &actions[0]["edit"]);
+    let resolved = client.code_action_resolve(&actions[0]);
+    assert!(
+        resolved.get("error").is_none(),
+        "codeAction/resolve failed: {resolved}"
+    );
+
+    let formatted = apply_workspace_edit(source, &uri, &resolved["result"]["edit"]);
     assert_eq!(formatted, expected_python_with_template());
+
+    client.shutdown();
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn lsp_rewrite_code_action_resolves_template_edit() {
+    let dir = test_dir("rewrite-resolve");
+    let file = dir.join("example.py");
+    let source = messy_rewrite_template();
+    write_file(&file, source);
+    let uri = file_uri(&file);
+    let template_line = source
+        .lines()
+        .position(|line| line.starts_with("template:"))
+        .expect("template line") as u32;
+
+    let mut client = LspClient::start(&dir);
+    client.initialize(&dir);
+    client.did_open(&uri, source);
+
+    let response = client.rewrite_template(&uri, template_line, 55, 65);
+    assert!(
+        response.get("error").is_none(),
+        "rewrite codeAction failed: {response}"
+    );
+    let actions = response["result"].as_array().expect("code actions");
+    assert_eq!(actions.len(), 1, "expected one rewrite action");
+    assert_eq!(actions[0]["kind"], "refactor.rewrite.t-linter");
+    assert!(
+        actions[0].get("edit").is_none(),
+        "rewrite action should defer edit until resolve: {}",
+        actions[0]
+    );
+
+    let resolved = client.code_action_resolve(&actions[0]);
+    assert!(
+        resolved.get("error").is_none(),
+        "rewrite codeAction/resolve failed: {resolved}"
+    );
+
+    let formatted = apply_workspace_edit(source, &uri, &resolved["result"]["edit"]);
+    assert_eq!(formatted, expected_rewrite_template());
 
     client.shutdown();
     let _ = fs::remove_dir_all(dir);

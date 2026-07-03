@@ -230,6 +230,40 @@ impl TemplateStringParser {
         self.find_template_strings_with_search_root(source, None)
     }
 
+    pub fn find_template_string_locations(&mut self, source: &str) -> Result<Vec<Location>> {
+        self.search_root = None;
+        self.current_file_path = None;
+        let tree = self
+            .parser
+            .parse(source, None)
+            .context("Failed to parse source")?;
+        let string_query = Query::new(
+            &tree_sitter_python::LANGUAGE.into(),
+            r#"
+            (string) @string
+            "#,
+        )
+        .context("Failed to create template string location query")?;
+        let mut string_cursor = QueryCursor::new();
+        let mut string_matches =
+            string_cursor.matches(&string_query, tree.root_node(), source.as_bytes());
+        let mut locations = Vec::new();
+
+        while let Some(match_) = string_matches.next() {
+            for capture in match_.captures {
+                if string_query.capture_names()[capture.index as usize] != "string" {
+                    continue;
+                }
+                let node = capture.node;
+                if is_template_string_node(node, source)? {
+                    locations.push(location_for_node(node));
+                }
+            }
+        }
+
+        Ok(locations)
+    }
+
     pub fn find_template_strings_in_file(
         &mut self,
         source: &str,
@@ -4198,6 +4232,17 @@ fn formatting_wrapper_location(node: Node) -> Option<Location> {
     })
 }
 
+fn location_for_node(node: Node) -> Location {
+    let start = node.start_position();
+    let end = node.end_position();
+    Location {
+        start_line: start.row + 1,
+        start_column: start.column + 1,
+        end_line: end.row + 1,
+        end_column: end.column + 1,
+    }
+}
+
 fn push_static_part(
     content_parts: &mut Vec<String>,
     parts: &mut Vec<TemplatePart>,
@@ -7397,6 +7442,24 @@ render_html(page)
             "typed_api",
             Some(&filter)
         ));
+    }
+
+    #[test]
+    fn test_template_location_scan_skips_import_resolution() {
+        let source = r#"
+from typed_api import render_html
+
+page = t"<div>{name}</div>"
+other = "not a template"
+raw = tr"<span>{name}</span>"
+"#;
+        let mut parser = TemplateStringParser::new().unwrap();
+        let locations = parser.find_template_string_locations(source).unwrap();
+
+        assert_eq!(locations.len(), 2);
+        assert_eq!(locations[0].start_line, 4);
+        assert_eq!(locations[1].start_line, 6);
+        assert!(parser.last_module_cache.is_empty());
     }
 
     #[test]
