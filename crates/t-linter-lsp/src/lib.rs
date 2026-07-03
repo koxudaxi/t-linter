@@ -41,6 +41,7 @@ pub struct TLinterLanguageServer {
     config: Arc<tokio::sync::RwLock<TLinterConfig>>,
     ruff: Arc<tokio::sync::RwLock<Option<Arc<RuffPipelineClient>>>>,
     type_checker: Arc<tokio::sync::Mutex<TypeCheckerState>>,
+    client_support: Arc<tokio::sync::RwLock<ClientSupport>>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,36 @@ struct DocumentState {
     text: String,
     version: i32,
 }
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ClientSupport {
+    resolve_code_action_edits: bool,
+    versioned_workspace_edits: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct TLinterCodeActionData {
+    schema_version: u8,
+    #[serde(flatten)]
+    action: TLinterCodeAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "action", rename_all = "camelCase")]
+enum TLinterCodeAction {
+    SourceFixAll {
+        uri: Url,
+        document_version: i32,
+    },
+    RefactorRewrite {
+        uri: Url,
+        document_version: i32,
+        range: Range,
+    },
+}
+
+const CODE_ACTION_DATA_SCHEMA_VERSION: u8 = 1;
 
 impl TLinterLanguageServer {
     pub fn new(client: Client) -> Result<Self> {
@@ -68,6 +99,7 @@ impl TLinterLanguageServer {
                 type_checker_config,
                 Vec::new(),
             ))),
+            client_support: Arc::new(tokio::sync::RwLock::new(ClientSupport::default())),
         })
     }
 
@@ -137,6 +169,7 @@ impl TLinterLanguageServer {
 impl LanguageServer for TLinterLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> JsonRpcResult<InitializeResult> {
         let startup_config = self.config.read().await.clone();
+        *self.client_support.write().await = client_support_from_capabilities(&params.capabilities);
         let config =
             parse_initialization_config(params.initialization_options.clone(), startup_config);
         *self.config.write().await = config.clone();
@@ -233,7 +266,7 @@ impl LanguageServer for TLinterLanguageServer {
                             Self::source_fix_all_kind(),
                             Self::refactor_rewrite_kind(),
                         ]),
-                        resolve_provider: Some(false),
+                        resolve_provider: Some(true),
                         ..Default::default()
                     }
                     .into(),
@@ -444,67 +477,89 @@ impl LanguageServer for TLinterLanguageServer {
         let requested_kinds = params.context.only.as_deref();
         let source_fix_all_kind = Self::source_fix_all_kind();
         let rewrite_kind = Self::refactor_rewrite_kind();
+        let defer_edits = self.client_support.read().await.resolve_code_action_edits;
 
         if requested_code_action_kinds_include(requested_kinds, &source_fix_all_kind) {
-            let edits = match self
-                .collect_document_format_edits(&params.text_document.uri, None)
-                .await
-            {
-                Ok(edits) => edits,
-                Err(err) if is_internal_lsp_error(&err) => {
-                    self.log_skipped_code_action_error(&source_fix_all_kind, &err)
-                        .await;
-                    Vec::new()
+            if defer_edits {
+                if let Some(action) = self
+                    .deferred_source_fix_all_action(&params.text_document.uri)
+                    .await?
+                {
+                    actions.push(action.into());
                 }
-                Err(err) => return Err(err),
-            };
-
-            if !edits.is_empty() {
-                let title = source_fix_all_title(self.ruff.read().await.is_some());
-
-                actions.push(
-                    CodeAction {
-                        title: title.to_string(),
-                        kind: Some(source_fix_all_kind),
-                        edit: Some(workspace_edit_for_uri(&params.text_document.uri, edits)),
-                        is_preferred: Some(true),
-                        ..Default::default()
+            } else {
+                let edits = match self
+                    .collect_document_format_edits(&params.text_document.uri, None)
+                    .await
+                {
+                    Ok(edits) => edits,
+                    Err(err) if is_internal_lsp_error(&err) => {
+                        self.log_skipped_code_action_error(&source_fix_all_kind, &err)
+                            .await;
+                        Vec::new()
                     }
-                    .into(),
-                );
-            }
-        }
+                    Err(err) => return Err(err),
+                };
 
-        if requested_code_action_kinds_include(requested_kinds, &rewrite_kind) {
-            match self
-                .collect_single_template_selection_format_edits(
-                    &params.text_document.uri,
-                    &params.range,
-                    None,
-                )
-                .await
-            {
-                Ok(SelectionFormatEdits::Edits(edits)) if !edits.is_empty() => {
+                if !edits.is_empty() {
+                    let title = source_fix_all_title(self.ruff.read().await.is_some());
+
                     actions.push(
                         CodeAction {
-                            title: "Rewrite template string with t-linter".to_string(),
-                            kind: Some(rewrite_kind),
+                            title: title.to_string(),
+                            kind: Some(source_fix_all_kind),
                             edit: Some(workspace_edit_for_uri(&params.text_document.uri, edits)),
+                            is_preferred: Some(true),
                             ..Default::default()
                         }
                         .into(),
                     );
                 }
-                Ok(
-                    SelectionFormatEdits::NoTemplate
-                    | SelectionFormatEdits::MultipleTemplates
-                    | SelectionFormatEdits::Edits(_),
-                ) => {}
-                Err(err) if is_internal_lsp_error(&err) => {
-                    self.log_skipped_code_action_error(&rewrite_kind, &err)
-                        .await;
+            }
+        }
+
+        if requested_code_action_kinds_include(requested_kinds, &rewrite_kind) {
+            if defer_edits {
+                if let Some(action) = self
+                    .deferred_rewrite_action(&params.text_document.uri, &params.range)
+                    .await?
+                {
+                    actions.push(action.into());
                 }
-                Err(err) => return Err(err),
+            } else {
+                match self
+                    .collect_single_template_selection_format_edits(
+                        &params.text_document.uri,
+                        &params.range,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(SelectionFormatEdits::Edits(edits)) if !edits.is_empty() => {
+                        actions.push(
+                            CodeAction {
+                                title: "Rewrite template string with t-linter".to_string(),
+                                kind: Some(rewrite_kind),
+                                edit: Some(workspace_edit_for_uri(
+                                    &params.text_document.uri,
+                                    edits,
+                                )),
+                                ..Default::default()
+                            }
+                            .into(),
+                        );
+                    }
+                    Ok(
+                        SelectionFormatEdits::NoTemplate
+                        | SelectionFormatEdits::MultipleTemplates
+                        | SelectionFormatEdits::Edits(_),
+                    ) => {}
+                    Err(err) if is_internal_lsp_error(&err) => {
+                        self.log_skipped_code_action_error(&rewrite_kind, &err)
+                            .await;
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
 
@@ -513,6 +568,81 @@ impl LanguageServer for TLinterLanguageServer {
         } else {
             Ok(Some(actions))
         }
+    }
+
+    async fn code_action_resolve(&self, mut params: CodeAction) -> JsonRpcResult<CodeAction> {
+        if params.edit.is_some() {
+            return Ok(params);
+        }
+
+        let data = decode_code_action_data(params.data.clone())?;
+        let (uri, document_version, edits) = match data.action {
+            TLinterCodeAction::SourceFixAll {
+                uri,
+                document_version,
+            } => {
+                let kind = Self::source_fix_all_kind();
+                let edits = match self
+                    .collect_document_format_edits_matching_version(
+                        &uri,
+                        Some(document_version),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(edits) => edits,
+                    Err(err) if is_internal_lsp_error(&err) => {
+                        self.log_skipped_code_action_error(&kind, &err).await;
+                        Vec::new()
+                    }
+                    Err(err) => return Err(err),
+                };
+                (uri, document_version, edits)
+            }
+            TLinterCodeAction::RefactorRewrite {
+                uri,
+                document_version,
+                range,
+            } => {
+                let kind = Self::refactor_rewrite_kind();
+                let edits = match self
+                    .collect_single_template_selection_format_edits_matching_version(
+                        &uri,
+                        &range,
+                        Some(document_version),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(SelectionFormatEdits::Edits(edits)) => edits,
+                    Ok(
+                        SelectionFormatEdits::NoTemplate | SelectionFormatEdits::MultipleTemplates,
+                    ) => Vec::new(),
+                    Err(err) if is_internal_lsp_error(&err) => {
+                        self.log_skipped_code_action_error(&kind, &err).await;
+                        Vec::new()
+                    }
+                    Err(err) => return Err(err),
+                };
+                (uri, document_version, edits)
+            }
+        };
+
+        if edits.is_empty() {
+            return Ok(params);
+        }
+
+        let versioned = self.client_support.read().await.versioned_workspace_edits;
+        params.edit = Some(workspace_edit_for_uri_with_optional_version(
+            &uri,
+            if versioned {
+                Some(document_version)
+            } else {
+                None
+            },
+            edits,
+        ));
+        Ok(params)
     }
 }
 
@@ -667,15 +797,30 @@ impl TLinterLanguageServer {
         uri: &Url,
         formatting_options: Option<&FormattingOptions>,
     ) -> JsonRpcResult<Vec<TextEdit>> {
+        self.collect_document_format_edits_matching_version(uri, None, formatting_options)
+            .await
+    }
+
+    async fn collect_document_format_edits_matching_version(
+        &self,
+        uri: &Url,
+        expected_version: Option<i32>,
+        formatting_options: Option<&FormattingOptions>,
+    ) -> JsonRpcResult<Vec<TextEdit>> {
         let state = self
             .document_cache
             .get(uri)
             .ok_or_else(|| tower_lsp::jsonrpc::Error::invalid_params("Document not found"))?
             .clone();
+        ensure_document_version(uri, state.version, expected_version)?;
         let text = state.text;
+        let ruff = self.ruff.read().await.clone();
+        if ruff.is_none() && !might_contain_template_string(&text) {
+            ensure_cached_document_version(&self.document_cache, uri, expected_version)?;
+            return Ok(Vec::new());
+        }
         let options =
             resolve_lsp_format_options(uri, formatting_options).map_err(internal_error)?;
-        let ruff = self.ruff.read().await.clone();
         let ruff_text = if let Some(ruff) = ruff {
             self.apply_ruff_pipeline(&ruff, uri, &text, state.version, formatting_options)
                 .await
@@ -687,6 +832,7 @@ impl TLinterLanguageServer {
         let final_text =
             t_linter_core::apply_template_edits(&ruff_text, &edits).map_err(internal_error)?;
 
+        ensure_cached_document_version(&self.document_cache, uri, expected_version)?;
         final_text_edit(&text, &final_text).map_err(internal_error)
     }
 
@@ -738,18 +884,38 @@ impl TLinterLanguageServer {
         range: &Range,
         formatting_options: Option<&FormattingOptions>,
     ) -> JsonRpcResult<SelectionFormatEdits> {
+        self.collect_single_template_selection_format_edits_matching_version(
+            uri,
+            range,
+            None,
+            formatting_options,
+        )
+        .await
+    }
+
+    async fn collect_single_template_selection_format_edits_matching_version(
+        &self,
+        uri: &Url,
+        range: &Range,
+        expected_version: Option<i32>,
+        formatting_options: Option<&FormattingOptions>,
+    ) -> JsonRpcResult<SelectionFormatEdits> {
         let text = self
             .document_cache
             .get(uri)
             .ok_or_else(|| tower_lsp::jsonrpc::Error::invalid_params("Document not found"))?
-            .text
             .clone();
+        ensure_document_version(uri, text.version, expected_version)?;
+        let source = text.text;
+        if !might_contain_template_string(&source) {
+            return Ok(SelectionFormatEdits::NoTemplate);
+        }
         let options =
             resolve_lsp_format_options(uri, formatting_options).map_err(internal_error)?;
-        let location = lsp_range_to_location(range, &text).map_err(internal_error)?;
+        let location = lsp_range_to_location(range, &source).map_err(internal_error)?;
         let mut parser = self.parser.lock().await;
         let templates = parser
-            .find_template_strings(&text)
+            .find_template_strings(&source)
             .map_err(internal_error)?;
         drop(parser);
 
@@ -766,11 +932,86 @@ impl TLinterLanguageServer {
             return Ok(SelectionFormatEdits::MultipleTemplates);
         }
 
-        let edits = format_document_range_with_options(&text, &location, &options)
+        let edits = format_document_range_with_options(&source, &location, &options)
             .map_err(internal_error)?;
+        ensure_cached_document_version(&self.document_cache, uri, expected_version)?;
         Ok(SelectionFormatEdits::Edits(
-            template_edits_to_lsp(edits, &text).map_err(internal_error)?,
+            template_edits_to_lsp(edits, &source).map_err(internal_error)?,
         ))
+    }
+
+    async fn deferred_source_fix_all_action(&self, uri: &Url) -> JsonRpcResult<Option<CodeAction>> {
+        let Some((document_version, might_have_template)) = self
+            .document_cache
+            .get(uri)
+            .map(|entry| (entry.version, might_contain_template_string(&entry.text)))
+        else {
+            return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                "Document not found",
+            ));
+        };
+        let ruff_enabled = self.ruff.read().await.is_some();
+        if !ruff_enabled && !might_have_template {
+            return Ok(None);
+        }
+
+        Ok(Some(CodeAction {
+            title: source_fix_all_title(ruff_enabled).to_string(),
+            kind: Some(Self::source_fix_all_kind()),
+            edit: None,
+            data: Some(encode_code_action_data(TLinterCodeAction::SourceFixAll {
+                uri: uri.clone(),
+                document_version,
+            })?),
+            is_preferred: Some(true),
+            ..Default::default()
+        }))
+    }
+
+    async fn deferred_rewrite_action(
+        &self,
+        uri: &Url,
+        range: &Range,
+    ) -> JsonRpcResult<Option<CodeAction>> {
+        let state = self
+            .document_cache
+            .get(uri)
+            .ok_or_else(|| tower_lsp::jsonrpc::Error::invalid_params("Document not found"))?
+            .clone();
+        if !might_contain_template_string(&state.text) {
+            return Ok(None);
+        }
+
+        let location = lsp_range_to_location(range, &state.text).map_err(internal_error)?;
+        let mut parser = self.parser.lock().await;
+        let locations = parser
+            .find_template_string_locations(&state.text)
+            .map_err(internal_error)?;
+        drop(parser);
+
+        let mut matches = locations
+            .iter()
+            .filter(|template_location| locations_overlap(template_location, &location));
+        if matches.next().is_none() {
+            return Ok(None);
+        }
+        if matches.next().is_some() {
+            return Ok(None);
+        }
+
+        Ok(Some(CodeAction {
+            title: "Rewrite template string with t-linter".to_string(),
+            kind: Some(Self::refactor_rewrite_kind()),
+            edit: None,
+            data: Some(encode_code_action_data(
+                TLinterCodeAction::RefactorRewrite {
+                    uri: uri.clone(),
+                    document_version: state.version,
+                    range: *range,
+                },
+            )?),
+            ..Default::default()
+        }))
     }
 
     async fn format_uri(
@@ -1057,7 +1298,25 @@ fn template_edits_to_lsp(
 }
 
 fn workspace_edit_for_uri(uri: &Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
-    WorkspaceEdit::new(HashMap::from([(uri.clone(), edits)]))
+    workspace_edit_for_uri_with_optional_version(uri, None, edits)
+}
+
+fn workspace_edit_for_uri_with_optional_version(
+    uri: &Url,
+    version: Option<i32>,
+    edits: Vec<TextEdit>,
+) -> WorkspaceEdit {
+    match version {
+        Some(version) => WorkspaceEdit {
+            changes: None,
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier::new(uri.clone(), version),
+                edits: edits.into_iter().map(OneOf::Left).collect(),
+            }])),
+            change_annotations: None,
+        },
+        None => WorkspaceEdit::new(HashMap::from([(uri.clone(), edits)])),
+    }
 }
 
 async fn run_interpolation_type_check(
@@ -1348,6 +1607,104 @@ fn requested_code_action_kinds_include(
     })
 }
 
+fn encode_code_action_data(action: TLinterCodeAction) -> JsonRpcResult<serde_json::Value> {
+    serde_json::to_value(TLinterCodeActionData {
+        schema_version: CODE_ACTION_DATA_SCHEMA_VERSION,
+        action,
+    })
+    .map_err(|error| internal_error(anyhow::Error::new(error)))
+}
+
+fn decode_code_action_data(
+    data: Option<serde_json::Value>,
+) -> JsonRpcResult<TLinterCodeActionData> {
+    let Some(data) = data else {
+        return Err(tower_lsp::jsonrpc::Error::invalid_params(
+            "Missing t-linter code action data",
+        ));
+    };
+    let data = serde_json::from_value::<TLinterCodeActionData>(data).map_err(|error| {
+        tower_lsp::jsonrpc::Error::invalid_params(format!(
+            "Invalid t-linter code action data: {error}"
+        ))
+    })?;
+    if data.schema_version != CODE_ACTION_DATA_SCHEMA_VERSION {
+        return Err(tower_lsp::jsonrpc::Error::invalid_params(format!(
+            "Unsupported t-linter code action data schema {}",
+            data.schema_version
+        )));
+    }
+    Ok(data)
+}
+
+fn ensure_document_version(
+    uri: &Url,
+    actual_version: i32,
+    expected_version: Option<i32>,
+) -> JsonRpcResult<()> {
+    if let Some(expected_version) = expected_version
+        && actual_version != expected_version
+    {
+        return Err(stale_code_action_error(
+            uri,
+            expected_version,
+            Some(actual_version),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_cached_document_version(
+    document_cache: &DashMap<Url, DocumentState>,
+    uri: &Url,
+    expected_version: Option<i32>,
+) -> JsonRpcResult<()> {
+    let Some(expected_version) = expected_version else {
+        return Ok(());
+    };
+    let actual_version = document_cache.get(uri).map(|entry| entry.version);
+    if actual_version == Some(expected_version) {
+        return Ok(());
+    }
+    Err(stale_code_action_error(
+        uri,
+        expected_version,
+        actual_version,
+    ))
+}
+
+fn stale_code_action_error(
+    uri: &Url,
+    expected_version: i32,
+    actual_version: Option<i32>,
+) -> tower_lsp::jsonrpc::Error {
+    let actual = actual_version
+        .map(|version| version.to_string())
+        .unwrap_or_else(|| "missing".to_string());
+    tower_lsp::jsonrpc::Error::invalid_params(format!(
+        "Stale t-linter code action for {uri}: expected document version {expected_version}, found {actual}"
+    ))
+}
+
+fn might_contain_template_string(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if matches!(byte, b't' | b'T') {
+            match bytes.get(index + 1) {
+                Some(b'\'' | b'"') => return true,
+                Some(b'r' | b'R') if matches!(bytes.get(index + 2), Some(b'\'' | b'"')) => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
 fn is_internal_lsp_error(err: &tower_lsp::jsonrpc::Error) -> bool {
     matches!(err.code, tower_lsp::jsonrpc::ErrorCode::InternalError)
 }
@@ -1380,6 +1737,30 @@ fn locations_overlap(left: &t_linter_core::Location, right: &t_linter_core::Loca
         left_start <= right_start && right_start < left_end
     } else {
         left_start < right_end && right_start < left_end
+    }
+}
+
+fn client_support_from_capabilities(capabilities: &ClientCapabilities) -> ClientSupport {
+    let code_action = capabilities
+        .text_document
+        .as_ref()
+        .and_then(|text_document| text_document.code_action.as_ref());
+    let resolve_code_action_edits = code_action
+        .and_then(|code_action| code_action.resolve_support.as_ref())
+        .is_some_and(|resolve| resolve.properties.iter().any(|property| property == "edit"))
+        && code_action
+            .and_then(|code_action| code_action.data_support)
+            .unwrap_or(false);
+    let versioned_workspace_edits = capabilities
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.workspace_edit.as_ref())
+        .and_then(|workspace_edit| workspace_edit.document_changes)
+        .unwrap_or(false);
+
+    ClientSupport {
+        resolve_code_action_edits,
+        versioned_workspace_edits,
     }
 }
 
@@ -1564,29 +1945,12 @@ fn final_text_edit(source: &str, final_text: &str) -> Result<Vec<TextEdit>> {
         return Ok(Vec::new());
     }
 
-    let source_chars = source.chars().collect::<Vec<_>>();
-    let final_chars = final_text.chars().collect::<Vec<_>>();
-    let mut prefix = 0;
-    while prefix < source_chars.len()
-        && prefix < final_chars.len()
-        && source_chars[prefix] == final_chars[prefix]
-    {
-        prefix += 1;
-    }
-
-    let mut suffix = 0;
-    while suffix + prefix < source_chars.len()
-        && suffix + prefix < final_chars.len()
-        && source_chars[source_chars.len() - 1 - suffix]
-            == final_chars[final_chars.len() - 1 - suffix]
-    {
-        suffix += 1;
-    }
-
-    let source_start = byte_offset_for_char(source, prefix);
-    let source_end = byte_offset_for_char(source, source_chars.len() - suffix);
-    let final_start = byte_offset_for_char(final_text, prefix);
-    let final_end = byte_offset_for_char(final_text, final_chars.len() - suffix);
+    let prefix = common_prefix_byte_len(source, final_text);
+    let suffix = common_suffix_byte_len(&source[prefix..], &final_text[prefix..]);
+    let source_start = prefix;
+    let source_end = source.len() - suffix;
+    let final_start = prefix;
+    let final_end = final_text.len() - suffix;
     let line_starts = line_start_offsets(source);
 
     Ok(vec![TextEdit {
@@ -1596,6 +1960,30 @@ fn final_text_edit(source: &str, final_text: &str) -> Result<Vec<TextEdit>> {
         },
         new_text: final_text[final_start..final_end].to_string(),
     }])
+}
+
+fn common_prefix_byte_len(left: &str, right: &str) -> usize {
+    let mut prefix = 0;
+    for ((left_index, left_char), (right_index, right_char)) in
+        left.char_indices().zip(right.char_indices())
+    {
+        if left_index != right_index || left_char != right_char {
+            break;
+        }
+        prefix = left_index + left_char.len_utf8();
+    }
+    prefix
+}
+
+fn common_suffix_byte_len(left: &str, right: &str) -> usize {
+    let mut suffix = 0;
+    for (left_char, right_char) in left.chars().rev().zip(right.chars().rev()) {
+        if left_char != right_char {
+            break;
+        }
+        suffix += left_char.len_utf8();
+    }
+    suffix
 }
 
 fn line_start_offsets(source: &str) -> Vec<usize> {
@@ -1700,14 +2088,6 @@ fn byte_offset_to_lsp_position(
         line: line as u32,
         character,
     })
-}
-
-fn byte_offset_for_char(source: &str, char_offset: usize) -> usize {
-    source
-        .char_indices()
-        .nth(char_offset)
-        .map(|(offset, _)| offset)
-        .unwrap_or(source.len())
 }
 
 #[cfg(test)]
@@ -2289,7 +2669,7 @@ payload: Annotated[Template, "json"] = t'{{"name": {名前}, "age": {age}}}'
                 TLinterLanguageServer::refactor_rewrite_kind()
             ])
         );
-        assert_eq!(options.resolve_provider, Some(false));
+        assert_eq!(options.resolve_provider, Some(true));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2659,6 +3039,166 @@ plain = t"hello {name}"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn source_fix_all_code_action_resolves_deferred_edit() {
+        let temp = tempdir_with_pyproject(20);
+        let source = sample_python_document();
+        let uri = write_source_file(temp.path(), "example.py", source);
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+        *server.client_support.write().await = ClientSupport {
+            resolve_code_action_edits: true,
+            versioned_workspace_edits: true,
+        };
+        open_cached_document(server, &uri, source).await;
+
+        let formatting_edits = server
+            .formatting(DocumentFormattingParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                options: FormattingOptions {
+                    tab_size: 4,
+                    insert_spaces: true,
+                    ..Default::default()
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            })
+            .await
+            .expect("formatting response")
+            .expect("formatting edits");
+
+        let actions = server
+            .code_action(code_action_params(
+                uri.clone(),
+                full_document_range(),
+                Some(vec![TLinterLanguageServer::source_fix_all_kind()]),
+            ))
+            .await
+            .expect("code action response")
+            .expect("code action");
+        let CodeActionOrCommand::CodeAction(action) = actions.into_iter().next().unwrap() else {
+            panic!("expected code action");
+        };
+        assert!(action.edit.is_none());
+        assert!(action.data.is_some());
+
+        let resolved = server
+            .code_action_resolve(action)
+            .await
+            .expect("resolve code action");
+        let edit = resolved.edit.as_ref().expect("resolved workspace edit");
+        let expected = apply_lsp_text_edits(source, &formatting_edits).expect("formatting edits");
+        let actual = apply_workspace_edit_for_uri(&uri, source, edit).expect("resolved edits");
+        assert_eq!(actual, expected);
+        assert!(matches!(
+            edit.document_changes,
+            Some(DocumentChanges::Edits(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deferred_code_action_rejects_stale_document_version() {
+        let temp = tempdir_with_pyproject(20);
+        let source = sample_python_document();
+        let uri = write_source_file(temp.path(), "example.py", source);
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+        *server.client_support.write().await = ClientSupport {
+            resolve_code_action_edits: true,
+            versioned_workspace_edits: true,
+        };
+        open_cached_document(server, &uri, source).await;
+
+        let actions = server
+            .code_action(code_action_params(
+                uri.clone(),
+                full_document_range(),
+                Some(vec![TLinterLanguageServer::source_fix_all_kind()]),
+            ))
+            .await
+            .expect("code action response")
+            .expect("code action");
+        let CodeActionOrCommand::CodeAction(action) = actions.into_iter().next().unwrap() else {
+            panic!("expected code action");
+        };
+
+        server
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 2,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: source.replace("12345", "changed"),
+                }],
+            })
+            .await;
+
+        let err = server
+            .code_action_resolve(action)
+            .await
+            .expect_err("stale code action should fail");
+        assert_eq!(err.code, tower_lsp::jsonrpc::ErrorCode::InvalidParams);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rewrite_code_action_resolves_deferred_edit() {
+        let temp = tempdir_with_pyproject(20);
+        let source = sample_python_document();
+        let uri = write_source_file(temp.path(), "example.py", source);
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+        *server.client_support.write().await = ClientSupport {
+            resolve_code_action_edits: true,
+            versioned_workspace_edits: false,
+        };
+        open_cached_document(server, &uri, source).await;
+        let range = Range {
+            start: Position {
+                line: 3,
+                character: 50,
+            },
+            end: Position {
+                line: 3,
+                character: 55,
+            },
+        };
+
+        let expected_edits = server
+            .format_uri(&uri, Some(range), None)
+            .await
+            .expect("range formatting edits");
+        let actions = server
+            .code_action(code_action_params(
+                uri.clone(),
+                range,
+                Some(vec![CodeActionKind::REFACTOR_REWRITE]),
+            ))
+            .await
+            .expect("code action response")
+            .expect("rewrite action");
+        let CodeActionOrCommand::CodeAction(action) = actions.into_iter().next().unwrap() else {
+            panic!("expected code action");
+        };
+        assert!(action.edit.is_none());
+
+        let resolved = server
+            .code_action_resolve(action)
+            .await
+            .expect("resolve rewrite action");
+        let edit = resolved.edit.as_ref().expect("resolved workspace edit");
+        let expected = apply_lsp_text_edits(source, &expected_edits).expect("range edits");
+        let actual = apply_workspace_edit_for_uri(&uri, source, edit).expect("resolved edits");
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn rewrite_code_action_requires_single_template_selection() {
         let temp = tempdir_with_pyproject(20);
         let source = sample_python_document();
@@ -2776,15 +3316,7 @@ query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
     #[tokio::test(flavor = "current_thread")]
     async fn code_action_ignores_transient_template_format_errors() {
         let temp = TempDir::new().expect("tempdir");
-        let source = r#"from typing import Annotated
-from string.templatelib import Template
-
-title = "demo"
-payload: Annotated[Template, "html"] = t"""
-<html><div>{title}< /div></html>
-
-"""
-"#;
+        let source = malformed_template_document();
         let uri = write_source_file(temp.path(), "example.py", source);
         let (service, _) = LspService::new(|client| {
             TLinterLanguageServer::new(client).expect("create language server")
@@ -2820,6 +3352,69 @@ payload: Annotated[Template, "html"] = t"""
             .await
             .expect("rewrite code action should not fail on malformed template content");
         assert!(no_rewrite.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn code_action_resolve_ignores_transient_template_format_errors() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = malformed_template_document();
+        let uri = write_source_file(temp.path(), "example.py", source);
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+        *server.client_support.write().await = ClientSupport {
+            resolve_code_action_edits: true,
+            versioned_workspace_edits: true,
+        };
+        open_cached_document(server, &uri, source).await;
+
+        let fix_all = server
+            .code_action(code_action_params(
+                uri.clone(),
+                full_document_range(),
+                Some(vec![TLinterLanguageServer::source_fix_all_kind()]),
+            ))
+            .await
+            .expect("deferred fixAll code action should not fail")
+            .expect("deferred fixAll action");
+        let CodeActionOrCommand::CodeAction(action) = fix_all.into_iter().next().unwrap() else {
+            panic!("expected code action");
+        };
+        assert!(action.edit.is_none());
+        let resolved = server
+            .code_action_resolve(action)
+            .await
+            .expect("resolve should ignore malformed template content");
+        assert!(resolved.edit.is_none());
+
+        let rewrite = server
+            .code_action(code_action_params(
+                uri,
+                Range {
+                    start: Position {
+                        line: 5,
+                        character: 20,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 20,
+                    },
+                },
+                Some(vec![TLinterLanguageServer::refactor_rewrite_kind()]),
+            ))
+            .await
+            .expect("deferred rewrite code action should not fail")
+            .expect("deferred rewrite action");
+        let CodeActionOrCommand::CodeAction(action) = rewrite.into_iter().next().unwrap() else {
+            panic!("expected code action");
+        };
+        assert!(action.edit.is_none());
+        let resolved = server
+            .code_action_resolve(action)
+            .await
+            .expect("resolve should ignore malformed rewrite content");
+        assert!(resolved.edit.is_none());
     }
 
     #[test]
@@ -2932,6 +3527,18 @@ from string.templatelib import Template
 html_template: Annotated[Template, "html"] = t'<div data-a="12345" data-b="67890"></div>'
 query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
 payload: Annotated[Template, "json"] = t'{"b": 2, "a": 1}'
+"#
+    }
+
+    fn malformed_template_document() -> &'static str {
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+title = "demo"
+payload: Annotated[Template, "html"] = t"""
+<html><div>{title}< /div></html>
+
+"""
 "#
     }
 }

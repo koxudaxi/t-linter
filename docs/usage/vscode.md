@@ -26,7 +26,7 @@ Use this when you want Ruff to format Python code and t-linter to format the con
 }
 ```
 
-On save, VSCode asks t-linter for the `source.fixAll.t-linter` code action. The server responds with a direct `WorkspaceEdit`, so save-time behavior stays deterministic.
+On save, VSCode asks t-linter for the `source.fixAll.t-linter` code action. t-linter returns either a direct `WorkspaceEdit` or, for clients that advertise lazy edit resolution, a lightweight action whose edit is computed by `codeAction/resolve`.
 
 You can also run the manual range action from the Command Palette or lightbulb UI:
 
