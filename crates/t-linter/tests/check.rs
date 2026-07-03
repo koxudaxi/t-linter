@@ -82,6 +82,47 @@ template: Annotated[Template, "json"] = t"""[1,,2]"""
 }
 
 #[test]
+fn check_honors_toml_profile_metadata() {
+    let dir = test_dir("toml-profile");
+    let source_without_profile = r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "toml"] = t"""
+value = {{ a = 1,
+  b = 2 }}
+"""
+"#;
+    write_file(&dir.join("ok.py"), source_without_profile);
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "toml", "profile:1.0"] = t"""
+value = {{ a = 1,
+  b = 2 }}
+"""
+"#,
+    );
+
+    let ok_output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let ok_stdout = String::from_utf8(ok_output.stdout).unwrap();
+    let ok_json: serde_json::Value = serde_json::from_str(&ok_stdout).unwrap();
+    assert_eq!(ok_output.status.code(), Some(0));
+    assert_eq!(ok_json["summary"]["diagnostics"], 0);
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "toml");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_reports_raw_first_template_prefixes() {
     let dir = test_dir("raw-first-prefix");
     write_file(

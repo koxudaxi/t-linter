@@ -275,7 +275,7 @@ fn lint_backend_template(
     static_spread_analysis: &StaticSpreadAnalysis,
 ) -> Result<Vec<LintDiagnostic>> {
     let input = template.to_template_input();
-    let result = backend.check_template(&input);
+    let result = backend.check_template(&input, template.profile.as_deref());
 
     let Err(error) = result else {
         let mut diagnostics = Vec::new();

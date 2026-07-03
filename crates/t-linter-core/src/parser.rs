@@ -51,6 +51,7 @@ pub struct CallableParameter {
     pub position: usize,
     pub name: String,
     pub template_language: Option<String>,
+    pub template_profile: Option<String>,
     pub value_types: Vec<CallableValueType>,
     pub accepts_none: bool,
     pub required: bool,
@@ -64,6 +65,12 @@ pub enum CallableValueType {
     Int,
     Float,
     String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TemplateHint {
+    language: String,
+    profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -169,6 +176,7 @@ enum TypeExpr {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ResolvedTypeInfo {
     template_language: Option<String>,
+    template_profile: Option<String>,
     value_types: Vec<CallableValueType>,
     accepts_none: bool,
 }
@@ -940,6 +948,7 @@ impl TemplateStringParser {
                         position,
                         name: parameter_name.to_string(),
                         template_language: type_hints.template_language,
+                        template_profile: type_hints.template_profile,
                         value_types: type_hints.value_types,
                         accepts_none: type_hints.accepts_none,
                         required,
@@ -1147,7 +1156,7 @@ impl TemplateStringParser {
         assignments: &[VariableAssignment],
         scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
-    ) -> Result<HashMap<AssignmentKey, String>> {
+    ) -> Result<HashMap<AssignmentKey, TemplateHint>> {
         let query_str = r#"
         (call
             function: (_) @func_expr
@@ -1159,7 +1168,7 @@ impl TemplateStringParser {
 
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
-        let mut hints = HashMap::<AssignmentKey, Option<String>>::new();
+        let mut hints = HashMap::<AssignmentKey, Option<TemplateHint>>::new();
 
         while let Some(match_) = matches.next() {
             let mut func_expr = None;
@@ -1217,28 +1226,24 @@ impl TemplateStringParser {
                 else {
                     continue;
                 };
-                match hints.get(&binding.key) {
-                    Some(Some(existing))
-                        if parameter
-                            .template_language
-                            .as_ref()
-                            .is_some_and(|lang| existing != lang) =>
-                    {
+                let parameter_hint = parameter_template_hint(parameter);
+                match (hints.get(&binding.key), parameter_hint) {
+                    (Some(Some(existing)), Some(hint)) if existing != &hint => {
                         hints.insert(binding.key.clone(), None);
                     }
-                    Some(None) => {}
-                    _ => {
-                        if let Some(language) = &parameter.template_language {
-                            hints.insert(binding.key.clone(), Some(language.clone()));
-                        }
+                    (Some(Some(_)), None) => {}
+                    (Some(None), _) => {}
+                    (_, Some(hint)) => {
+                        hints.insert(binding.key.clone(), Some(hint));
                     }
+                    (_, None) => {}
                 }
             }
         }
 
         Ok(hints
             .into_iter()
-            .filter_map(|(name, language)| language.map(|language| (name, language)))
+            .filter_map(|(name, hint)| hint.map(|hint| (name, hint)))
             .collect())
     }
 
@@ -1248,7 +1253,7 @@ impl TemplateStringParser {
         source: &str,
         templates: &mut Vec<TemplateStringInfo>,
         context: &ModuleContext,
-        variable_language_hints: &HashMap<AssignmentKey, String>,
+        variable_language_hints: &HashMap<AssignmentKey, TemplateHint>,
         assignments: &[VariableAssignment],
         scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
@@ -1331,7 +1336,7 @@ impl TemplateStringParser {
         type_annotation: Option<Node>,
         func_name: Option<&str>,
         context: &ModuleContext,
-        variable_language_hints: &HashMap<AssignmentKey, String>,
+        variable_language_hints: &HashMap<AssignmentKey, TemplateHint>,
         assignments: &[VariableAssignment],
         scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
@@ -1356,7 +1361,7 @@ impl TemplateStringParser {
         let (content, expressions, parts) =
             self.extract_content_and_interpolations(&node, source, flags.is_raw)?;
 
-        let mut language = if let Some(type_node) = type_annotation {
+        let mut hint = if let Some(type_node) = type_annotation {
             if type_annotation_references_local_type_alias(
                 type_node,
                 source,
@@ -1365,10 +1370,10 @@ impl TemplateStringParser {
             )? {
                 None
             } else {
-                self.resolve_language_from_type_node(type_node, source)?
+                self.resolve_template_hint_from_type_node(type_node, source)?
             }
         } else if let Some(func) = func_name {
-            self.infer_language_from_function_call(
+            self.infer_template_hint_from_function_call(
                 func,
                 &node,
                 source,
@@ -1380,12 +1385,12 @@ impl TemplateStringParser {
         } else {
             None
         };
-        if language.is_none() {
+        if hint.is_none() {
             if let Some(var_node) = var_name_node
                 && let Some(binding) =
                     assignment_key_for_node_with_directives(var_node, source, scope_directives)
             {
-                language = variable_language_hints.get(&binding).cloned();
+                hint = variable_language_hints.get(&binding).cloned();
             }
         }
 
@@ -1409,7 +1414,8 @@ impl TemplateStringParser {
             raw_content: raw_content.to_string(),
             variable_name: var_name.map(String::from),
             function_name: func_name.map(String::from),
-            language,
+            language: hint.as_ref().map(|hint| hint.language.clone()),
+            profile: hint.and_then(|hint| hint.profile),
             string_start: start_text.to_string(),
             string_end: end_text.to_string(),
             location: Location {
@@ -1612,7 +1618,7 @@ impl TemplateStringParser {
         }))
     }
 
-    fn infer_language_from_function_call(
+    fn infer_template_hint_from_function_call(
         &self,
         func_name: &str,
         string_node: &Node,
@@ -1621,7 +1627,7 @@ impl TemplateStringParser {
         assignments: &[VariableAssignment],
         scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<TemplateHint>> {
         let callee_node = string_node
             .parent()
             .and_then(|parent| match parent.kind() {
@@ -1643,7 +1649,7 @@ impl TemplateStringParser {
             name_bindings,
         )?
         else {
-            return self.infer_language_from_explicit_callee_target(
+            return self.infer_template_hint_from_explicit_callee_target(
                 func_name,
                 callee_node,
                 source,
@@ -1668,8 +1674,8 @@ impl TemplateStringParser {
                         argument.position,
                         argument.keyword,
                     ) {
-                        if parameter.template_language.is_some() {
-                            return Ok(parameter.template_language.clone());
+                        if let Some(hint) = parameter_template_hint(parameter) {
+                            return Ok(Some(hint));
                         }
                     }
                     break;
@@ -1677,7 +1683,7 @@ impl TemplateStringParser {
             }
         }
 
-        self.infer_language_from_explicit_callee_target(
+        self.infer_template_hint_from_explicit_callee_target(
             func_name,
             callee_node,
             source,
@@ -1688,7 +1694,7 @@ impl TemplateStringParser {
         )
     }
 
-    fn infer_language_from_explicit_callee_target(
+    fn infer_template_hint_from_explicit_callee_target(
         &self,
         func_name: &str,
         callee_node: Option<Node>,
@@ -1697,7 +1703,7 @@ impl TemplateStringParser {
         assignments: &[VariableAssignment],
         scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<TemplateHint>> {
         let Some(target) = self.resolve_callee_import_target(
             func_name,
             callee_node,
@@ -1711,7 +1717,12 @@ impl TemplateStringParser {
             return Ok(None);
         };
 
-        self.resolve_language_from_explicit_callee_target(&target, &mut HashSet::new())
+        Ok(self
+            .resolve_language_from_explicit_callee_target(&target, &mut HashSet::new())?
+            .map(|language| TemplateHint {
+                language,
+                profile: None,
+            }))
     }
 
     fn resolve_language_from_explicit_callee_target(
@@ -1908,11 +1919,11 @@ impl TemplateStringParser {
         }))
     }
 
-    fn resolve_language_from_type_node(
+    fn resolve_template_hint_from_type_node(
         &mut self,
         type_node: Node,
         source: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<TemplateHint>> {
         let module_type_data = self.last_module_type_data.clone();
         let mut module_cache = std::mem::take(&mut self.last_module_cache);
         let resolved = self.resolve_type_info_from_type_node(
@@ -1922,7 +1933,7 @@ impl TemplateStringParser {
             &mut module_cache,
         );
         self.last_module_cache = module_cache;
-        Ok(resolved?.template_language)
+        Ok(template_hint_from_type_info(resolved?))
     }
 
     fn resolve_module_type_aliases(
@@ -1985,6 +1996,7 @@ impl TemplateStringParser {
             TypeExpr::StringLiteral(_) => Ok(ResolvedTypeInfo::default()),
             TypeExpr::NoneLiteral => Ok(ResolvedTypeInfo {
                 template_language: None,
+                template_profile: None,
                 value_types: Vec::new(),
                 accepts_none: true,
             }),
@@ -2279,6 +2291,7 @@ impl TemplateStringParser {
             && let TypeExpr::StringLiteral(language) = &args[1]
         {
             resolved.template_language = Some(language.clone());
+            resolved.template_profile = args.iter().skip(2).find_map(template_profile_metadata);
         }
 
         Ok(resolved)
@@ -2598,6 +2611,35 @@ fn resolved_type_info_for_special_name(kind: &str) -> ResolvedTypeInfo {
     resolved
 }
 
+fn template_hint_from_type_info(info: ResolvedTypeInfo) -> Option<TemplateHint> {
+    info.template_language.map(|language| TemplateHint {
+        language,
+        profile: info.template_profile,
+    })
+}
+
+fn parameter_template_hint(parameter: &CallableParameter) -> Option<TemplateHint> {
+    parameter
+        .template_language
+        .as_ref()
+        .map(|language| TemplateHint {
+            language: language.clone(),
+            profile: parameter.template_profile.clone(),
+        })
+}
+
+fn template_profile_metadata(arg: &TypeExpr) -> Option<String> {
+    let TypeExpr::StringLiteral(value) = arg else {
+        return None;
+    };
+    value
+        .strip_prefix("profile:")
+        .or_else(|| value.strip_prefix("profile="))
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+        .map(str::to_string)
+}
+
 fn resolve_literal_type_info(args: &[TypeExpr]) -> ResolvedTypeInfo {
     let mut resolved = ResolvedTypeInfo::default();
     for arg in args {
@@ -2628,6 +2670,9 @@ fn resolve_literal_type_info(args: &[TypeExpr]) -> ResolvedTypeInfo {
 fn merge_resolved_type_info(target: &mut ResolvedTypeInfo, other: ResolvedTypeInfo) {
     if target.template_language.is_none() {
         target.template_language = other.template_language;
+    }
+    if target.template_profile.is_none() {
+        target.template_profile = other.template_profile;
     }
     for value_type in other.value_types {
         push_value_type(&mut target.value_types, value_type);
@@ -4167,6 +4212,7 @@ pub struct TemplateStringInfo {
     pub variable_name: Option<String>,
     pub function_name: Option<String>,
     pub language: Option<String>,
+    pub profile: Option<String>,
     pub string_start: String,
     pub string_end: String,
     pub location: Location,
@@ -5354,6 +5400,7 @@ html = t"""
             variable_name: None,
             function_name: None,
             language: Some("html".to_string()),
+            profile: None,
             string_start: "t\"".to_string(),
             string_end: "\"".to_string(),
             location: Location {
@@ -5418,6 +5465,7 @@ html = t"""
             variable_name: None,
             function_name: None,
             language: Some("yaml".to_string()),
+            profile: None,
             string_start: "t\"".to_string(),
             string_end: "\"".to_string(),
             location: Location {
@@ -5782,6 +5830,37 @@ config: toml_config = t"title = {title}"
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("toml".to_string()));
         assert_eq!(templates[0].content, "title = {}");
+    }
+
+    #[test]
+    fn test_annotated_template_profile_metadata_detection() {
+        let source = r#"
+config: Annotated[Template, "toml", "profile:1.0"] = t"title = {title}"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("toml".to_string()));
+        assert_eq!(templates[0].profile, Some("1.0".to_string()));
+    }
+
+    #[test]
+    fn test_function_annotation_profile_metadata_detection() {
+        let source = r#"
+def render_toml(template: Annotated[Template, "toml", "profile=1.0"]) -> None:
+    pass
+
+render_toml(t"title = {title}")
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("toml".to_string()));
+        assert_eq!(templates[0].profile, Some("1.0".to_string()));
     }
 
     #[test]

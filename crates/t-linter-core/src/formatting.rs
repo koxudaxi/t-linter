@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tstring_syntax::BackendError;
 
+use crate::backend::TemplateBackend;
 use crate::{Location, TemplateStringInfo, TemplateStringParser};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,24 +191,8 @@ fn format_template_edit(
     let input = template.to_template_input();
     let line_length = options.line_length.max(1);
 
-    let formatted = match language.as_str() {
-        "html" => tstring_html::format_template_with_options(
-            &input,
-            &tstring_html::FormatOptions { line_length },
-        ),
-        "thtml" => tstring_thtml::format_template_with_options(
-            &input,
-            &tstring_html::FormatOptions { line_length },
-        ),
-        "tdom" => tstring_tdom::format_template_with_options(
-            &input,
-            &tstring_tdom::FormatOptions { line_length },
-        ),
-        "json" => tstring_json::format_template(&input),
-        "yaml" | "yml" => tstring_yaml::format_template(&input),
-        "toml" => tstring_toml::format_template(&input),
-        _ => return None,
-    };
+    let backend = TemplateBackend::for_language(&language)?;
+    let formatted = backend.format_template(&input, template.profile.as_deref(), line_length);
 
     Some(
         formatted

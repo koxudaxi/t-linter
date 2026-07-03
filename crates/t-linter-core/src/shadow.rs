@@ -203,7 +203,10 @@ fn type_requirements_by_template(
             let Some(backend) = TemplateBackend::for_language(language) else {
                 return Vec::new();
             };
-            match backend.interpolation_type_requirements(&template.to_template_input()) {
+            match backend.interpolation_type_requirements(
+                &template.to_template_input(),
+                template.profile.as_deref(),
+            ) {
                 Ok(requirements) => requirements,
                 Err(error) => {
                     tracing::debug!(
