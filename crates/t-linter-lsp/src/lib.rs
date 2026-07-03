@@ -581,13 +581,22 @@ impl LanguageServer for TLinterLanguageServer {
                 uri,
                 document_version,
             } => {
-                let edits = self
+                let kind = Self::source_fix_all_kind();
+                let edits = match self
                     .collect_document_format_edits_matching_version(
                         &uri,
                         Some(document_version),
                         None,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(edits) => edits,
+                    Err(err) if is_internal_lsp_error(&err) => {
+                        self.log_skipped_code_action_error(&kind, &err).await;
+                        Vec::new()
+                    }
+                    Err(err) => return Err(err),
+                };
                 (uri, document_version, edits)
             }
             TLinterCodeAction::RefactorRewrite {
@@ -595,19 +604,25 @@ impl LanguageServer for TLinterLanguageServer {
                 document_version,
                 range,
             } => {
-                let edits = self
+                let kind = Self::refactor_rewrite_kind();
+                let edits = match self
                     .collect_single_template_selection_format_edits_matching_version(
                         &uri,
                         &range,
                         Some(document_version),
                         None,
                     )
-                    .await?;
-                let edits = match edits {
-                    SelectionFormatEdits::Edits(edits) => edits,
-                    SelectionFormatEdits::NoTemplate | SelectionFormatEdits::MultipleTemplates => {
+                    .await
+                {
+                    Ok(SelectionFormatEdits::Edits(edits)) => edits,
+                    Ok(
+                        SelectionFormatEdits::NoTemplate | SelectionFormatEdits::MultipleTemplates,
+                    ) => Vec::new(),
+                    Err(err) if is_internal_lsp_error(&err) => {
+                        self.log_skipped_code_action_error(&kind, &err).await;
                         Vec::new()
                     }
+                    Err(err) => return Err(err),
                 };
                 (uri, document_version, edits)
             }
@@ -3301,15 +3316,7 @@ query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
     #[tokio::test(flavor = "current_thread")]
     async fn code_action_ignores_transient_template_format_errors() {
         let temp = TempDir::new().expect("tempdir");
-        let source = r#"from typing import Annotated
-from string.templatelib import Template
-
-title = "demo"
-payload: Annotated[Template, "html"] = t"""
-<html><div>{title}< /div></html>
-
-"""
-"#;
+        let source = malformed_template_document();
         let uri = write_source_file(temp.path(), "example.py", source);
         let (service, _) = LspService::new(|client| {
             TLinterLanguageServer::new(client).expect("create language server")
@@ -3345,6 +3352,69 @@ payload: Annotated[Template, "html"] = t"""
             .await
             .expect("rewrite code action should not fail on malformed template content");
         assert!(no_rewrite.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn code_action_resolve_ignores_transient_template_format_errors() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = malformed_template_document();
+        let uri = write_source_file(temp.path(), "example.py", source);
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::new(client).expect("create language server")
+        });
+        let server = service.inner();
+        *server.client_support.write().await = ClientSupport {
+            resolve_code_action_edits: true,
+            versioned_workspace_edits: true,
+        };
+        open_cached_document(server, &uri, source).await;
+
+        let fix_all = server
+            .code_action(code_action_params(
+                uri.clone(),
+                full_document_range(),
+                Some(vec![TLinterLanguageServer::source_fix_all_kind()]),
+            ))
+            .await
+            .expect("deferred fixAll code action should not fail")
+            .expect("deferred fixAll action");
+        let CodeActionOrCommand::CodeAction(action) = fix_all.into_iter().next().unwrap() else {
+            panic!("expected code action");
+        };
+        assert!(action.edit.is_none());
+        let resolved = server
+            .code_action_resolve(action)
+            .await
+            .expect("resolve should ignore malformed template content");
+        assert!(resolved.edit.is_none());
+
+        let rewrite = server
+            .code_action(code_action_params(
+                uri,
+                Range {
+                    start: Position {
+                        line: 5,
+                        character: 20,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 20,
+                    },
+                },
+                Some(vec![TLinterLanguageServer::refactor_rewrite_kind()]),
+            ))
+            .await
+            .expect("deferred rewrite code action should not fail")
+            .expect("deferred rewrite action");
+        let CodeActionOrCommand::CodeAction(action) = rewrite.into_iter().next().unwrap() else {
+            panic!("expected code action");
+        };
+        assert!(action.edit.is_none());
+        let resolved = server
+            .code_action_resolve(action)
+            .await
+            .expect("resolve should ignore malformed rewrite content");
+        assert!(resolved.edit.is_none());
     }
 
     #[test]
@@ -3457,6 +3527,18 @@ from string.templatelib import Template
 html_template: Annotated[Template, "html"] = t'<div data-a="12345" data-b="67890"></div>'
 query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
 payload: Annotated[Template, "json"] = t'{"b": 2, "a": 1}'
+"#
+    }
+
+    fn malformed_template_document() -> &'static str {
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+title = "demo"
+payload: Annotated[Template, "html"] = t"""
+<html><div>{title}< /div></html>
+
+"""
 "#
     }
 }
