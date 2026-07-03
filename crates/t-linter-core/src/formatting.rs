@@ -220,6 +220,8 @@ fn ranges_overlap(left: &Location, right: &Location) -> bool {
     let right_start = (right.start_line, right.start_column);
     let right_end = (right.end_line, right.end_column);
 
+    // A zero-width `right` range acts as a cursor and uses the template's
+    // inclusive start / exclusive end boundary.
     if right_start == right_end {
         left_start <= right_start && right_start < left_end
     } else {
