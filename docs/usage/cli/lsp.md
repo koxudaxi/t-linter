@@ -78,6 +78,10 @@ Enable it from an LSP client with initialization options:
 
 The `t-linter check` CLI does not run interpolation value type checking yet.
 
+See [Interpolation Type Checking](../interpolation-type-checking.md) for the
+architecture, shadow document behavior, diagnostic mapping, and implementation
+entry points.
+
 ## Code Action Kinds
 
 The server advertises `textDocument/codeAction` support with two t-linter-specific kinds:

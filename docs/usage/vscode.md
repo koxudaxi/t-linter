@@ -79,6 +79,9 @@ Interpolation value type checking is optional and checks JSON, YAML, and TOML te
 
 `t-linter.typeChecking.tyPath` is optional. Leave it empty to let the language server discover `ty` from the active virtual environment, workspace `.venv`/`venv`, uv project, or `PATH`.
 
+For the architecture, shadow document behavior, and implementation details, see
+[Interpolation Type Checking](./interpolation-type-checking.md).
+
 ## Bundled Binary Matrix
 
 The extension bundles `t-linter` on these platforms:

@@ -227,6 +227,9 @@ Interpolation value type checking is opt-in and applies to JSON, YAML, and TOML 
 
 When `command` is omitted, t-linter searches active virtual environments, workspace `.venv`/`venv`, uv projects, and then `ty` on `PATH`.
 
+See [Interpolation Type Checking](docs/usage/interpolation-type-checking.md)
+for the architecture, behavior, and implementation details.
+
 #### Claude Code
 
 Add t-linter as an LSP server in your project's `.claude/settings.json`:
