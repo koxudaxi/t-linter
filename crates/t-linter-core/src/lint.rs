@@ -455,8 +455,8 @@ fn map_content_range_to_document(
     start_offset: usize,
     end_offset: usize,
 ) -> ((usize, usize), (usize, usize)) {
-    let prefix_len = calculate_template_content_offset(&template.raw_content);
-    let suffix_len = if template.flags.is_triple { 3 } else { 1 };
+    let prefix_len = template.string_start.len();
+    let suffix_len = template.string_end.len();
     let actual_content = &template.raw_content[prefix_len..template.raw_content.len() - suffix_len];
     let template_start_line = template.location.start_line - 1;
     let template_start_col = template.location.start_column - 1;
@@ -479,20 +479,6 @@ fn map_content_range_to_document(
     );
 
     ((start_line + 1, start_col + 1), (end_line + 1, end_col + 1))
-}
-
-fn calculate_template_content_offset(raw_content: &str) -> usize {
-    if raw_content.starts_with("t\"\"\"") || raw_content.starts_with("t'''") {
-        4
-    } else if raw_content.starts_with("tr\"\"\"") || raw_content.starts_with("tr'''") {
-        5
-    } else if raw_content.starts_with("t\"") || raw_content.starts_with("t'") {
-        2
-    } else if raw_content.starts_with("tr\"") || raw_content.starts_with("tr'") {
-        3
-    } else {
-        0
-    }
 }
 
 fn map_template_position_to_document(

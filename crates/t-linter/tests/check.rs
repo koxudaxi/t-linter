@@ -82,6 +82,29 @@ template: Annotated[Template, "json"] = t"""[1,,2]"""
 }
 
 #[test]
+fn check_reports_raw_first_template_prefixes() {
+    let dir = test_dir("raw-first-prefix");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "html"] = rt"<div><"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "html");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_reports_yaml_plain_scalars_with_whitespace_interpolation() {
     let dir = test_dir("yaml-plain-scalar");
     write_file(
