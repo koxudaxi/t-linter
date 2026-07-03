@@ -32,6 +32,20 @@ struct PendingInsertion {
     text: String,
     sites: Vec<PendingSite>,
     datetime_imported: bool,
+    mode: InsertionMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum InsertionMode {
+    #[default]
+    AfterStatement,
+    BeforeStatement,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InsertionPoint {
+    offset: usize,
+    mode: InsertionMode,
 }
 
 #[derive(Debug)]
@@ -74,8 +88,8 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
             continue;
         }
         let template_start = location_start_byte(source, &line_starts, &template.location)?;
-        let Some(statement_end) =
-            enclosing_simple_statement_end(tree.root_node(), template_start, source.len())
+        let Some(insertion_point) =
+            enclosing_simple_statement_insertion(tree.root_node(), template_start, source.len())
         else {
             tracing::debug!(
                 "Skipping interpolation type checks outside a simple statement at {}:{}",
@@ -101,18 +115,26 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
             );
             let annotation =
                 shadow_annotation_type(&requirement.expected_python_type, &datetime_alias);
-            let lhs = format!("; {name}: \"{annotation}\" = ");
+            let lhs = format!("{name}: \"{annotation}\" = ");
             debug_assert!(!lhs.contains('\n'));
             debug_assert!(!interpolation.expression.contains('\n'));
 
-            let insertion = insertions.entry(statement_end).or_default();
+            let insertion =
+                insertions
+                    .entry(insertion_point.offset)
+                    .or_insert_with(|| PendingInsertion {
+                        mode: insertion_point.mode,
+                        ..PendingInsertion::default()
+                    });
             if requires_datetime_alias(&requirement.expected_python_type)
                 && !insertion.datetime_imported
             {
-                insertion.text.push_str("; import datetime as ");
+                push_shadow_statement_prefix(&mut insertion.text, insertion.mode);
+                insertion.text.push_str("import datetime as ");
                 insertion.text.push_str(&datetime_alias);
                 insertion.datetime_imported = true;
             }
+            push_shadow_statement_prefix(&mut insertion.text, insertion.mode);
             let rhs_start = insertion.text.len() + lhs.len();
             insertion.text.push_str(&lhs);
             insertion.text.push_str(&interpolation.expression);
@@ -146,6 +168,9 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
         text.push_str(&source[cursor..offset]);
         let insertion_start = text.len();
         text.push_str(&insertion.text);
+        if insertion.mode == InsertionMode::BeforeStatement && !insertion.text.is_empty() {
+            text.push_str("; ");
+        }
         cursor = offset;
 
         sites.extend(insertion.sites.into_iter().map(|site| ShadowCheckSite {
@@ -241,18 +266,36 @@ fn should_skip_interpolation(
         .is_some_and(|node| contains_node_kind(node, "named_expression")))
 }
 
-fn enclosing_simple_statement_end(
+fn push_shadow_statement_prefix(text: &mut String, mode: InsertionMode) {
+    match mode {
+        InsertionMode::AfterStatement => text.push_str("; "),
+        InsertionMode::BeforeStatement if !text.is_empty() => text.push_str("; "),
+        InsertionMode::BeforeStatement => {}
+    }
+}
+
+fn enclosing_simple_statement_insertion(
     root: Node<'_>,
     start_byte: usize,
     source_len: usize,
-) -> Option<usize> {
+) -> Option<InsertionPoint> {
     let end_byte = start_byte.saturating_add(1).min(source_len);
     let mut node = root.descendant_for_byte_range(start_byte, end_byte)?;
     loop {
         let parent = node.parent()?;
         match parent.kind() {
             "module" | "block" => {
-                return simple_statement_kind(node.kind()).then_some(node.end_byte());
+                return match node.kind() {
+                    "return_statement" | "raise_statement" => Some(InsertionPoint {
+                        offset: node.start_byte(),
+                        mode: InsertionMode::BeforeStatement,
+                    }),
+                    kind if simple_statement_kind(kind) => Some(InsertionPoint {
+                        offset: node.end_byte(),
+                        mode: InsertionMode::AfterStatement,
+                    }),
+                    _ => None,
+                };
             }
             _ => node = parent,
         }
@@ -262,11 +305,7 @@ fn enclosing_simple_statement_end(
 fn simple_statement_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "expression_statement"
-            | "return_statement"
-            | "assert_statement"
-            | "delete_statement"
-            | "raise_statement"
+        "expression_statement" | "assert_statement" | "delete_statement"
     )
 }
 
@@ -420,6 +459,27 @@ run_json(
             .position(|line| line.contains("); __tl_0_0:"))
             .expect("insertion line");
         assert_eq!(shadow.sites[0].shadow_line, insertion_line);
+        assert_eq!(
+            &shadow.text[shadow.sites[0].shadow_rhs_byte_range.clone()],
+            "user"
+        );
+        assert_python_parses(&shadow.text);
+    }
+
+    #[test]
+    fn return_templates_insert_shadow_checks_before_return() {
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+def run_json(template: Annotated[Template, "json"]) -> None: ...
+
+def build(user) -> Annotated[Template, "json"]:
+    return run_json(t'{{"name": {user}}}')
+"#;
+        let shadow = synthesize(source).expect("shadow");
+
+        assert!(shadow.text.contains("__tl_0_0: "));
+        assert!(shadow.text.contains(" = user; return run_json("));
         assert_eq!(
             &shadow.text[shadow.sites[0].shadow_rhs_byte_range.clone()],
             "user"

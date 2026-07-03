@@ -649,6 +649,7 @@ mod tests {
                 .unwrap_or_else(|| format!("slot_{interpolation_index}"));
             parts.push(TemplatePart::Interpolation(InterpolationInfo {
                 expression: expression.clone(),
+                debug_prefix: None,
                 conversion: None,
                 format_spec: String::new(),
                 raw_source: format!("{{{expression}}}"),
@@ -701,8 +702,17 @@ mod tests {
     fn parse_single_template(source: &str) -> TemplateStringInfo {
         let mut parser = TemplateStringParser::new().unwrap();
         let templates = parser.find_template_strings(source).unwrap();
-        assert_eq!(templates.len(), 1);
-        templates.into_iter().next().unwrap()
+        assert!(!templates.is_empty());
+        templates
+            .into_iter()
+            .min_by_key(|template| {
+                (
+                    template.location.start_line,
+                    template.location.start_column,
+                    usize::MAX - template.raw_content.len(),
+                )
+            })
+            .unwrap()
     }
 
     fn placeholder_ranges(template: &TemplateStringInfo) -> Vec<(usize, usize)> {
@@ -1638,12 +1648,12 @@ project_name = "demo-project"
 payload = {"nested": {"enabled": True}}
 
 config: Annotated[Template, "json"] = t"""
-{
-  "meta": {
+{{
+  "meta": {{
     "pattern": "{{}}"
-  },
+  }},
   "payload": {payload["nested"]}
-}
+}}
 """
 "#,
         );

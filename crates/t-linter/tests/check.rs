@@ -2750,3 +2750,22 @@ template: Annotated[Template, "yaml"] = t"name: {value}"
 
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn check_reports_invalid_explicit_non_python_files() {
+    let dir = test_dir("invalid-explicit-non-python");
+    write_file(&dir.join("notes.txt"), "not python\n");
+
+    let output = run_check(&dir, &["check", "notes.txt"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stdout.contains("notes.txt:1:1: error[file-read-error]"));
+    assert!(stdout.contains("Explicit file operands must use the .py extension"));
+    assert!(stdout.contains("1 files scanned"));
+    assert!(stdout.contains("0 templates scanned"));
+    assert!(stdout.contains("1 diagnostics"));
+    assert!(stdout.contains("1 failed files"));
+
+    let _ = fs::remove_dir_all(dir);
+}

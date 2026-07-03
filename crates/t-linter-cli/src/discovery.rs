@@ -121,7 +121,7 @@ impl DiscoveryCollector {
         }
 
         if !is_python_file(&resolved) {
-            if mode == DiscoveryMode::Format {
+            if matches!(mode, DiscoveryMode::Check | DiscoveryMode::Format) {
                 self.push_failure(
                     operand.to_path_buf(),
                     "Explicit file operands must use the .py extension",

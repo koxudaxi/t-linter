@@ -90,7 +90,11 @@ pub fn check(paths: Vec<String>, format: OutputFormat, error_on_issues: bool) ->
 
     for file in walk_report.python_files {
         match fs::read_to_string(&file.canonical_path) {
-            Ok(source) => file_results.push(lint_source(&file.display_path, &source)?),
+            Ok(source) => {
+                let mut result = lint_source(&file.canonical_path, &source)?;
+                rewrite_lint_result_path(&mut result, &file.display_path);
+                file_results.push(result);
+            }
             Err(_) => file_results.push(file_read_error(&file.display_path)),
         }
     }
@@ -181,7 +185,11 @@ pub fn stats(path: String) -> Result<()> {
 }
 
 fn check_failure_to_result(failure: &DiscoveryFailure) -> LintFileResult {
-    file_read_error(&failure.display_path)
+    let mut result = file_read_error(&failure.display_path);
+    if let Some(diagnostic) = result.diagnostics.first_mut() {
+        diagnostic.message = failure.message.clone();
+    }
+    result
 }
 
 fn has_read_failure(result: &LintFileResult) -> bool {
@@ -189,6 +197,13 @@ fn has_read_failure(result: &LintFileResult) -> bool {
         .diagnostics
         .iter()
         .any(|diagnostic| diagnostic.rule == "file-read-error")
+}
+
+fn rewrite_lint_result_path(result: &mut LintFileResult, display_path: &Path) {
+    result.file = display_path.to_path_buf();
+    for diagnostic in &mut result.diagnostics {
+        diagnostic.file = display_path.to_path_buf();
+    }
 }
 
 fn format_stdin(

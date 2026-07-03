@@ -11,7 +11,7 @@ use tstring_thtml as backend_thtml;
 
 use crate::backend::TemplateBackend;
 use crate::parser::{CallableParameter, CallableSignature, CallableValueType, ModuleContext};
-use crate::{TemplateStringInfo, TemplateStringParser};
+use crate::{TemplatePart, TemplateStringInfo, TemplateStringParser};
 
 const RULE_EMBEDDED_PARSE_ERROR: &str = "embedded-parse-error";
 const RULE_FILE_READ_ERROR: &str = "file-read-error";
@@ -382,34 +382,40 @@ fn prepare_template_for_lint(template: &TemplateStringInfo, language: &str) -> P
     let placeholder = placeholder_for_language(language);
     let mut content = String::new();
     let mut processed_to_original = vec![0];
-    let mut last_end = 0;
-    let mut search_start = 0;
+    let mut original_offset = 0;
 
-    while let Some(pos) = template.content[search_start..].find("{}") {
-        let absolute_pos = search_start + pos;
-        append_original_segment(
-            &mut content,
-            &mut processed_to_original,
-            &template.content[last_end..absolute_pos],
-            last_end,
-        );
-        append_placeholder_segment(
-            &mut content,
-            &mut processed_to_original,
-            placeholder,
-            absolute_pos,
-            absolute_pos + 2,
-        );
-        last_end = absolute_pos + 2;
-        search_start = absolute_pos + 2;
+    for part in &template.parts {
+        match part {
+            TemplatePart::Static(part) => {
+                append_original_segment(
+                    &mut content,
+                    &mut processed_to_original,
+                    &part.text,
+                    original_offset,
+                );
+                original_offset += part.text.len();
+            }
+            TemplatePart::Interpolation(part) => {
+                if let Some(debug_prefix) = &part.debug_prefix {
+                    append_original_segment(
+                        &mut content,
+                        &mut processed_to_original,
+                        debug_prefix,
+                        original_offset,
+                    );
+                    original_offset += debug_prefix.len();
+                }
+                append_placeholder_segment(
+                    &mut content,
+                    &mut processed_to_original,
+                    placeholder,
+                    original_offset,
+                    original_offset + 2,
+                );
+                original_offset += 2;
+            }
+        }
     }
-
-    append_original_segment(
-        &mut content,
-        &mut processed_to_original,
-        &template.content[last_end..],
-        last_end,
-    );
 
     ProcessedTemplate {
         content,
@@ -455,80 +461,7 @@ fn map_content_range_to_document(
     start_offset: usize,
     end_offset: usize,
 ) -> ((usize, usize), (usize, usize)) {
-    let prefix_len = template.string_start.len();
-    let suffix_len = template.string_end.len();
-    let actual_content = &template.raw_content[prefix_len..template.raw_content.len() - suffix_len];
-    let template_start_line = template.location.start_line - 1;
-    let template_start_col = template.location.start_column - 1;
-
-    let (start_line, start_col) = map_template_position_to_document(
-        &template.content,
-        actual_content,
-        start_offset,
-        template_start_line,
-        template_start_col,
-        prefix_len,
-    );
-    let (end_line, end_col) = map_template_position_to_document(
-        &template.content,
-        actual_content,
-        end_offset,
-        template_start_line,
-        template_start_col,
-        prefix_len,
-    );
-
-    ((start_line + 1, start_col + 1), (end_line + 1, end_col + 1))
-}
-
-fn map_template_position_to_document(
-    template_content: &str,
-    actual_content: &str,
-    position_in_template: usize,
-    template_start_line: usize,
-    template_start_col: usize,
-    prefix_len: usize,
-) -> (usize, usize) {
-    let mut template_idx = 0;
-    let mut actual_idx = 0;
-    let template_bytes = template_content.as_bytes();
-    let actual_bytes = actual_content.as_bytes();
-
-    while template_idx < position_in_template && actual_idx < actual_bytes.len() {
-        if template_idx + 1 < template_bytes.len()
-            && template_bytes[template_idx] == b'{'
-            && template_bytes[template_idx + 1] == b'}'
-        {
-            if actual_idx < actual_bytes.len() && actual_bytes[actual_idx] == b'{' {
-                let mut expr_end = actual_idx + 1;
-                while expr_end < actual_bytes.len() && actual_bytes[expr_end] != b'}' {
-                    expr_end += 1;
-                }
-                if expr_end < actual_bytes.len() {
-                    expr_end += 1;
-                }
-                actual_idx = expr_end;
-            }
-            template_idx += 2;
-        } else {
-            template_idx += 1;
-            actual_idx += 1;
-        }
-    }
-
-    let mut line = template_start_line;
-    let mut col = template_start_col + prefix_len;
-
-    for byte in actual_bytes.iter().take(actual_idx) {
-        if *byte == b'\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-
-    (line, col)
+    template.map_content_range_to_document(start_offset, end_offset)
 }
 
 fn next_char_boundary(content: &str, start_offset: usize) -> usize {
@@ -1699,25 +1632,20 @@ fn location_to_byte_offset(source: &str, line: usize, column: usize) -> Option<u
         return None;
     }
 
-    let mut current_line = 1usize;
-    let mut current_column = 1usize;
-    for (offset, ch) in source.char_indices() {
-        if current_line == line && current_column == column {
-            return Some(offset);
-        }
-        if ch == '\n' {
-            current_line += 1;
-            current_column = 1;
-        } else {
-            current_column += 1;
+    let mut line_start = 0usize;
+    for current_line in 1..line {
+        let next_newline = source[line_start..].find('\n')?;
+        line_start += next_newline + 1;
+        if current_line + 1 == line {
+            break;
         }
     }
 
-    if current_line == line && current_column == column {
-        Some(source.len())
-    } else {
-        None
+    let offset = line_start.checked_add(column - 1)?;
+    if offset > source.len() {
+        return None;
     }
+    Some(offset)
 }
 
 fn sort_and_dedup_diagnostics(diagnostics: &mut Vec<LintDiagnostic>) {
@@ -1808,6 +1736,23 @@ value: Annotated[Template, "{language}"] = t"""{python_template}"""
                 result.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn literal_brace_pairs_are_not_treated_as_interpolation_placeholders() {
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+value: Annotated[Template, "json"] = t'{{"literal": "{{}}", "value": {value}}}'
+"#;
+
+        let result = lint_source(Path::new("sample.py"), source).unwrap();
+
+        assert!(
+            result.diagnostics.is_empty(),
+            "expected no diagnostics, got {:?}",
+            result.diagnostics
+        );
     }
 
     #[test]

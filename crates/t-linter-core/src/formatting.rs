@@ -213,7 +213,10 @@ fn format_template_edit(
         formatted
             .map(|content| TemplateEdit {
                 location: template.formatting_location(&content).clone(),
-                replacement: template.formatted_literal(&content),
+                replacement: {
+                    let replacement = template.formatted_literal(&content);
+                    replacement
+                },
             })
             .map_err(|error| FormatError::from_backend_error(template, &language, error).into()),
     )
@@ -235,7 +238,7 @@ fn ranges_overlap(left: &Location, right: &Location) -> bool {
     let right_start = (right.start_line, right.start_column);
     let right_end = (right.end_line, right.end_column);
 
-    left_start <= right_end && right_start <= left_end
+    left_start < right_end && right_start < left_end
 }
 
 fn line_start_offsets(source: &[u8]) -> Vec<usize> {
@@ -332,6 +335,29 @@ config: Annotated[Template, "json"] = t'{"name": {name}}'
 
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].replacement, "t'{\"name\": {name}}'");
+    }
+
+    #[test]
+    fn range_formatting_uses_half_open_boundaries() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+config: Annotated[Template, "json"] = t'{"name": {name}}'
+"#;
+
+        let edits = format_document_range(
+            source,
+            &Location {
+                start_line: 5,
+                start_column: 58,
+                end_line: 5,
+                end_column: 60,
+            },
+        )
+        .expect("expected range format success");
+
+        assert!(edits.is_empty());
     }
 
     #[test]

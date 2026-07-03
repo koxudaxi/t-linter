@@ -35,19 +35,28 @@ const TY_INVALID_ASSIGNMENT_RULE: &str = "invalid-assignment";
 pub struct TLinterLanguageServer {
     client: Client,
     document_cache: Arc<DashMap<Url, DocumentState>>,
-    diagnostic_tasks: Arc<DashMap<Url, tokio::task::JoinHandle<()>>>,
+    diagnostic_tasks: Arc<DashMap<Url, DiagnosticTask>>,
+    ruff_document_locks: Arc<DashMap<Url, Arc<tokio::sync::Mutex<()>>>>,
     parser: Arc<tokio::sync::Mutex<TemplateStringParser>>,
     highlighter: Arc<tokio::sync::Mutex<TemplateHighlighter>>,
     config: Arc<tokio::sync::RwLock<TLinterConfig>>,
     ruff: Arc<tokio::sync::RwLock<Option<Arc<RuffPipelineClient>>>>,
     type_checker: Arc<tokio::sync::Mutex<TypeCheckerState>>,
     client_support: Arc<tokio::sync::RwLock<ClientSupport>>,
+    workspace_roots: Arc<tokio::sync::RwLock<Vec<PathBuf>>>,
+    initialize_params: Arc<tokio::sync::RwLock<Option<serde_json::Value>>>,
 }
 
 #[derive(Debug, Clone)]
 struct DocumentState {
     text: String,
     version: i32,
+}
+
+#[derive(Debug)]
+struct DiagnosticTask {
+    generation: u64,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -91,6 +100,7 @@ impl TLinterLanguageServer {
             client,
             document_cache: Arc::new(DashMap::new()),
             diagnostic_tasks: Arc::new(DashMap::new()),
+            ruff_document_locks: Arc::new(DashMap::new()),
             parser: Arc::new(tokio::sync::Mutex::new(TemplateStringParser::new()?)),
             highlighter: Arc::new(tokio::sync::Mutex::new(TemplateHighlighter::new()?)),
             config: Arc::new(tokio::sync::RwLock::new(config)),
@@ -100,6 +110,8 @@ impl TLinterLanguageServer {
                 Vec::new(),
             ))),
             client_support: Arc::new(tokio::sync::RwLock::new(ClientSupport::default())),
+            workspace_roots: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            initialize_params: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
 
@@ -116,7 +128,7 @@ impl TLinterLanguageServer {
         let end_col = (template.location.end_column - 1) as u32;
 
         if start_line == end_line {
-            let length = end_col - start_col;
+            let length = end_col.saturating_sub(start_col);
             tokens.push((
                 start_line,
                 start_col,
@@ -128,7 +140,7 @@ impl TLinterLanguageServer {
             let lines: Vec<&str> = text.lines().collect();
 
             if let Some(first_line) = lines.get(start_line as usize) {
-                let first_line_len = first_line.len() as u32 - start_col;
+                let first_line_len = (first_line.len() as u32).saturating_sub(start_col);
                 tokens.push((
                     start_line,
                     start_col,
@@ -174,6 +186,10 @@ impl LanguageServer for TLinterLanguageServer {
             parse_initialization_config(params.initialization_options.clone(), startup_config);
         *self.config.write().await = config.clone();
         let workspace_roots = workspace_roots_from_initialize_params(&params);
+        *self.workspace_roots.write().await = workspace_roots.clone();
+        let initialize_params = serde_json::to_value(&params)
+            .map_err(|error| internal_error(anyhow::Error::new(error)))?;
+        *self.initialize_params.write().await = Some(initialize_params.clone());
         *self.type_checker.lock().await =
             TypeCheckerState::new(config.type_checking.clone(), workspace_roots.clone());
         if config.pyright_path.is_some() {
@@ -185,8 +201,6 @@ impl LanguageServer for TLinterLanguageServer {
                 .await;
         }
         if config.ruff_pipeline.enabled {
-            let initialize_params = serde_json::to_value(&params)
-                .map_err(|error| internal_error(anyhow::Error::new(error)))?;
             match RuffPipelineClient::start(
                 &config.ruff_pipeline,
                 initialize_params,
@@ -207,6 +221,7 @@ impl LanguageServer for TLinterLanguageServer {
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                position_encoding: Some(PositionEncodingKind::UTF16),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
@@ -283,7 +298,8 @@ impl LanguageServer for TLinterLanguageServer {
     }
 
     async fn shutdown(&self) -> JsonRpcResult<()> {
-        if let Some(ruff) = self.ruff.write().await.take() {
+        let ruff = self.ruff.write().await.take();
+        if let Some(ruff) = ruff {
             ruff.shutdown().await;
         }
         let type_checker = {
@@ -314,6 +330,8 @@ impl LanguageServer for TLinterLanguageServer {
             .insert(uri.clone(), DocumentState { text, version });
         let ruff = self.ruff.read().await.clone();
         if let Some(ruff) = ruff {
+            let lock = self.ruff_document_lock(&uri);
+            let _guard = lock.lock().await;
             match serde_json::to_value(&forwarded) {
                 Ok(value) => {
                     if let Err(error) = ruff.did_open(value).await {
@@ -339,54 +357,90 @@ impl LanguageServer for TLinterLanguageServer {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let uri = params.text_document.uri.clone();
+        let DidChangeTextDocumentParams {
+            text_document,
+            content_changes,
+        } = params;
+        if content_changes.is_empty() {
+            return;
+        }
 
-        if let Some(change) = params.content_changes.into_iter().next() {
-            self.document_cache.insert(
-                uri.clone(),
-                DocumentState {
-                    text: change.text.clone(),
-                    version: params.text_document.version,
-                },
-            );
-            let ruff = self.ruff.read().await.clone();
-            if let Some(ruff) = ruff {
-                let forwarded = DidChangeTextDocumentParams {
-                    text_document: params.text_document,
-                    content_changes: vec![change],
-                };
-                match serde_json::to_value(&forwarded) {
-                    Ok(value) => {
-                        if let Err(error) = ruff.did_change(value).await {
-                            self.client
-                                .log_message(
-                                    MessageType::ERROR,
-                                    format!("Failed to sync didChange to Ruff: {error}"),
-                                )
-                                .await;
-                        }
-                    }
-                    Err(error) => {
+        let uri = text_document.uri.clone();
+        let current_text = self
+            .document_cache
+            .get(&uri)
+            .map(|entry| entry.text.clone());
+        let text =
+            match apply_text_document_content_changes(current_text.as_deref(), &content_changes) {
+                Ok(text) => text,
+                Err(error) => {
+                    self.client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("Failed to apply didChange for {uri}: {error}"),
+                        )
+                        .await;
+                    return;
+                }
+            };
+        self.document_cache.insert(
+            uri.clone(),
+            DocumentState {
+                text,
+                version: text_document.version,
+            },
+        );
+        let ruff = self.ruff.read().await.clone();
+        if let Some(ruff) = ruff {
+            let lock = self.ruff_document_lock(&uri);
+            let _guard = lock.lock().await;
+            let forwarded = DidChangeTextDocumentParams {
+                text_document,
+                content_changes,
+            };
+            match serde_json::to_value(&forwarded) {
+                Ok(value) => {
+                    if let Err(error) = ruff.did_change(value).await {
                         self.client
                             .log_message(
                                 MessageType::ERROR,
-                                format!("Failed to serialize didChange for Ruff: {error}"),
+                                format!("Failed to sync didChange to Ruff: {error}"),
                             )
                             .await;
                     }
                 }
+                Err(error) => {
+                    self.client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!("Failed to serialize didChange for Ruff: {error}"),
+                        )
+                        .await;
+                }
             }
-            self.schedule_diagnostics(uri);
         }
+        self.schedule_diagnostics(uri);
     }
 
     async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
         debug!("Configuration changed: {:?}", params);
+        let Some(settings) = configuration_settings(params.settings) else {
+            return;
+        };
+        let previous = self.config.read().await.clone();
+        let next = parse_initialization_config(Some(settings), previous.clone());
+        if next == previous {
+            return;
+        }
+        *self.config.write().await = next.clone();
+        self.apply_runtime_config(previous, next).await;
     }
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.document_cache.remove(&params.text_document.uri);
         let ruff = self.ruff.read().await.clone();
         if let Some(ruff) = ruff {
+            let lock = self.ruff_document_lock(&params.text_document.uri);
+            let _guard = lock.lock().await;
             match serde_json::to_value(&params) {
                 Ok(value) => {
                     if let Err(error) = ruff.did_close(value).await {
@@ -419,8 +473,8 @@ impl LanguageServer for TLinterLanguageServer {
                 )
                 .await;
         }
-        if let Some((_, handle)) = self.diagnostic_tasks.remove(&params.text_document.uri) {
-            handle.abort();
+        if let Some((_, task)) = self.diagnostic_tasks.remove(&params.text_document.uri) {
+            task.handle.abort();
         }
         self.client
             .publish_diagnostics(params.text_document.uri, Vec::new(), None)
@@ -653,10 +707,77 @@ enum SelectionFormatEdits {
 }
 
 impl TLinterLanguageServer {
-    fn schedule_diagnostics(&self, uri: Url) {
-        if let Some((_, handle)) = self.diagnostic_tasks.remove(&uri) {
-            handle.abort();
+    fn ruff_document_lock(&self, uri: &Url) -> Arc<tokio::sync::Mutex<()>> {
+        let entry = self
+            .ruff_document_locks
+            .entry(uri.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
+        Arc::clone(entry.value())
+    }
+
+    async fn apply_runtime_config(&self, previous: TLinterConfig, next: TLinterConfig) {
+        if previous.type_checking != next.type_checking {
+            let type_checker = {
+                let mut state = self.type_checker.lock().await;
+                state.config = next.type_checking.clone();
+                state.consecutive_failures = 0;
+                state.disabled = false;
+                state.client.take()
+            };
+            if let Some(type_checker) = type_checker {
+                type_checker.shutdown().await;
+            }
         }
+
+        if previous.ruff_pipeline == next.ruff_pipeline {
+            return;
+        }
+
+        let ruff = self.ruff.write().await.take();
+        if let Some(ruff) = ruff {
+            ruff.shutdown().await;
+        }
+        if !next.ruff_pipeline.enabled {
+            return;
+        }
+
+        let Some(initialize_params) = self.initialize_params.read().await.clone() else {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    "Cannot restart Ruff pipeline before LSP initialization completes",
+                )
+                .await;
+            return;
+        };
+        let workspace_roots = self.workspace_roots.read().await.clone();
+        match RuffPipelineClient::start(&next.ruff_pipeline, initialize_params, &workspace_roots)
+            .await
+        {
+            Ok(ruff) => {
+                *self.ruff.write().await = Some(Arc::new(ruff));
+            }
+            Err(error) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!(
+                            "Failed to restart Ruff pipeline after configuration change: {error}"
+                        ),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    fn schedule_diagnostics(&self, uri: Url) {
+        let generation = match self.diagnostic_tasks.remove(&uri) {
+            Some((_, task)) => {
+                task.handle.abort();
+                task.generation.saturating_add(1)
+            }
+            None => 1,
+        };
 
         let client = self.client.clone();
         let document_cache = Arc::clone(&self.document_cache);
@@ -671,7 +792,7 @@ impl TLinterLanguageServer {
                 .get(&task_uri)
                 .map(|entry| (entry.text.clone(), entry.version))
             else {
-                diagnostic_tasks.remove(&task_uri);
+                remove_diagnostic_task_if_current(&diagnostic_tasks, &task_uri, generation);
                 return;
             };
 
@@ -682,7 +803,7 @@ impl TLinterLanguageServer {
                         format!("Unable to resolve filesystem path for {}", task_uri),
                     )
                     .await;
-                diagnostic_tasks.remove(&task_uri);
+                remove_diagnostic_task_if_current(&diagnostic_tasks, &task_uri, generation);
                 return;
             };
 
@@ -699,7 +820,7 @@ impl TLinterLanguageServer {
                             format!("Diagnostic analysis failed for {}: {}", task_uri, err),
                         )
                         .await;
-                    diagnostic_tasks.remove(&task_uri);
+                    remove_diagnostic_task_if_current(&diagnostic_tasks, &task_uri, generation);
                     return;
                 }
             };
@@ -715,10 +836,15 @@ impl TLinterLanguageServer {
                             ),
                         )
                         .await;
-                    diagnostic_tasks.remove(&task_uri);
+                    remove_diagnostic_task_if_current(&diagnostic_tasks, &task_uri, generation);
                     return;
                 }
             };
+            let current_version = document_cache.get(&task_uri).map(|entry| entry.version);
+            if current_version != Some(version) {
+                remove_diagnostic_task_if_current(&diagnostic_tasks, &task_uri, generation);
+                return;
+            }
 
             client
                 .publish_diagnostics(task_uri.clone(), diagnostics.clone(), Some(version))
@@ -786,10 +912,11 @@ impl TLinterLanguageServer {
                     }
                 }
             }
-            diagnostic_tasks.remove(&task_uri);
+            remove_diagnostic_task_if_current(&diagnostic_tasks, &task_uri, generation);
         });
 
-        self.diagnostic_tasks.insert(uri, handle);
+        self.diagnostic_tasks
+            .insert(uri, DiagnosticTask { generation, handle });
     }
 
     async fn collect_document_format_edits(
@@ -844,38 +971,58 @@ impl TLinterLanguageServer {
         version: i32,
         formatting_options: Option<&FormattingOptions>,
     ) -> Result<String> {
+        let lock = self.ruff_document_lock(uri);
+        let _guard = lock.lock().await;
         let mut shadow_text = text.to_string();
-        let mut shadow_version = version;
+        let mut shadow_version = version.saturating_add(1);
 
-        let actions = ruff
-            .source_fix_all(&ruff_code_action_params(uri, &shadow_text))
-            .await?;
-        apply_ruff_code_action_step(ruff, uri, &mut shadow_text, &mut shadow_version, &actions)
-            .await?;
+        sync_ruff_shadow_document(ruff, uri, shadow_version, &shadow_text).await?;
+        let result = async {
+            let actions = ruff
+                .source_fix_all(&ruff_code_action_params(uri, &shadow_text))
+                .await?;
+            apply_ruff_code_action_step(ruff, uri, &mut shadow_text, &mut shadow_version, &actions)
+                .await?;
 
-        let actions = ruff
-            .organize_imports(&ruff_code_action_params(uri, &shadow_text))
-            .await?;
-        apply_ruff_code_action_step(ruff, uri, &mut shadow_text, &mut shadow_version, &actions)
-            .await?;
+            let actions = ruff
+                .organize_imports(&ruff_code_action_params(uri, &shadow_text))
+                .await?;
+            apply_ruff_code_action_step(ruff, uri, &mut shadow_text, &mut shadow_version, &actions)
+                .await?;
 
-        let ruff_document_format_edits = ruff
-            .format(&DocumentFormattingParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                options: formatting_options
-                    .cloned()
-                    .unwrap_or_else(default_formatting_options),
-                work_done_progress_params: Default::default(),
-            })
-            .await?;
-        let next_text = apply_lsp_text_edits(&shadow_text, &ruff_document_format_edits)?;
-        if next_text != shadow_text {
-            shadow_text = next_text;
-            shadow_version = shadow_version.saturating_add(1);
-            sync_ruff_shadow_document(ruff, uri, shadow_version, &shadow_text).await?;
+            let ruff_document_format_edits = ruff
+                .format(&DocumentFormattingParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    options: formatting_options
+                        .cloned()
+                        .unwrap_or_else(default_formatting_options),
+                    work_done_progress_params: Default::default(),
+                })
+                .await?;
+            let next_text = apply_lsp_text_edits(&shadow_text, &ruff_document_format_edits)?;
+            if next_text != shadow_text {
+                shadow_text = next_text;
+                shadow_version = shadow_version.saturating_add(1);
+                sync_ruff_shadow_document(ruff, uri, shadow_version, &shadow_text).await?;
+            }
+
+            Ok(shadow_text)
         }
+        .await;
 
-        Ok(shadow_text)
+        let restore_version = shadow_version.saturating_add(1);
+        let restore_result = sync_ruff_shadow_document(ruff, uri, restore_version, text).await;
+        match (result, restore_result) {
+            (Ok(shadow_text), Ok(())) => Ok(shadow_text),
+            (Ok(_), Err(restore_error)) => {
+                Err(restore_error
+                    .context("Failed to restore Ruff document after formatting pipeline"))
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(restore_error)) => Err(error.context(format!(
+                "Ruff formatting pipeline failed and document restore also failed: {restore_error}"
+            ))),
+        }
     }
 
     async fn collect_single_template_selection_format_edits(
@@ -1149,7 +1296,8 @@ impl TLinterLanguageServer {
             );
         }
 
-        let data = self.convert_to_semantic_tokens(all_tokens);
+        let lsp_tokens = byte_tokens_to_lsp_tokens(&text, all_tokens)?;
+        let data = self.convert_to_semantic_tokens(lsp_tokens);
 
         info!("Generated {} semantic token values", data.len());
 
@@ -1167,9 +1315,9 @@ impl TLinterLanguageServer {
         let mut prev_start = 0;
 
         for (line, start, length, token_type, modifiers) in tokens {
-            let delta_line = line - prev_line;
+            let delta_line = line.saturating_sub(prev_line);
             let delta_start = if delta_line == 0 {
-                start - prev_start
+                start.saturating_sub(prev_start)
             } else {
                 start
             };
@@ -1227,6 +1375,14 @@ fn json_value_to_usize(value: &FormattingProperty) -> Option<usize> {
         FormattingProperty::String(value) => value.parse::<usize>().ok(),
         FormattingProperty::Bool(_) => None,
     }
+}
+
+fn remove_diagnostic_task_if_current(
+    diagnostic_tasks: &DashMap<Url, DiagnosticTask>,
+    uri: &Url,
+    generation: u64,
+) {
+    diagnostic_tasks.remove_if(uri, |_, task| task.generation == generation);
 }
 
 fn lint_diagnostic_to_lsp(diagnostic: &LintDiagnostic, source: &str) -> Result<Diagnostic> {
@@ -1342,13 +1498,16 @@ fn remap_interpolation_type_diagnostics(
     let mut candidates = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic_rule_code(diagnostic) == Some(TY_INVALID_ASSIGNMENT_RULE))
-        .map(|diagnostic| {
-            Ok((
-                diagnostic_range_to_byte_range(&shadow.text, &diagnostic.range, encoding)?,
-                diagnostic,
-            ))
+        .filter_map(|diagnostic| {
+            match diagnostic_range_to_byte_range(&shadow.text, &diagnostic.range, encoding) {
+                Ok(range) => Some((range, diagnostic)),
+                Err(error) => {
+                    debug!("Skipping ty diagnostic with invalid range: {error}");
+                    None
+                }
+            }
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
     candidates.sort_by_key(|(range, _)| range.start);
 
     let mut remapped = Vec::new();
@@ -1451,6 +1610,61 @@ fn utf8_position_to_byte_offset(
 
 fn ranges_intersect(left: &std::ops::Range<usize>, right: &std::ops::Range<usize>) -> bool {
     left.start < right.end && right.start < left.end
+}
+
+fn byte_tokens_to_lsp_tokens(
+    source: &str,
+    tokens: Vec<(u32, u32, u32, u32, u32)>,
+) -> Result<Vec<(u32, u32, u32, u32, u32)>> {
+    let line_starts = line_start_offsets(source);
+    let mut converted = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let Some(token) = byte_token_to_lsp_token(source, &line_starts, token)? else {
+            continue;
+        };
+        converted.push(token);
+    }
+    Ok(converted)
+}
+
+fn byte_token_to_lsp_token(
+    source: &str,
+    line_starts: &[usize],
+    token: (u32, u32, u32, u32, u32),
+) -> Result<Option<(u32, u32, u32, u32, u32)>> {
+    let (line, start_col, length, token_type, modifiers) = token;
+    let line_index = line as usize;
+    let line_start = *line_starts
+        .get(line_index)
+        .ok_or_else(|| anyhow::anyhow!("Semantic token line {line} is out of bounds"))?;
+    let line_end = line_starts
+        .get(line_index + 1)
+        .map(|next| next.saturating_sub(1))
+        .unwrap_or(source.len());
+    let start = line_start
+        .checked_add(start_col as usize)
+        .ok_or_else(|| anyhow::anyhow!("Semantic token start offset overflowed"))?;
+    let end = start
+        .checked_add(length as usize)
+        .ok_or_else(|| anyhow::anyhow!("Semantic token end offset overflowed"))?;
+    if start > line_end || end > line_end {
+        return Err(anyhow::anyhow!(
+            "Semantic token byte range {start_col}..{} is out of bounds",
+            start_col.saturating_add(length)
+        ));
+    }
+
+    let start = byte_offset_to_lsp_position(source, line_starts, start)?;
+    let end = byte_offset_to_lsp_position(source, line_starts, end)?;
+    if start.line != end.line {
+        return Err(anyhow::anyhow!("Semantic token spans multiple lines"));
+    }
+    let length = end.character.saturating_sub(start.character);
+    if length == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some((line, start.character, length, token_type, modifiers)))
 }
 
 fn default_formatting_options() -> FormattingOptions {
@@ -1830,7 +2044,7 @@ struct TLinterInitializationOptions {
     type_checking: Option<TypeCheckerConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TLinterConfig {
     pub enable_type_checking: bool,
     pub pyright_path: Option<String>,
@@ -1873,6 +2087,71 @@ fn parse_initialization_config(
         ruff_pipeline: options.ruff_pipeline.unwrap_or(defaults.ruff_pipeline),
         type_checking: options.type_checking.unwrap_or(defaults.type_checking),
     }
+}
+
+fn configuration_settings(settings: serde_json::Value) -> Option<serde_json::Value> {
+    if settings.is_null() {
+        return None;
+    }
+    match settings {
+        serde_json::Value::Object(mut object) => {
+            if let Some(settings) = object.remove("t-linter") {
+                return Some(settings);
+            }
+            if let Some(settings) = object.remove("tLinter") {
+                return Some(settings);
+            }
+            Some(serde_json::Value::Object(object))
+        }
+        settings => Some(settings),
+    }
+}
+
+fn apply_text_document_content_changes(
+    current_text: Option<&str>,
+    content_changes: &[TextDocumentContentChangeEvent],
+) -> Result<String> {
+    let mut text = String::new();
+    let mut initialized = false;
+    for change in content_changes {
+        let Some(range) = change.range else {
+            text.clear();
+            text.push_str(&change.text);
+            initialized = true;
+            continue;
+        };
+        if !initialized {
+            let Some(current_text) = current_text else {
+                return Err(anyhow::anyhow!(
+                    "Received ranged didChange for a document that is not open"
+                ));
+            };
+            text.push_str(current_text);
+            initialized = true;
+        }
+        text = apply_lsp_content_change(&text, range, &change.text)?;
+    }
+    if initialized {
+        Ok(text)
+    } else {
+        Ok(current_text.unwrap_or_default().to_string())
+    }
+}
+
+fn apply_lsp_content_change(source: &str, range: Range, new_text: &str) -> Result<String> {
+    let line_starts = line_start_offsets(source);
+    let start = lsp_position_to_byte_offset(source, &line_starts, range.start)?;
+    let end = lsp_position_to_byte_offset(source, &line_starts, range.end)?;
+    if start > end {
+        return Err(anyhow::anyhow!(
+            "Content change start offset is after end offset"
+        ));
+    }
+    let mut output = String::with_capacity(source.len() - (end - start) + new_text.len());
+    output.push_str(&source[..start]);
+    output.push_str(new_text);
+    output.push_str(&source[end..]);
+    Ok(output)
 }
 
 fn apply_lsp_text_edits(source: &str, edits: &[TextEdit]) -> Result<String> {
@@ -2356,11 +2635,28 @@ payload: Annotated[Template, "json"] = t'{{"name": {名前}, "age": {age}}}'
             message: "unresolved".to_string(),
             ..Default::default()
         };
+        let invalid_range = Diagnostic {
+            range: Range {
+                start: Position {
+                    line: 999,
+                    character: 0,
+                },
+                end: Position {
+                    line: 999,
+                    character: 1,
+                },
+            },
+            code: Some(NumberOrString::String(
+                TY_INVALID_ASSIGNMENT_RULE.to_string(),
+            )),
+            message: "bad range".to_string(),
+            ..Default::default()
+        };
 
         let remapped = remap_interpolation_type_diagnostics(
             &shadow,
             source,
-            &[ignored, matching],
+            &[ignored, invalid_range, matching],
             NegotiatedEncoding::Utf8,
         )
         .expect("remap");
@@ -2726,11 +3022,73 @@ payload: Annotated[Template, "json"] = t'{{"name": {名前}, "age": {age}}}'
                 .contains("data-a=\"x\"")
         );
 
+        let changed_once = source.replace("12345", "x");
+        let line_starts = line_start_offsets(&changed_once);
+        let first_start = changed_once.find("x\"").expect("first marker");
+        let second_start = changed_once.find("67890").expect("second marker");
         server
-            .did_change_configuration(DidChangeConfigurationParams {
-                settings: serde_json::json!({"demo": true}),
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 3,
+                },
+                content_changes: vec![
+                    TextDocumentContentChangeEvent {
+                        range: Some(Range {
+                            start: byte_offset_to_lsp_position(
+                                &changed_once,
+                                &line_starts,
+                                first_start,
+                            )
+                            .expect("first start"),
+                            end: byte_offset_to_lsp_position(
+                                &changed_once,
+                                &line_starts,
+                                first_start + 1,
+                            )
+                            .expect("first end"),
+                        }),
+                        range_length: None,
+                        text: "y".to_string(),
+                    },
+                    TextDocumentContentChangeEvent {
+                        range: Some(Range {
+                            start: byte_offset_to_lsp_position(
+                                &changed_once,
+                                &line_starts,
+                                second_start,
+                            )
+                            .expect("second start"),
+                            end: byte_offset_to_lsp_position(
+                                &changed_once,
+                                &line_starts,
+                                second_start + 5,
+                            )
+                            .expect("second end"),
+                        }),
+                        range_length: None,
+                        text: "42".to_string(),
+                    },
+                ],
             })
             .await;
+        {
+            let changed_twice = server.document_cache.get(&uri).expect("cached twice");
+            assert!(changed_twice.text.contains("data-a=\"y\""));
+            assert!(changed_twice.text.contains("data-b=\"42\""));
+        }
+
+        server
+            .did_change_configuration(DidChangeConfigurationParams {
+                settings: serde_json::json!({
+                    "t-linter": {
+                        "highlightUntyped": false
+                    }
+                }),
+            })
+            .await;
+        let config = server.config.read().await.clone();
+        assert!(!config.highlight_untyped_templates);
 
         let missing = Url::parse("file:///tmp/missing.py").expect("uri");
         let err = server
@@ -2904,7 +3262,7 @@ from string.templatelib import Template
 typed_html: Annotated[Template, "html"] = t"<div class='card'>{value}</div>"
 unsupported: Annotated[Template, "unknown"] = t"""<odd>{{ brace }}</odd>
 <span>{value}</span>"""
-plain = t"hello {name}"
+plain = "世界🙂"; plain_tpl = t"こんにちは {name}"
 "#;
         let uri = write_source_file(temp.path(), "tokens.py", source);
         let (service, _) = LspService::new(|client| {
@@ -2941,16 +3299,36 @@ plain = t"hello {name}"
             .position(|line| line.starts_with("plain ="))
             .expect("plain line") as u32;
 
-        assert!(absolute_tokens.iter().any(|(line, _, token_type)| {
+        assert!(absolute_tokens.iter().any(|(line, _, _, token_type)| {
             *line == typed_html_line && *token_type != TOKEN_TYPE_MACRO
         }));
-        assert!(absolute_tokens.iter().any(|(line, _, token_type)| {
+        assert!(absolute_tokens.iter().any(|(line, _, _, token_type)| {
             *line == unsupported_line && *token_type == TOKEN_TYPE_MACRO
         }));
+        let line_starts = line_start_offsets(source);
+        let plain_line_start = line_starts[plain_line as usize];
+        let plain_text = source
+            .lines()
+            .nth(plain_line as usize)
+            .expect("plain line text");
+        let token_start = plain_line_start + plain_text.find("t\"").expect("template start");
+        let token_end = plain_line_start + plain_text.rfind('"').expect("template end") + 1;
+        let expected_start = byte_offset_to_lsp_position(source, &line_starts, token_start)
+            .expect("template start position");
+        let expected_end = byte_offset_to_lsp_position(source, &line_starts, token_end)
+            .expect("template end position");
         assert!(
             absolute_tokens
                 .iter()
-                .any(|(line, _, _)| *line == plain_line)
+                .any(|(line, start, length, token_type)| {
+                    *line == plain_line
+                        && *start == expected_start.character
+                        && *length
+                            == expected_end
+                                .character
+                                .saturating_sub(expected_start.character)
+                        && *token_type == TOKEN_TYPE_MACRO
+                })
         );
     }
 
@@ -2972,6 +3350,32 @@ plain = t"hello {name}"
         assert_eq!(converted[1].delta_start, 5);
         assert_eq!(converted[2].delta_line, 2);
         assert_eq!(converted[2].delta_start, 2);
+
+        let source = "名前 = t\"界\"\n";
+        let line_starts = line_start_offsets(source);
+        let start = source.find("t\"").expect("token start");
+        let end = source.rfind('"').expect("token end") + 1;
+        let utf16_start = byte_offset_to_lsp_position(source, &line_starts, start)
+            .expect("utf16 start")
+            .character;
+        let utf16_end = byte_offset_to_lsp_position(source, &line_starts, end)
+            .expect("utf16 end")
+            .character;
+        let lsp_tokens = byte_tokens_to_lsp_tokens(
+            source,
+            vec![(0, start as u32, (end - start) as u32, TOKEN_TYPE_MACRO, 0)],
+        )
+        .expect("byte token conversion");
+        assert_eq!(
+            lsp_tokens,
+            vec![(
+                0,
+                utf16_start,
+                utf16_end.saturating_sub(utf16_start),
+                TOKEN_TYPE_MACRO,
+                0
+            )]
+        );
 
         assert!(requested_code_action_kinds_include(
             None,
@@ -3471,7 +3875,7 @@ query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
         .expect("diagnostic task timed out");
     }
 
-    fn semantic_token_positions(tokens: &[SemanticToken]) -> Vec<(u32, u32, u32)> {
+    fn semantic_token_positions(tokens: &[SemanticToken]) -> Vec<(u32, u32, u32, u32)> {
         let mut line = 0;
         let mut start = 0;
         let mut absolute = Vec::with_capacity(tokens.len());
@@ -3483,7 +3887,7 @@ query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
             } else {
                 start = token.delta_start;
             }
-            absolute.push((line, start, token.token_type));
+            absolute.push((line, start, token.length, token.token_type));
         }
 
         absolute

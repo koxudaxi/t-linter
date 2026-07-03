@@ -9,7 +9,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -78,6 +78,7 @@ struct RuffPipelineClientInner {
     stdin: Mutex<ChildStdin>,
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>,
+    dead: AtomicBool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,6 +87,48 @@ struct RpcError {
     message: String,
     #[allow(dead_code)]
     data: Option<Value>,
+}
+
+impl RuffPipelineClientInner {
+    async fn fail_pending(&self, message: impl Into<String>) {
+        self.dead.store(true, Ordering::SeqCst);
+        let message = message.into();
+        let pending = std::mem::take(&mut *self.pending.lock().await);
+        for sender in pending.into_values() {
+            let _ = sender.send(Err(RpcError {
+                code: -32000,
+                message: message.clone(),
+                data: None,
+            }));
+        }
+    }
+
+    async fn respond_method_not_found(&self, message: &Value) {
+        let Some(id) = server_request_id(message) else {
+            return;
+        };
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32601,
+                "message": format!("Method not found: {method}"),
+            }
+        });
+        let result = {
+            let mut stdin = self.stdin.lock().await;
+            write_message(&mut *stdin, &response).await
+        };
+        if let Err(error) = result {
+            tracing::warn!("failed to write Ruff MethodNotFound response: {error}");
+            self.fail_pending(format!("Ruff server stdin write failed: {error}"))
+                .await;
+        }
+    }
 }
 
 impl RuffPipelineClient {
@@ -136,6 +179,7 @@ impl RuffPipelineClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
+            .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("failed to spawn Ruff server: {}", launch.command))?;
 
@@ -151,19 +195,24 @@ impl RuffPipelineClient {
             stdin: Mutex::new(stdin),
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
+            dead: AtomicBool::new(false),
         });
         let reader_inner = Arc::clone(&inner);
         tokio::spawn(async move {
-            loop {
+            let exit_message = loop {
                 let message = match read_message(&mut stdout).await {
                     Ok(Some(message)) => message,
-                    Ok(None) => break,
+                    Ok(None) => break "Ruff server stdout closed".to_string(),
                     Err(error) => {
                         tracing::warn!("failed to read Ruff server message: {error}");
-                        break;
+                        break format!("Ruff server reader failed: {error}");
                     }
                 };
-                if let Some(id) = message.get("id").and_then(Value::as_u64) {
+                if message.get("method").is_some() {
+                    reader_inner.respond_method_not_found(&message).await;
+                    continue;
+                }
+                if let Some(id) = response_id(&message) {
                     let result = if let Some(error) = message.get("error") {
                         serde_json::from_value::<RpcError>(error.clone())
                             .map(Err)
@@ -181,7 +230,8 @@ impl RuffPipelineClient {
                         let _ = sender.send(result);
                     }
                 }
-            }
+            };
+            reader_inner.fail_pending(exit_message).await;
         });
 
         let client = Self {
@@ -278,19 +328,32 @@ impl RuffPipelineClient {
     }
 
     async fn terminate(&self) {
+        self.inner
+            .fail_pending("Ruff server is shutting down")
+            .await;
         let mut child = self.child.lock().await;
         match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
             Ok(Ok(_)) => {}
             _ => {
-                let _ = child.kill().await;
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
             }
         }
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        if self.inner.dead.load(Ordering::SeqCst) {
+            return Err(anyhow!("Ruff server is not running"));
+        }
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = oneshot::channel();
-        self.inner.pending.lock().await.insert(id, sender);
+        {
+            let mut pending = self.inner.pending.lock().await;
+            if self.inner.dead.load(Ordering::SeqCst) {
+                return Err(anyhow!("Ruff server is not running"));
+            }
+            pending.insert(id, sender);
+        }
         let message = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -329,8 +392,19 @@ impl RuffPipelineClient {
     }
 
     async fn write(&self, message: Value) -> Result<()> {
-        let mut stdin = self.inner.stdin.lock().await;
-        write_message(&mut *stdin, &message).await?;
+        if self.inner.dead.load(Ordering::SeqCst) {
+            return Err(anyhow!("Ruff server is not running"));
+        }
+        let result = {
+            let mut stdin = self.inner.stdin.lock().await;
+            write_message(&mut *stdin, &message).await
+        };
+        if let Err(error) = result {
+            self.inner
+                .fail_pending(format!("Ruff server stdin write failed: {error}"))
+                .await;
+            return Err(error).context("failed to write Ruff server message");
+        }
         Ok(())
     }
 }
@@ -472,7 +546,7 @@ fn is_uv_project(root: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(pyproject) else {
         return false;
     };
-    content.contains("[tool.uv") || content.contains("[dependency-groups")
+    content.lines().any(is_uv_pyproject_table)
 }
 
 fn dedupe_launch_candidates(candidates: Vec<RuffLaunchConfig>) -> Vec<RuffLaunchConfig> {
@@ -491,6 +565,32 @@ fn path_string(path: PathBuf) -> String {
 
 fn set_ruff_initialization_options(params: &mut Value, settings: Value) {
     params["initializationOptions"] = json!({ "settings": settings });
+}
+
+fn response_id(message: &Value) -> Option<u64> {
+    if message.get("method").is_some() {
+        return None;
+    }
+    message.get("id").and_then(Value::as_u64)
+}
+
+fn server_request_id(message: &Value) -> Option<Value> {
+    message.get("method")?;
+    message.get("id").cloned()
+}
+
+fn is_uv_pyproject_table(line: &str) -> bool {
+    let Some(table) = toml_table_name(line) else {
+        return false;
+    };
+    table == "dependency-groups" || table == "tool.uv" || table.starts_with("tool.uv.")
+}
+
+fn toml_table_name(line: &str) -> Option<&str> {
+    let table = line.split('#').next()?.trim();
+    let table = table.strip_prefix('[')?.strip_suffix(']')?.trim();
+    let table = table.strip_prefix('[').unwrap_or(table);
+    Some(table.strip_suffix(']').unwrap_or(table).trim())
 }
 
 async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Option<Value>> {
@@ -713,6 +813,41 @@ mod tests {
                         "server",
                     ]
         }));
+    }
+
+    #[test]
+    fn resolver_does_not_treat_uvicorn_table_as_uv_project() {
+        let workspace = TempDir::new().expect("workspace");
+        std::fs::write(
+            workspace.path().join("pyproject.toml"),
+            "[project]\nname = \"demo\"\n\n[tool.uvicorn]\nreload = true\n",
+        )
+        .expect("pyproject");
+
+        let candidates =
+            ruff_launch_candidates(&RuffPipelineConfig::default(), &[workspace.path().into()]);
+
+        assert!(!candidates.iter().any(|candidate| candidate.command == "uv"));
+    }
+
+    #[test]
+    fn json_rpc_messages_with_methods_are_not_responses() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "workspace/configuration",
+            "params": {}
+        });
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": null
+        });
+
+        assert_eq!(response_id(&request), None);
+        assert_eq!(server_request_id(&request), Some(json!(1)));
+        assert_eq!(response_id(&response), Some(1));
+        assert_eq!(server_request_id(&response), None);
     }
 
     #[test]

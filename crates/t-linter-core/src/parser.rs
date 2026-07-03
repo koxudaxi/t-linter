@@ -73,6 +73,13 @@ struct CallArgument<'a> {
     value: Node<'a>,
 }
 
+#[derive(Debug, Clone)]
+struct ExtractedInterpolation {
+    debug_prefix: Option<String>,
+    info: InterpolationInfo,
+    format_expressions: Vec<Expression>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct AssignmentKey {
     scope_start: usize,
@@ -104,6 +111,7 @@ struct VariableAssignment {
 enum NameBindingKind {
     Import,
     Definition,
+    TypeAlias,
     Value,
 }
 
@@ -537,6 +545,9 @@ impl TemplateStringParser {
                 while let Some(match_) = matches.next() {
                     for capture in match_.captures {
                         let type_alias_node = capture.node;
+                        if !is_module_level_statement(type_alias_node) {
+                            continue;
+                        }
 
                         let mut cursor = type_alias_node.walk();
                         let mut name_node = None;
@@ -596,10 +607,12 @@ impl TemplateStringParser {
                 if let (Some(name_node), Some(value_node), Some(type_node)) =
                     (alias_name, alias_value, type_annotation)
                 {
+                    if !is_module_level_statement(name_node.parent().unwrap_or(name_node)) {
+                        continue;
+                    }
                     let name = name_node.utf8_text(source.as_bytes())?;
-                    let type_text = type_node.utf8_text(source.as_bytes())?;
 
-                    if type_text.contains("TypeAlias") {
+                    if type_annotation_is_type_alias(type_node, source, module_type_data)? {
                         module_type_data.alias_exprs.insert(
                             name.to_string(),
                             parse_type_expr(value_node.utf8_text(source.as_bytes())?),
@@ -1241,44 +1254,7 @@ impl TemplateStringParser {
         name_bindings: &[NameBinding],
     ) -> Result<()> {
         let query_str = r#"
-        (expression_statement
-            (string) @string
-        )
-        
-        (assignment
-            left: (identifier) @var_name
-            type: (_) @type_annotation
-            right: (string) @string
-        )
-
-        (assignment
-            left: (identifier) @var_name
-            type: (_) @type_annotation
-            right: (parenthesized_expression
-                (string) @string)
-        )
-        
-        (assignment
-            left: (identifier) @var_name
-            right: (string) @string
-        )
-
-        (assignment
-            left: (identifier) @var_name
-            right: (parenthesized_expression
-                (string) @string)
-        )
-        
-        (call
-            function: (_) @func_name
-            arguments: (argument_list
-                [
-                    (string) @string
-                    (keyword_argument
-                        value: (string) @string)
-                ]
-            )
-        )
+        (string) @string
     "#;
 
         let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_str)
@@ -1291,21 +1267,11 @@ impl TemplateStringParser {
 
         while let Some(match_) = matches.next() {
             let mut string_node = None;
-            let mut var_name = None;
-            let mut var_name_node = None;
-            let mut type_annotation = None;
-            let mut func_name = None;
 
             for capture in match_.captures {
                 let name = query.capture_names()[capture.index as usize];
                 match name {
                     "string" => string_node = Some(capture.node),
-                    "var_name" => {
-                        var_name = Some(capture.node.utf8_text(source.as_bytes())?);
-                        var_name_node = Some(capture.node);
-                    }
-                    "type_annotation" => type_annotation = Some(capture.node),
-                    "func_name" => func_name = Some(capture.node.utf8_text(source.as_bytes())?),
                     _ => {}
                 }
             }
@@ -1323,6 +1289,16 @@ impl TemplateStringParser {
                     let start_text = start_node.utf8_text(source.as_bytes())?;
 
                     if is_template_string_start(start_text) {
+                        let assignment = assignment_for_string_node(node);
+                        let var_name_node = assignment.as_ref().map(|(name_node, _)| *name_node);
+                        let var_name = var_name_node
+                            .map(|name_node| name_node.utf8_text(source.as_bytes()))
+                            .transpose()?;
+                        let type_annotation = assignment.and_then(|(_, type_node)| type_node);
+                        let func_name_node = call_function_for_string_node(node);
+                        let func_name = func_name_node
+                            .map(|node| node.utf8_text(source.as_bytes()))
+                            .transpose()?;
                         processed_nodes.insert(node_id);
                         let info = self.extract_template_info(
                             node,
@@ -1381,7 +1357,16 @@ impl TemplateStringParser {
             self.extract_content_and_interpolations(&node, source, flags.is_raw)?;
 
         let mut language = if let Some(type_node) = type_annotation {
-            self.resolve_language_from_type_node(type_node, source)?
+            if type_annotation_references_local_type_alias(
+                type_node,
+                source,
+                name_bindings,
+                scope_directives,
+            )? {
+                None
+            } else {
+                self.resolve_language_from_type_node(type_node, source)?
+            }
         } else if let Some(func) = func_name {
             self.infer_language_from_function_call(
                 func,
@@ -1490,17 +1475,20 @@ impl TemplateStringParser {
                         push_static_part(&mut content_parts, &mut parts, between, between);
                     }
 
-                    content_parts.push("{}".to_string());
-
                     if let Some(interpolation) =
                         self.extract_interpolation_expression(&child, source, interpolation_index)?
                     {
+                        if let Some(prefix) = interpolation.debug_prefix.as_deref() {
+                            content_parts.push(prefix.to_string());
+                        }
+                        content_parts.push("{}".to_string());
                         let expr = Expression {
-                            content: interpolation.expression.clone(),
-                            location: interpolation.location.clone(),
+                            content: interpolation.info.expression.clone(),
+                            location: interpolation.info.location.clone(),
                         };
                         expressions.push(expr);
-                        parts.push(TemplatePart::Interpolation(interpolation));
+                        expressions.extend(interpolation.format_expressions);
+                        parts.push(TemplatePart::Interpolation(interpolation.info));
                         interpolation_index += 1;
                     }
 
@@ -1546,23 +1534,42 @@ impl TemplateStringParser {
         interpolation_node: &Node,
         source: &str,
         interpolation_index: usize,
-    ) -> Result<Option<InterpolationInfo>> {
+    ) -> Result<Option<ExtractedInterpolation>> {
         let mut cursor = interpolation_node.walk();
         let mut expression = None;
         let mut location = None;
         let mut conversion = None;
         let mut format_spec = String::new();
+        let mut format_expressions = Vec::new();
+        let mut open_end = interpolation_node.start_byte();
+        let mut equals_start = None;
+        let mut debug_end = None;
 
         for child in interpolation_node.children(&mut cursor) {
             match child.kind() {
-                "{" | "}" | "=" => {}
+                "{" => open_end = child.end_byte(),
+                "}" => {
+                    if equals_start.is_some() && debug_end.is_none() {
+                        debug_end = Some(child.start_byte());
+                    }
+                }
+                "=" => {
+                    equals_start = Some(child.start_byte());
+                }
                 "type_conversion" => {
+                    if equals_start.is_some() && debug_end.is_none() {
+                        debug_end = Some(child.start_byte());
+                    }
                     let value = child.utf8_text(source.as_bytes())?;
                     conversion = value.strip_prefix('!').map(str::to_string);
                 }
                 "format_specifier" => {
+                    if equals_start.is_some() && debug_end.is_none() {
+                        debug_end = Some(child.start_byte());
+                    }
                     let value = child.utf8_text(source.as_bytes())?;
                     format_spec = value.strip_prefix(':').unwrap_or(value).to_string();
+                    format_expressions.extend(collect_format_specifier_expressions(child, source)?);
                 }
                 _ => {
                     if expression.is_none() {
@@ -1581,17 +1588,28 @@ impl TemplateStringParser {
             }
         }
 
-        Ok(expression
-            .zip(location)
-            .map(|(expression, location)| InterpolationInfo {
-                expression,
-                conversion,
-                format_spec,
-                raw_source: source[interpolation_node.start_byte()..interpolation_node.end_byte()]
-                    .to_string(),
-                location,
-                interpolation_index,
-            }))
+        Ok(expression.zip(location).map(|(expression, location)| {
+            let debug_prefix = equals_start.map(|_| {
+                let end = debug_end.unwrap_or(interpolation_node.end_byte());
+                source[open_end..end].to_string()
+            });
+            let conversion = conversion.or_else(|| debug_prefix.as_ref().map(|_| "r".into()));
+            ExtractedInterpolation {
+                debug_prefix: debug_prefix.clone(),
+                info: InterpolationInfo {
+                    expression,
+                    debug_prefix: debug_prefix.clone(),
+                    conversion,
+                    format_spec,
+                    raw_source: source
+                        [interpolation_node.start_byte()..interpolation_node.end_byte()]
+                        .to_string(),
+                    location,
+                    interpolation_index,
+                },
+                format_expressions,
+            }
+        }))
     }
 
     fn infer_language_from_function_call(
@@ -2790,6 +2808,34 @@ fn assignment_for_string_node(node: Node) -> Option<(Node, Option<Node>)> {
     None
 }
 
+fn is_module_level_statement(node: Node) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "module" => return true,
+            "expression_statement" => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn type_annotation_is_type_alias(
+    type_node: Node,
+    source: &str,
+    module_type_data: &ModuleTypeData,
+) -> Result<bool> {
+    let TypeExpr::Name(name) = parse_type_expr(type_node.utf8_text(source.as_bytes())?) else {
+        return Ok(false);
+    };
+    let resolved =
+        expand_qualified_name(&name, &module_type_data.imports).unwrap_or_else(|| name.as_string());
+    Ok(matches!(
+        resolved.as_str(),
+        "TypeAlias" | "typing.TypeAlias" | "typing_extensions.TypeAlias"
+    ))
+}
+
 fn push_root_identifier_for_node(
     roots: &mut HashSet<String>,
     node: Node,
@@ -2863,9 +2909,6 @@ impl TemplateStringParser {
 
         if let Some(root) = self.search_root.as_deref() {
             push_search_root(&mut roots, root.to_path_buf());
-        }
-        if let Ok(current_dir) = env::current_dir() {
-            push_search_root(&mut roots, current_dir);
         }
         if let Some(paths) = env::var_os("PYTHONPATH") {
             for path in env::split_paths(&paths) {
@@ -3129,6 +3172,8 @@ fn collect_name_bindings(tree: &Tree, source: &str) -> Result<Vec<NameBinding>> 
     (class_definition
         name: (identifier) @definition_name)
 
+    (type_alias_statement) @type_alias
+
     (lambda) @lambda
     "#;
 
@@ -3146,6 +3191,7 @@ fn collect_name_bindings(tree: &Tree, source: &str) -> Result<Vec<NameBinding>> 
         let mut import_alias_node = None;
         let mut binding_target_node = None;
         let mut definition_name_node = None;
+        let mut type_alias_node = None;
         let mut lambda_node = None;
 
         for capture in match_.captures {
@@ -3161,9 +3207,23 @@ fn collect_name_bindings(tree: &Tree, source: &str) -> Result<Vec<NameBinding>> 
                 }
                 "binding_target" => binding_target_node = Some(capture.node),
                 "definition_name" => definition_name_node = Some(capture.node),
+                "type_alias" => type_alias_node = Some(capture.node),
                 "lambda" => lambda_node = Some(capture.node),
                 _ => {}
             }
+        }
+
+        if let Some(node) = type_alias_node {
+            let Some(name_node) = node.child_by_field_name("left") else {
+                continue;
+            };
+            bindings.push(NameBinding {
+                scope: enclosing_scope(name_node),
+                name: name_node.utf8_text(source.as_bytes())?.to_string(),
+                binding_start: name_node.start_byte(),
+                kind: NameBindingKind::TypeAlias,
+            });
+            continue;
         }
 
         if let Some(node) = binding_target_node {
@@ -3251,6 +3311,40 @@ fn collect_name_bindings(tree: &Tree, source: &str) -> Result<Vec<NameBinding>> 
 
     bindings.sort_by_key(|binding| binding.binding_start);
     Ok(bindings)
+}
+
+fn type_annotation_references_local_type_alias(
+    type_node: Node<'_>,
+    source: &str,
+    bindings: &[NameBinding],
+    scope_directives: &[ScopeDirective],
+) -> Result<bool> {
+    let mut nodes = vec![type_node];
+    while let Some(node) = nodes.pop() {
+        if matches!(node.kind(), "identifier" | "keyword_identifier" | "type") {
+            let name = node.utf8_text(source.as_bytes())?;
+            for scope in filtered_scope_chain(node, name, scope_directives) {
+                if matches!(scope.kind, ScopeKind::Module) {
+                    continue;
+                }
+                if bindings.iter().rev().any(|binding| {
+                    binding.kind == NameBindingKind::TypeAlias
+                        && binding.name == name
+                        && binding.scope.start == scope.start
+                        && binding.scope.end == scope.end
+                        && (scope_uses_function_like_binding_rules(scope.kind)
+                            || binding.binding_start < node.start_byte())
+                }) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        nodes.extend(node.children(&mut cursor));
+    }
+
+    Ok(false)
 }
 
 fn collect_parameter_name_bindings(
@@ -3363,13 +3457,19 @@ fn resolve_assignment_for_identifier(
     let use_position = identifier.start_byte();
 
     for scope in &scope_chain {
-        if let Some(assignment) = assignments.iter().rev().find(|assignment| {
+        let matches_scope = |assignment: &&VariableAssignment| {
             assignment.key.name == name
                 && assignment.key.scope_start == scope.start
                 && assignment.key.scope_end == scope.end
-                && (scope_uses_function_like_binding_rules(scope.kind)
-                    || assignment.key.assignment_start < use_position)
+        };
+        if let Some(assignment) = assignments.iter().rev().find(|assignment| {
+            matches_scope(assignment) && assignment.key.assignment_start < use_position
         }) {
+            return Ok(Some(assignment.clone()));
+        }
+        if scope_uses_function_like_binding_rules(scope.kind)
+            && let Some(assignment) = assignments.iter().rev().find(matches_scope)
+        {
             return Ok(Some(assignment.clone()));
         }
     }
@@ -3564,6 +3664,39 @@ fn push_search_root(roots: &mut Vec<PathBuf>, path: PathBuf) {
         return;
     }
     roots.push(path);
+}
+
+fn collect_format_specifier_expressions(
+    format_specifier: Node<'_>,
+    source: &str,
+) -> Result<Vec<Expression>> {
+    let mut expressions = Vec::new();
+    let mut stack = vec![format_specifier];
+
+    while let Some(node) = stack.pop() {
+        if node.kind() == "format_expression" {
+            if let Some(expression_node) = node.child_by_field_name("expression") {
+                let start = expression_node.start_position();
+                let end = expression_node.end_position();
+                expressions.push(Expression {
+                    content: expression_node.utf8_text(source.as_bytes())?.to_string(),
+                    location: Location {
+                        start_line: start.row + 1,
+                        start_column: start.column + 1,
+                        end_line: end.row + 1,
+                        end_column: end.column + 1,
+                    },
+                });
+            }
+            continue;
+        }
+
+        let mut cursor = node.walk();
+        let children = node.children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+
+    Ok(expressions)
 }
 
 fn ancestor_virtualenv_search_roots(search_root: Option<&Path>) -> Vec<PathBuf> {
@@ -3784,7 +3917,7 @@ fn module_reference_is_shadowed(
             name_bindings,
             scope_directives,
         )?,
-        Some(NameBindingKind::Definition | NameBindingKind::Value)
+        Some(NameBindingKind::Definition | NameBindingKind::TypeAlias | NameBindingKind::Value)
     ))
 }
 
@@ -3825,6 +3958,7 @@ fn direct_callable_reference_is_shadowed(
             scope_directives,
         )? {
             Some(NameBindingKind::Value) => true,
+            Some(NameBindingKind::TypeAlias) => true,
             Some(NameBindingKind::Definition) => !has_local_callable_signature,
             _ => false,
         },
@@ -4071,6 +4205,7 @@ pub struct StaticTextSegment {
 #[derive(Debug, Clone)]
 pub struct InterpolationInfo {
     pub expression: String,
+    pub debug_prefix: Option<String>,
     pub conversion: Option<String>,
     pub format_spec: String,
     pub raw_source: String,
@@ -4090,6 +4225,9 @@ impl TemplateStringInfo {
                     }
                 }
                 TemplatePart::Interpolation(part) => {
+                    if let Some(debug_prefix) = &part.debug_prefix {
+                        segments.push(TemplateSegment::StaticText(debug_prefix.clone()));
+                    }
                     segments.push(TemplateSegment::Interpolation(TemplateInterpolation {
                         expression: part.expression.clone(),
                         conversion: part.conversion.clone(),
@@ -4146,7 +4284,15 @@ impl TemplateStringInfo {
         } else {
             quote.to_string()
         };
-        let escaped_content = escape_python_literal_content(content, quote, use_triple);
+        let escaped_content = escape_formatted_template_content(
+            content,
+            quote,
+            use_triple,
+            self.parts.iter().filter_map(|part| match part {
+                TemplatePart::Interpolation(part) => Some(part.raw_source.as_str()),
+                TemplatePart::Static(_) => None,
+            }),
+        );
 
         format!("{normalized_prefix}{delimiter}{escaped_content}{delimiter}")
     }
@@ -4191,7 +4337,7 @@ impl TemplateStringInfo {
         offset
     }
 
-    fn map_content_range_to_document(
+    pub(crate) fn map_content_range_to_document(
         &self,
         start_offset: usize,
         end_offset: usize,
@@ -4632,6 +4778,15 @@ fn trailing_quote_run_len(content: &str, quote: char) -> usize {
 }
 
 fn escape_python_literal_content(content: &str, quote: char, use_triple: bool) -> String {
+    escape_python_literal_content_with_options(content, quote, use_triple, true)
+}
+
+fn escape_python_literal_content_with_options(
+    content: &str,
+    quote: char,
+    use_triple: bool,
+    escape_trailing_quotes: bool,
+) -> String {
     let mut escaped = String::new();
 
     for ch in content.chars() {
@@ -4658,7 +4813,9 @@ fn escape_python_literal_content(content: &str, quote: char, use_triple: bool) -
         } else {
             "\\\"\\\"\\\""
         };
-        let trailing_quotes = trailing_quote_run_len(content, quote);
+        let trailing_quotes = escape_trailing_quotes
+            .then(|| trailing_quote_run_len(content, quote))
+            .unwrap_or(0);
         if trailing_quotes > 0 {
             let split_at = escaped.len() - trailing_quotes;
             let mut escaped = escaped[..split_at].replace(&delimiter, escaped_delimiter);
@@ -4672,6 +4829,59 @@ fn escape_python_literal_content(content: &str, quote: char, use_triple: bool) -
     } else {
         escaped
     }
+}
+
+fn escape_formatted_template_content<'a>(
+    content: &str,
+    quote: char,
+    use_triple: bool,
+    raw_interpolations: impl Iterator<Item = &'a str>,
+) -> String {
+    let mut escaped = String::with_capacity(content.len());
+    let mut cursor = 0;
+
+    for raw_source in raw_interpolations {
+        let Some(relative_start) = content[cursor..].find(raw_source) else {
+            return escape_python_literal_content(content, quote, use_triple);
+        };
+        let start = cursor + relative_start;
+        let static_segment =
+            unescape_quote_before_raw_interpolation(&content[cursor..start], quote, use_triple);
+        escaped.push_str(&escape_python_literal_content_with_options(
+            &static_segment,
+            quote,
+            use_triple,
+            false,
+        ));
+        escaped.push_str(raw_source);
+        cursor = start + raw_source.len();
+    }
+
+    escaped.push_str(&escape_python_literal_content(
+        &content[cursor..],
+        quote,
+        use_triple,
+    ));
+    escaped
+}
+
+fn unescape_quote_before_raw_interpolation(segment: &str, quote: char, use_triple: bool) -> String {
+    if !use_triple || !segment.ends_with(quote) {
+        return segment.to_string();
+    }
+
+    let Some(quote_start) = segment.len().checked_sub(quote.len_utf8()) else {
+        return segment.to_string();
+    };
+    if quote_start == 0 || !segment[..quote_start].ends_with('\\') {
+        return segment.to_string();
+    }
+
+    let slash_start = quote_start - 1;
+    let mut normalized = String::with_capacity(segment.len() - 1);
+    normalized.push_str(&segment[..slash_start]);
+    normalized.push(quote);
+    normalized
 }
 
 #[cfg(test)]
@@ -4710,6 +4920,27 @@ mod tests {
     }
 
     #[test]
+    fn test_python_search_roots_do_not_add_process_cwd_implicitly() {
+        let dir = parser_test_dir("search-roots-no-cwd");
+        let mut parser = TemplateStringParser::new().unwrap();
+        parser.search_root = Some(dir.clone());
+        parser.runtime_python_search_roots = Some(Vec::new());
+
+        let roots = parser.python_search_roots();
+        let cwd = std::env::current_dir().unwrap();
+        let cwd_is_explicit = std::env::var_os("PYTHONPATH")
+            .map(|paths| std::env::split_paths(&paths).any(|path| path == cwd))
+            .unwrap_or(false)
+            || environment_python_search_roots()
+                .into_iter()
+                .any(|path| path == cwd);
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(roots.iter().any(|path| path == &cwd), cwd_is_explicit);
+    }
+
+    #[test]
     fn test_simple_template_string() {
         let source = r#"msg = t"Hello {name}!""#;
 
@@ -4737,6 +4968,48 @@ mod tests {
         };
         assert_eq!(interpolation.format_spec, ".2f");
         assert_eq!(interpolation.raw_source, "{price:.2f}");
+    }
+
+    #[test]
+    fn test_nested_format_spec_expressions_are_tracked() {
+        let source = r#"price_str = t"Price: {price:{width}.{precision}f}""#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(
+            templates[0]
+                .expressions
+                .iter()
+                .map(|expression| expression.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["price", "width", "precision"]
+        );
+        let TemplatePart::Interpolation(interpolation) = &templates[0].parts[1] else {
+            panic!("expected interpolation part");
+        };
+        assert_eq!(interpolation.format_spec, "{width}.{precision}f");
+    }
+
+    #[test]
+    fn test_debug_interpolation_adds_static_prefix_and_repr_conversion() {
+        let source = r#"payload = t"{value = }""#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].content, "value = {}");
+        let input = templates[0].to_template_input();
+        assert!(matches!(
+            input.segments.first(),
+            Some(TemplateSegment::StaticText(text)) if text == "value = "
+        ));
+        let interpolation = input.interpolation(0).expect("expected interpolation");
+        assert_eq!(interpolation.expression, "value");
+        assert_eq!(interpolation.conversion.as_deref(), Some("r"));
+        assert_eq!(interpolation.raw_source.as_deref(), Some("{value = }"));
     }
 
     #[test]
@@ -4876,6 +5149,7 @@ html = t"""
         let parts = vec![
             TemplatePart::Interpolation(InterpolationInfo {
                 expression: "value".to_string(),
+                debug_prefix: None,
                 conversion: None,
                 format_spec: String::new(),
                 raw_source: "{value}".to_string(),
@@ -4945,6 +5219,7 @@ html = t"""
         let interpolation_then_continuation = vec![
             TemplatePart::Interpolation(InterpolationInfo {
                 expression: "value".to_string(),
+                debug_prefix: None,
                 conversion: None,
                 format_spec: String::new(),
                 raw_source: "{value}".to_string(),
@@ -5010,6 +5285,7 @@ html = t"""
             parts: vec![
                 TemplatePart::Interpolation(InterpolationInfo {
                     expression: "a".to_string(),
+                    debug_prefix: None,
                     conversion: None,
                     format_spec: String::new(),
                     raw_source: "{a}".to_string(),
@@ -5027,6 +5303,7 @@ html = t"""
                 }),
                 TemplatePart::Interpolation(InterpolationInfo {
                     expression: "b".to_string(),
+                    debug_prefix: None,
                     conversion: None,
                     format_spec: String::new(),
                     raw_source: "{b}".to_string(),
@@ -5076,6 +5353,7 @@ html = t"""
                 }),
                 TemplatePart::Interpolation(InterpolationInfo {
                     expression: "value".to_string(),
+                    debug_prefix: None,
                     conversion: None,
                     format_spec: String::new(),
                     raw_source: "{value}".to_string(),
@@ -5208,6 +5486,36 @@ html = t"""
         let reparsed_templates = reparsed.find_template_strings(&reparsed_source).unwrap();
         assert_eq!(reparsed_templates.len(), 1);
         assert_eq!(reparsed_templates[0].content, r#""""x"""x'''"#);
+    }
+
+    #[test]
+    fn test_formatted_literal_preserves_interpolation_source_escapes() {
+        let source = r#"payload = t'<a href="{url.replace("\\", "/")}">{d['k']}</a>'"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+        let formatted =
+            templates[0].formatted_literal(r#"<a href="{url.replace("\\", "/")}">{d['k']}</a>"#);
+
+        assert_eq!(
+            formatted,
+            r#"t'<a href="{url.replace("\\", "/")}">{d['k']}</a>'"#
+        );
+        let reparsed_source = format!("payload = {formatted}");
+        let mut reparsed = TemplateStringParser::new().unwrap();
+        let reparsed_templates = reparsed.find_template_strings(&reparsed_source).unwrap();
+        assert_eq!(
+            reparsed_templates[0]
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    TemplatePart::Interpolation(interpolation) =>
+                        Some(interpolation.raw_source.as_str()),
+                    TemplatePart::Static(_) => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![r#"{url.replace("\\", "/")}"#, "{d['k']}"]
+        );
     }
 
     #[test]
@@ -5636,6 +5944,31 @@ load_config(template=config)
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].variable_name, Some("config".to_string()));
         assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_function_scope_uses_latest_prior_assignment_for_language_hints() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+def run_sql(template: Annotated[Template, "sql"]) -> None:
+    return None
+
+def f():
+    config = t"SELECT 1"
+    run_sql(config)
+    config = t"<div>plain</div>"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 2);
+        assert_eq!(templates[0].content, "SELECT 1");
+        assert_eq!(templates[0].language, Some("sql".to_string()));
+        assert_eq!(templates[1].content, "<div>plain</div>");
+        assert_eq!(templates[1].language, None);
     }
 
     #[test]
@@ -7650,6 +7983,31 @@ content: Ann[Tmpl, "html"] = t"<p>Hello</p>"
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("html".to_string()));
+    }
+
+    #[test]
+    fn test_function_local_type_aliases_do_not_clobber_module_aliases() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+type T = Annotated[Template, "sql"]
+
+def a():
+    type T = Annotated[Template, "html"]
+    local: T = t"<div>local</div>"
+
+query: T = t"SELECT 1"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 2);
+        assert_eq!(templates[0].content, "<div>local</div>");
+        assert_eq!(templates[0].language, None);
+        assert_eq!(templates[1].content, "SELECT 1");
+        assert_eq!(templates[1].language, Some("sql".to_string()));
     }
 
     #[test]
