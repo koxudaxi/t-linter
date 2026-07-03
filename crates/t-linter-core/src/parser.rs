@@ -425,17 +425,12 @@ impl TemplateStringParser {
                     }
                 }
 
-                let start_node = node
-                    .child_by_field_name("string_start")
-                    .or_else(|| node.child(0));
-                let is_raw = start_node
-                    .map(|start| {
-                        self.parse_string_flags(start.utf8_text(source.as_bytes()).unwrap_or(""))
-                            .is_raw
-                    })
-                    .unwrap_or(false);
+                let is_raw = string_start_node(node).map(|start| {
+                    self.parse_string_flags(start.utf8_text(source.as_bytes()).unwrap_or(""))
+                        .is_raw
+                })?;
                 let (content, expressions, _) =
-                    self.extract_content_and_interpolations(&node, source, is_raw)?;
+                    self.extract_content_and_interpolations(&node, source, is_raw, 0)?;
                 push_component_roots_from_template_content(&mut roots, &content);
                 for expression in expressions {
                     push_root_identifier_from_text(&mut roots, &expression.content);
@@ -1268,7 +1263,7 @@ impl TemplateStringParser {
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
 
-        let mut processed_nodes = std::collections::HashSet::new();
+        let mut processed_nodes = HashSet::new();
 
         while let Some(match_) = matches.next() {
             let mut string_node = None;
@@ -1282,49 +1277,80 @@ impl TemplateStringParser {
             }
 
             if let Some(node) = string_node {
+                let node = self
+                    .template_concatenation_root(node, source)?
+                    .unwrap_or(node);
                 let node_id = node.id();
                 if processed_nodes.contains(&node_id) {
                     continue;
                 }
 
-                if let Some(start_node) = node
-                    .child_by_field_name("string_start")
-                    .or_else(|| node.child(0))
-                {
-                    let start_text = start_node.utf8_text(source.as_bytes())?;
-
-                    if is_template_string_start(start_text) {
-                        let assignment = assignment_for_string_node(node);
-                        let var_name_node = assignment.as_ref().map(|(name_node, _)| *name_node);
-                        let var_name = var_name_node
-                            .map(|name_node| name_node.utf8_text(source.as_bytes()))
-                            .transpose()?;
-                        let type_annotation = assignment.and_then(|(_, type_node)| type_node);
-                        let func_name_node = call_function_for_string_node(node);
-                        let func_name = func_name_node
-                            .map(|node| node.utf8_text(source.as_bytes()))
-                            .transpose()?;
-                        processed_nodes.insert(node_id);
-                        let info = self.extract_template_info(
-                            node,
-                            source,
-                            var_name,
-                            var_name_node,
-                            type_annotation,
-                            func_name,
-                            context,
-                            variable_language_hints,
-                            assignments,
-                            scope_directives,
-                            name_bindings,
-                        )?;
-                        templates.push(info);
-                    }
+                if !node_is_template_or_template_concat(node, source)? {
+                    continue;
                 }
+
+                let assignment = assignment_for_string_node(node);
+                let var_name_node = assignment.as_ref().map(|(name_node, _)| *name_node);
+                let var_name = var_name_node
+                    .map(|name_node| name_node.utf8_text(source.as_bytes()))
+                    .transpose()?;
+                let type_annotation = assignment.and_then(|(_, type_node)| type_node);
+                let func_name_node = call_function_for_string_node(node);
+                let func_name = func_name_node
+                    .map(|node| node.utf8_text(source.as_bytes()))
+                    .transpose()?;
+                processed_nodes.insert(node_id);
+                let info = self.extract_template_info(
+                    node,
+                    source,
+                    var_name,
+                    var_name_node,
+                    type_annotation,
+                    func_name,
+                    context,
+                    variable_language_hints,
+                    assignments,
+                    scope_directives,
+                    name_bindings,
+                )?;
+                templates.push(info);
             }
         }
 
         Ok(())
+    }
+
+    fn template_concatenation_root<'tree>(
+        &self,
+        node: Node<'tree>,
+        source: &str,
+    ) -> Result<Option<Node<'tree>>> {
+        let mut current = node;
+        let mut root = None;
+
+        while let Some(parent) = current.parent() {
+            match parent.kind() {
+                "concatenated_string" => {
+                    root = Some(parent);
+                    current = parent;
+                }
+                "binary_operator" if is_plus_binary_operator(parent, source)? => {
+                    root = Some(parent);
+                    current = parent;
+                }
+                _ => break,
+            }
+        }
+
+        let Some(root) = root else {
+            return Ok(None);
+        };
+        let mut strings = Vec::new();
+        collect_concat_strings(root, source, &mut strings)?;
+        if strings.len() > 1 && all_template_string_nodes(&strings, source)? {
+            return Ok(Some(root));
+        }
+        Ok(None)
     }
 
     fn extract_template_info(
@@ -1341,6 +1367,22 @@ impl TemplateStringParser {
         scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
     ) -> Result<TemplateStringInfo> {
+        if node.kind() != "string" {
+            return self.extract_concatenated_template_info(
+                node,
+                source,
+                var_name,
+                var_name_node,
+                type_annotation,
+                func_name,
+                context,
+                variable_language_hints,
+                assignments,
+                scope_directives,
+                name_bindings,
+            );
+        }
+
         let start_position = node.start_position();
         let end_position = node.end_position();
 
@@ -1359,7 +1401,7 @@ impl TemplateStringParser {
         let flags = self.parse_string_flags(start_text);
 
         let (content, expressions, parts) =
-            self.extract_content_and_interpolations(&node, source, flags.is_raw)?;
+            self.extract_content_and_interpolations(&node, source, flags.is_raw, 0)?;
 
         let mut hint = if let Some(type_node) = type_annotation {
             if type_annotation_references_local_type_alias(
@@ -1433,6 +1475,132 @@ impl TemplateStringParser {
         })
     }
 
+    fn extract_concatenated_template_info(
+        &mut self,
+        node: Node,
+        source: &str,
+        var_name: Option<&str>,
+        var_name_node: Option<Node>,
+        type_annotation: Option<Node>,
+        func_name: Option<&str>,
+        context: &ModuleContext,
+        variable_language_hints: &HashMap<AssignmentKey, TemplateHint>,
+        assignments: &[VariableAssignment],
+        scope_directives: &[ScopeDirective],
+        name_bindings: &[NameBinding],
+    ) -> Result<TemplateStringInfo> {
+        let mut string_nodes = Vec::new();
+        collect_concat_strings(node, source, &mut string_nodes)?;
+        if string_nodes.is_empty() {
+            return Err(anyhow::anyhow!("No string nodes in concatenated template"));
+        }
+
+        let first_string = string_nodes[0];
+        let last_string = string_nodes[string_nodes.len() - 1];
+        let first_start = string_start_node(first_string)?;
+        let last_end = string_end_node(last_string)?;
+        let start_text = first_start.utf8_text(source.as_bytes())?;
+        let end_text = last_end.utf8_text(source.as_bytes())?;
+        let raw_content = node.utf8_text(source.as_bytes())?;
+        let flags = self.parse_string_flags(start_text);
+
+        let mut content = String::new();
+        let mut expressions = Vec::new();
+        let mut parts = Vec::new();
+        let mut interpolation_index = 0;
+        let mut previous_content_end = None;
+
+        for string_node in string_nodes {
+            let string_start = string_start_node(string_node)?;
+            let string_end = string_end_node(string_node)?;
+            if let Some(previous_content_end) = previous_content_end {
+                let gap = &source[previous_content_end..string_start.end_byte()];
+                if !gap.is_empty() {
+                    parts.push(TemplatePart::Static(StaticTextSegment {
+                        text: String::new(),
+                        raw_text: gap.to_string(),
+                    }));
+                }
+            }
+
+            let segment_flags = self.parse_string_flags(string_start.utf8_text(source.as_bytes())?);
+            let (segment_content, mut segment_expressions, mut segment_parts) = self
+                .extract_content_and_interpolations(
+                    &string_node,
+                    source,
+                    segment_flags.is_raw,
+                    interpolation_index,
+                )?;
+            interpolation_index += segment_parts
+                .iter()
+                .filter(|part| matches!(part, TemplatePart::Interpolation(_)))
+                .count();
+            content.push_str(&segment_content);
+            expressions.append(&mut segment_expressions);
+            parts.append(&mut segment_parts);
+            previous_content_end = Some(string_end.start_byte());
+        }
+
+        let mut hint = if let Some(type_node) = type_annotation {
+            if type_annotation_references_local_type_alias(
+                type_node,
+                source,
+                name_bindings,
+                scope_directives,
+            )? {
+                None
+            } else {
+                self.resolve_template_hint_from_type_node(type_node, source)?
+            }
+        } else if let Some(func) = func_name {
+            self.infer_template_hint_from_function_call(
+                func,
+                &node,
+                source,
+                context,
+                assignments,
+                scope_directives,
+                name_bindings,
+            )?
+        } else if let Some(return_type_node) = return_type_for_string_node(node) {
+            self.resolve_template_hint_from_type_node(return_type_node, source)?
+        } else {
+            None
+        };
+        if hint.is_none() {
+            if let Some(var_node) = var_name_node
+                && let Some(binding) =
+                    assignment_key_for_node_with_directives(var_node, source, scope_directives)
+            {
+                hint = variable_language_hints.get(&binding).cloned();
+            }
+        }
+
+        let start_position = node.start_position();
+        let end_position = node.end_position();
+
+        Ok(TemplateStringInfo {
+            content,
+            raw_content: raw_content.to_string(),
+            variable_name: var_name.map(String::from),
+            function_name: func_name.map(String::from),
+            language: hint.as_ref().map(|hint| hint.language.clone()),
+            profile: hint.and_then(|hint| hint.profile),
+            string_start: start_text.to_string(),
+            string_end: end_text.to_string(),
+            location: Location {
+                start_line: start_position.row + 1,
+                start_column: start_position.column + 1,
+                end_line: end_position.row + 1,
+                end_column: end_position.column + 1,
+            },
+            formatting_wrapper_location: formatting_wrapper_location(node),
+            expressions,
+            parts,
+            flags,
+        })
+    }
+
     fn parse_string_flags(&self, start_text: &str) -> TemplateStringFlags {
         let mut flags = TemplateStringFlags::default();
 
@@ -1451,13 +1619,14 @@ impl TemplateStringParser {
         string_node: &Node,
         source: &str,
         is_raw: bool,
+        interpolation_index_start: usize,
     ) -> Result<(String, Vec<Expression>, Vec<TemplatePart>)> {
         let mut content_parts = Vec::new();
         let mut expressions = Vec::new();
         let mut parts = Vec::new();
         let mut cursor = string_node.walk();
         let mut last_end_byte = 0;
-        let mut interpolation_index = 0;
+        let mut interpolation_index = interpolation_index_start;
 
         for child in string_node.children(&mut cursor) {
             match child.kind() {
@@ -2789,14 +2958,85 @@ fn scoped_import_matches_resolution_filter(
 }
 
 fn is_template_string_node(node: Node, source: &str) -> Result<bool> {
-    let Some(start_node) = node
-        .child_by_field_name("string_start")
-        .or_else(|| node.child(0))
-    else {
+    if node.kind() != "string" {
+        return Ok(false);
+    }
+    let start_text = string_start_node(node)?.utf8_text(source.as_bytes())?;
+    Ok(is_template_string_start(start_text))
+}
+
+fn node_is_template_or_template_concat(node: Node, source: &str) -> Result<bool> {
+    if node.kind() == "string" {
+        return is_template_string_node(node, source);
+    }
+    let mut strings = Vec::new();
+    collect_concat_strings(node, source, &mut strings)?;
+    Ok(strings.len() > 1 && all_template_string_nodes(&strings, source)?)
+}
+
+fn all_template_string_nodes(nodes: &[Node<'_>], source: &str) -> Result<bool> {
+    nodes
+        .iter()
+        .map(|node| is_template_string_node(*node, source))
+        .try_fold(true, |all_template, is_template| {
+            is_template.map(|is_template| all_template && is_template)
+        })
+}
+
+fn collect_concat_strings<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    strings: &mut Vec<Node<'tree>>,
+) -> Result<bool> {
+    match node.kind() {
+        "string" => {
+            strings.push(node);
+            Ok(true)
+        }
+        "concatenated_string" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if !collect_concat_strings(child, source, strings)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        "binary_operator" if is_plus_binary_operator(node, source)? => {
+            let Some(left) = node.child_by_field_name("left") else {
+                return Ok(false);
+            };
+            let Some(right) = node.child_by_field_name("right") else {
+                return Ok(false);
+            };
+            Ok(collect_concat_strings(left, source, strings)?
+                && collect_concat_strings(right, source, strings)?)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn is_plus_binary_operator(node: Node, source: &str) -> Result<bool> {
+    if node.kind() != "binary_operator" {
+        return Ok(false);
+    }
+    let Some(operator) = node.child_by_field_name("operator") else {
         return Ok(false);
     };
-    let start_text = start_node.utf8_text(source.as_bytes())?;
-    Ok(is_template_string_start(start_text))
+    Ok(operator.utf8_text(source.as_bytes())? == "+")
+}
+
+fn string_start_node(node: Node) -> Result<Node> {
+    node.child_by_field_name("string_start")
+        .or_else(|| node.child(0))
+        .ok_or_else(|| anyhow::anyhow!("No string_start node"))
+}
+
+fn string_end_node(node: Node) -> Result<Node> {
+    let last_child_index = u32::try_from(node.child_count().saturating_sub(1))?;
+    node.child_by_field_name("string_end")
+        .or_else(|| node.child(last_child_index))
+        .ok_or_else(|| anyhow::anyhow!("No string_end node"))
 }
 
 fn string_prefix(start_text: &str) -> Option<&str> {
@@ -5922,8 +6162,42 @@ explicit = t"<b>" + t"{label}</b>"
             .collect::<Vec<_>>();
 
         assert!(contents.contains(&"<li>{}</li>"));
-        assert!(contents.iter().any(|content| content.contains("<span>")));
-        assert!(contents.iter().any(|content| content.contains("<b>")));
+        assert!(contents.contains(&"<span>{}</span>"));
+        assert!(contents.contains(&"<b>{}</b>"));
+        assert_eq!(templates.len(), 3);
+
+        let explicit = templates
+            .iter()
+            .find(|template| template.content == "<b>{}</b>")
+            .expect("explicit concatenation template");
+        let input = explicit.to_template_input();
+        assert!(matches!(
+            &input.segments[..],
+            [
+                TemplateSegment::StaticText(prefix),
+                TemplateSegment::Interpolation(interpolation),
+                TemplateSegment::StaticText(suffix),
+            ] if prefix == "<b>" && interpolation.expression == "label" && suffix == "</b>"
+        ));
+
+        let suffix_location = explicit.backend_span_to_location(&SourceSpan {
+            start: SourcePosition {
+                token_index: 2,
+                offset: 0,
+            },
+            end: SourcePosition {
+                token_index: 2,
+                offset: 4,
+            },
+        });
+        let explicit_line = source
+            .lines()
+            .find(|line| line.contains("explicit"))
+            .expect("explicit line");
+        assert_eq!(
+            suffix_location.start_column,
+            explicit_line.find("</b>").expect("suffix") + 1
+        );
     }
 
     #[test]

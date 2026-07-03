@@ -9,13 +9,13 @@ Intelligent syntax highlighting and validation for Python template strings (PEP 
 - 🎨 **Smart Syntax Highlighting** - Automatic detection and highlighting of embedded languages
 - 🔍 **Type-based Detection** - Understands `Annotated[Template, "language"]` annotations
 - 💾 **Save-time Template Formatting** - Use `source.fixAll.t-linter` alongside Ruff or keep t-linter as the formatter
-- 💡 **IntelliSense Support** - Code completion within template strings
 - 🚀 **Fast & Lightweight** - Built with Rust for optimal performance
 - 🔧 **Highly Configurable** - Customize behavior to match your workflow
 
 ### Supported Languages
 - HTML
 - T-HTML (component-based HTML)
+- TDOM
 - SQL
 - JavaScript
 - CSS

@@ -1265,6 +1265,7 @@ impl TLinterLanguageServer {
 
         let mut parser = self.parser.lock().await;
         let templates = parser.find_template_strings(&text)?;
+        let highlight_untyped_templates = self.config.read().await.highlight_untyped_templates;
 
         let mut all_tokens = Vec::new();
 
@@ -1327,6 +1328,10 @@ impl TLinterLanguageServer {
                     all_tokens.extend(tokens);
                 }
             } else {
+                if !highlight_untyped_templates {
+                    info!("No language specified and untyped highlighting is disabled");
+                    continue;
+                }
                 info!("No language specified, using fallback tokens");
                 let tokens = self.generate_fallback_tokens(template, &text);
                 all_tokens.extend(tokens);
@@ -3163,6 +3168,7 @@ payload: Annotated[Template, "json"] = t'{{"name": {名前}, "age": {age}}}'
             })
             .await;
         assert!(!server.document_cache.contains_key(&uri));
+        assert!(!server.ruff_document_locks.contains_key(&uri));
         assert!(!server.diagnostic_tasks.contains_key(&uri));
 
         server.shutdown().await.expect("shutdown");
@@ -3323,7 +3329,7 @@ plain = "世界🙂"; plain_tpl = t"こんにちは {name}"
 
         let response = server
             .semantic_tokens_full(SemanticTokensParams {
-                text_document: TextDocumentIdentifier { uri },
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: PartialResultParams::default(),
             })
@@ -3369,6 +3375,45 @@ plain = "世界🙂"; plain_tpl = t"こんにちは {name}"
             .expect("template end position");
         assert!(
             absolute_tokens
+                .iter()
+                .any(|(line, start, length, token_type)| {
+                    *line == plain_line
+                        && *start == expected_start.character
+                        && *length
+                            == expected_end
+                                .character
+                                .saturating_sub(expected_start.character)
+                        && *token_type == TOKEN_TYPE_MACRO
+                })
+        );
+
+        let (service, _) = LspService::new(|client| {
+            TLinterLanguageServer::with_config(
+                client,
+                TLinterConfig {
+                    highlight_untyped_templates: false,
+                    ..TLinterConfig::default()
+                },
+            )
+            .expect("create language server")
+        });
+        let server = service.inner();
+        open_cached_document(server, &uri, source).await;
+
+        let response = server
+            .semantic_tokens_full(SemanticTokensParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            })
+            .await
+            .expect("semantic tokens response");
+        let Some(SemanticTokensResult::Tokens(tokens)) = response else {
+            panic!("expected semantic tokens");
+        };
+        let absolute_tokens = semantic_token_positions(&tokens.data);
+        assert!(
+            !absolute_tokens
                 .iter()
                 .any(|(line, start, length, token_type)| {
                     *line == plain_line

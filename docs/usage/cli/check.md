@@ -3,7 +3,7 @@
 The `check` command validates Python template strings for syntax errors in embedded languages.
 
 `check --format` controls the report output format only. To rewrite supported
-HTML, T-HTML, JSON, YAML, and TOML template literals, use [`t-linter format`](./format.md).
+HTML, T-HTML, TDOM, JSON, YAML, and TOML template literals, use [`t-linter format`](./format.md).
 
 ## Basic Usage
 
@@ -26,7 +26,7 @@ t-linter check file.py
 ```
 
 ```text
-example.py:4:46: error[embedded-parse-error] Invalid json syntax in template string (language=json)
+example.py:4:47: error[embedded-parse-error] Expected a JSON value. (language=json)
 1 files scanned, 1 templates scanned, 1 diagnostics, 0 failed files
 ```
 
@@ -47,12 +47,12 @@ t-linter check file.py --format json
           "rule": "embedded-parse-error",
           "severity": "error",
           "language": "json",
-          "message": "Invalid json syntax in template string",
+          "message": "Expected a JSON value.",
           "file": "example.py",
           "start_line": 4,
-          "start_column": 46,
+          "start_column": 47,
           "end_line": 4,
-          "end_column": 47
+          "end_column": 48
         }
       ]
     }
@@ -62,12 +62,12 @@ t-linter check file.py --format json
       "rule": "embedded-parse-error",
       "severity": "error",
       "language": "json",
-      "message": "Invalid json syntax in template string",
+      "message": "Expected a JSON value.",
       "file": "example.py",
       "start_line": 4,
-      "start_column": 46,
+      "start_column": 47,
       "end_line": 4,
-      "end_column": 47
+      "end_column": 48
     }
   ],
   "summary": {
@@ -86,7 +86,7 @@ t-linter check file.py --format github
 ```
 
 ```text
-::error file=example.py,line=4,col=46,title=t-linter(embedded-parse-error)::Invalid json syntax in template string (language=json)
+::error file=example.py,line=4,col=47,title=t-linter(embedded-parse-error)::Expected a JSON value. (language=json)
 ```
 
 ## Error on Issues
@@ -121,6 +121,6 @@ payload: Annotated[Template, "json"] = t"""[1,,2]"""
 t-linter will report the invalid JSON syntax:
 
 ```text
-example.py:4:46: error[embedded-parse-error] Invalid json syntax in template string (language=json)
+example.py:4:47: error[embedded-parse-error] Expected a JSON value. (language=json)
 1 files scanned, 1 templates scanned, 1 diagnostics, 0 failed files
 ```
