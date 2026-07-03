@@ -291,6 +291,25 @@ impl RuffPipelineClient {
         self.terminate().await;
     }
 
+    pub async fn is_running(&self) -> bool {
+        if self.inner.dead.load(Ordering::SeqCst) {
+            return false;
+        }
+        let exit_message = {
+            let mut child = self.child.lock().await;
+            match child.try_wait() {
+                Ok(Some(status)) => Some(format!("Ruff server exited with status {status}")),
+                Ok(None) => None,
+                Err(error) => Some(format!("failed to poll Ruff server status: {error}")),
+            }
+        };
+        if let Some(message) = exit_message {
+            self.inner.fail_pending(message).await;
+            return false;
+        }
+        true
+    }
+
     async fn code_actions(
         &self,
         params: &CodeActionParams,

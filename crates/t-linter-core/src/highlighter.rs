@@ -459,6 +459,11 @@ impl TemplateHighlighter {
         let prefix_len = template.string_start.len();
 
         for expr in &template.expressions {
+            if expr.location.start_line != expr.location.end_line
+                || expr.location.end_column <= expr.location.start_column
+            {
+                continue;
+            }
             tokens.push((
                 (expr.location.start_line - 1) as u32,
                 (expr.location.start_column - 1) as u32,
@@ -752,6 +757,11 @@ mod tests {
         template: &TemplateStringInfo,
     ) {
         for expr in &template.expressions {
+            if expr.location.start_line != expr.location.end_line
+                || expr.location.end_column <= expr.location.start_column
+            {
+                continue;
+            }
             assert!(tokens.iter().any(|token| {
                 token.0 == (expr.location.start_line - 1) as u32
                     && token.1 == (expr.location.start_column - 1) as u32
@@ -1058,6 +1068,28 @@ page: Annotated[Template, "html"] = t"""<section class="panel">
         assert_expression_tokens_match_template(&tokens, &template);
         assert_non_variable_tokens_avoid_expression_ranges(&highlighter, &tokens, &template);
         assert_has_token_start(&tokens, 10, 4, highlighter.token_type_to_index("tag"), 1);
+    }
+
+    #[test]
+    fn test_multiline_expression_does_not_emit_invalid_variable_token() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+page: Annotated[Template, "html"] = t"""<div>{
+    first
+    + second
+}</div>"""
+"#,
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+        let variable_type = highlighter.token_type_to_index("variable.parameter");
+
+        assert!(tokens.iter().all(|token| token.3 != variable_type));
+        assert!(!tokens.is_empty());
     }
 
     #[test]

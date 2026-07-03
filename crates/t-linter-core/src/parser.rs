@@ -1382,6 +1382,8 @@ impl TemplateStringParser {
                 scope_directives,
                 name_bindings,
             )?
+        } else if let Some(return_type_node) = return_type_for_string_node(node) {
+            self.resolve_template_hint_from_type_node(return_type_node, source)?
         } else {
             None
         };
@@ -2847,6 +2849,29 @@ fn assignment_for_string_node(node: Node) -> Option<(Node, Option<Node>)> {
                 return None;
             }
             return Some((left, parent.child_by_field_name("type")));
+        }
+        current = parent;
+    }
+    None
+}
+
+fn return_type_for_string_node(node: Node) -> Option<Node> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "return_statement" => return enclosing_function_return_type(parent),
+            "function_definition" | "lambda" => return None,
+            _ => current = parent,
+        }
+    }
+    None
+}
+
+fn enclosing_function_return_type(node: Node) -> Option<Node> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "function_definition" {
+            return parent.child_by_field_name("return_type");
         }
         current = parent;
     }
@@ -5861,6 +5886,44 @@ render_toml(t"title = {title}")
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("toml".to_string()));
         assert_eq!(templates[0].profile, Some("1.0".to_string()));
+    }
+
+    #[test]
+    fn test_return_annotation_inference() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+def render_page() -> Annotated[Template, "html"]:
+    return t"<main>{body}</main>"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].content, "<main>{}</main>");
+        assert_eq!(templates[0].language, Some("html".to_string()));
+    }
+
+    #[test]
+    fn test_templates_in_collection_and_concat_contexts_are_detected() {
+        let source = r#"
+items = [t"<li>{first}</li>"]
+implicit = t"<span>" t"{label}</span>"
+explicit = t"<b>" + t"{label}</b>"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+        let contents = templates
+            .iter()
+            .map(|template| template.content.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(contents.contains(&"<li>{}</li>"));
+        assert!(contents.iter().any(|content| content.contains("<span>")));
+        assert!(contents.iter().any(|content| content.contains("<b>")));
     }
 
     #[test]

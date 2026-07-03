@@ -329,7 +329,7 @@ impl LanguageServer for TLinterLanguageServer {
         };
         self.document_cache
             .insert(uri.clone(), DocumentState { text, version });
-        let ruff = self.ruff.read().await.clone();
+        let ruff = self.current_ruff_client().await;
         if let Some(ruff) = ruff {
             let lock = self.ruff_document_lock(&uri);
             let _guard = lock.lock().await;
@@ -768,6 +768,54 @@ impl TLinterLanguageServer {
                         ),
                     )
                     .await;
+            }
+        }
+    }
+
+    async fn current_ruff_client(&self) -> Option<Arc<RuffPipelineClient>> {
+        let current = self.ruff.read().await.clone();
+        if let Some(ruff) = current {
+            if ruff.is_running().await {
+                return Some(ruff);
+            }
+            return self.restart_ruff_pipeline_after_exit().await;
+        }
+        None
+    }
+
+    async fn restart_ruff_pipeline_after_exit(&self) -> Option<Arc<RuffPipelineClient>> {
+        let config = self.config.read().await.ruff_pipeline.clone();
+        if !config.enabled {
+            return None;
+        }
+        let Some(initialize_params) = self.initialize_params.read().await.clone() else {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    "Cannot restart Ruff pipeline before LSP initialization completes",
+                )
+                .await;
+            return None;
+        };
+        let workspace_roots = self.workspace_roots.read().await.clone();
+        let previous = self.ruff.write().await.take();
+        if let Some(previous) = previous {
+            previous.shutdown().await;
+        }
+        match RuffPipelineClient::start(&config, initialize_params, &workspace_roots).await {
+            Ok(ruff) => {
+                let ruff = Arc::new(ruff);
+                *self.ruff.write().await = Some(Arc::clone(&ruff));
+                Some(ruff)
+            }
+            Err(error) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Failed to restart Ruff pipeline after exit: {error}"),
+                    )
+                    .await;
+                None
             }
         }
     }
