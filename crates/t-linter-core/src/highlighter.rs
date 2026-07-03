@@ -1,7 +1,7 @@
 #[cfg(feature = "sql")]
 use tree_sitter_sequel;
 
-use crate::parser::{raw_static_prefix_len, TemplatePart, TemplateStringInfo};
+use crate::parser::{TemplatePart, TemplateStringInfo, raw_static_prefix_len};
 use anyhow::Result;
 use std::collections::HashMap;
 use tracing::info;
@@ -316,7 +316,9 @@ impl TemplateHighlighter {
         }
     }
 
-    fn prepare_tdom_content_for_highlighting(template: &TemplateStringInfo) -> ProcessedHighlightContent {
+    fn prepare_tdom_content_for_highlighting(
+        template: &TemplateStringInfo,
+    ) -> ProcessedHighlightContent {
         let mut processed = String::new();
         let mut processed_to_original = vec![0];
         let mut placeholders = Vec::new();
@@ -334,14 +336,13 @@ impl TemplateHighlighter {
                     original_offset += part.text.len();
                 }
                 TemplatePart::Interpolation(_) => {
-                    let placeholder_text =
-                        if template.content[..original_offset].ends_with("</")
-                            || template.content[..original_offset].ends_with('<')
-                        {
-                            "tdom_component"
-                        } else {
-                            "t_linter_expr"
-                        };
+                    let placeholder_text = if template.content[..original_offset].ends_with("</")
+                        || template.content[..original_offset].ends_with('<')
+                    {
+                        "tdom_component"
+                    } else {
+                        "t_linter_expr"
+                    };
                     Self::append_placeholder_segment(
                         &mut processed,
                         &mut processed_to_original,
@@ -455,7 +456,7 @@ impl TemplateHighlighter {
         let template_start_line = template.location.start_line - 1;
         let template_start_col = template.location.start_column - 1;
 
-        let prefix_len = self.calculate_template_content_offset(&template.raw_content);
+        let prefix_len = template.string_start.len();
 
         for expr in &template.expressions {
             tokens.push((
@@ -467,7 +468,7 @@ impl TemplateHighlighter {
             ));
         }
 
-        let suffix_len = if template.flags.is_triple { 3 } else { 1 };
+        let suffix_len = template.string_end.len();
         let actual_content =
             &template.raw_content[prefix_len..template.raw_content.len() - suffix_len];
 
@@ -523,20 +524,6 @@ impl TemplateHighlighter {
 
         tokens
     }
-    fn calculate_template_content_offset(&self, raw_content: &str) -> usize {
-        if raw_content.starts_with("t\"\"\"") || raw_content.starts_with("t'''") {
-            4
-        } else if raw_content.starts_with("tr\"\"\"") || raw_content.starts_with("tr'''") {
-            5
-        } else if raw_content.starts_with("t\"") || raw_content.starts_with("t'") {
-            2
-        } else if raw_content.starts_with("tr\"") || raw_content.starts_with("tr'") {
-            3
-        } else {
-            0
-        }
-    }
-
     fn map_template_position_to_document(
         &self,
         template: &TemplateStringInfo,
@@ -797,8 +784,7 @@ mod tests {
                 assert!(
                     !overlaps,
                     "non-variable token {:?} overlaps expression {:?}",
-                    token,
-                    expr.location
+                    token, expr.location
                 );
             }
         }
@@ -812,14 +798,12 @@ mod tests {
         length: u32,
     ) {
         assert!(
-            tokens
-                .iter()
-                .any(|token| {
-                    token.0 == (line_1_based - 1) as u32
-                        && token.1 == (start_column_1_based - 1) as u32
-                        && token.2 == length
-                        && token.3 == token_type
-                }),
+            tokens.iter().any(|token| {
+                token.0 == (line_1_based - 1) as u32
+                    && token.1 == (start_column_1_based - 1) as u32
+                    && token.2 == length
+                    && token.3 == token_type
+            }),
             "expected token type {token_type} at {line_1_based}:{start_column_1_based} len {length}, got {:?}",
             tokens
         );
@@ -1227,9 +1211,7 @@ B<span>{value}</span>
 
             assert_expression_tokens_match_template(&tokens, &template);
             assert!(
-                tokens
-                    .iter()
-                    .any(|token| token.0 >= 6 && token.2 > 0),
+                tokens.iter().any(|token| token.0 >= 6 && token.2 > 0),
                 "expected tokens on the continued line, got {:?}",
                 tokens
             );
@@ -1266,7 +1248,11 @@ B<span>{value}</span>
             &template,
         );
 
-        assert!(tokens.is_empty(), "expected multiline ranges to be skipped, got {:?}", tokens);
+        assert!(
+            tokens.is_empty(),
+            "expected multiline ranges to be skipped, got {:?}",
+            tokens
+        );
     }
 
     #[test]

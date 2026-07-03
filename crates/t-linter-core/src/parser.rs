@@ -1322,7 +1322,7 @@ impl TemplateStringParser {
                 {
                     let start_text = start_node.utf8_text(source.as_bytes())?;
 
-                    if start_text.starts_with('t') || start_text.starts_with('T') {
+                    if is_template_string_start(start_text) {
                         processed_nodes.insert(node_id);
                         let info = self.extract_template_info(
                             node,
@@ -1443,10 +1443,10 @@ impl TemplateStringParser {
     fn parse_string_flags(&self, start_text: &str) -> TemplateStringFlags {
         let mut flags = TemplateStringFlags::default();
 
-        let prefix = start_text.to_lowercase();
+        let prefix = string_prefix(start_text).unwrap_or_default();
 
         flags.is_template = true;
-        flags.is_raw = prefix.contains('r');
+        flags.is_raw = prefix.bytes().any(|byte| byte.eq_ignore_ascii_case(&b'r'));
         flags.is_format = true;
         flags.is_triple = start_text.ends_with("'''") || start_text.ends_with("\"\"\"");
 
@@ -2719,8 +2719,7 @@ fn scoped_import_matches_resolution_filter(
         return true;
     };
     scoped_imports.iter().any(|binding| {
-        binding.import_target == import_path
-            && filter.contains(root_identifier_text(&binding.name))
+        binding.import_target == import_path && filter.contains(root_identifier_text(&binding.name))
     })
 }
 
@@ -2732,7 +2731,29 @@ fn is_template_string_node(node: Node, source: &str) -> Result<bool> {
         return Ok(false);
     };
     let start_text = start_node.utf8_text(source.as_bytes())?;
-    Ok(start_text.starts_with('t') || start_text.starts_with('T'))
+    Ok(is_template_string_start(start_text))
+}
+
+fn string_prefix(start_text: &str) -> Option<&str> {
+    start_text
+        .find(['"', '\''])
+        .map(|quote_index| &start_text[..quote_index])
+}
+
+fn is_template_string_start(start_text: &str) -> bool {
+    let Some(prefix) = string_prefix(start_text) else {
+        return false;
+    };
+    let mut saw_template = false;
+    let mut saw_raw = false;
+    for byte in prefix.bytes() {
+        match byte.to_ascii_lowercase() {
+            b't' if !saw_template => saw_template = true,
+            b'r' if !saw_raw => saw_raw = true,
+            _ => return false,
+        }
+    }
+    saw_template
 }
 
 fn call_function_for_string_node(node: Node) -> Option<Node> {
@@ -2871,45 +2892,38 @@ fn call_arguments<'a>(argument_list: Node<'a>, source: &'a str) -> Result<Vec<Ca
     let mut arguments = Vec::new();
     let mut cursor = argument_list.walk();
     let mut position = 0;
+    let mut infer_positional = true;
 
     for child in argument_list.children(&mut cursor) {
-        if matches!(
-            child.kind(),
-            "string"
-                | "identifier"
-                | "call"
-                | "attribute"
-                | "integer"
-                | "float"
-                | "true"
-                | "false"
-                | "none"
-                | "list"
-                | "dictionary"
-                | "tuple"
-                | "set"
-        ) {
-            arguments.push(CallArgument {
-                position,
-                keyword: None,
-                value: child,
-            });
-            position += 1;
+        if !child.is_named() || child.kind() == "comment" {
             continue;
         }
 
-        if child.kind() == "keyword_argument"
-            && let Some(value) = child.child_by_field_name("value")
-        {
-            let keyword = child
-                .child_by_field_name("name")
-                .and_then(|name| name.utf8_text(source.as_bytes()).ok());
-            arguments.push(CallArgument {
-                position,
-                keyword,
-                value,
-            });
-            position += 1;
+        match child.kind() {
+            "keyword_argument" => {
+                if let Some(value) = child.child_by_field_name("value") {
+                    let keyword = child
+                        .child_by_field_name("name")
+                        .and_then(|name| name.utf8_text(source.as_bytes()).ok());
+                    arguments.push(CallArgument {
+                        position,
+                        keyword,
+                        value,
+                    });
+                }
+            }
+            "list_splat" | "dictionary_splat" => {
+                infer_positional = false;
+            }
+            _ if infer_positional => {
+                arguments.push(CallArgument {
+                    position,
+                    keyword: None,
+                    value: child,
+                });
+                position += 1;
+            }
+            _ => {}
         }
     }
 
@@ -4152,11 +4166,14 @@ impl TemplateStringInfo {
         let mut visible_token_index = 0;
 
         for part in &self.parts {
-            let contributes_token = !matches!(part, TemplatePart::Static(part) if part.text.is_empty());
+            let contributes_token =
+                !matches!(part, TemplatePart::Static(part) if part.text.is_empty());
 
             if contributes_token && visible_token_index == position.token_index {
                 return match part {
-                    TemplatePart::Static(part) => offset + position.offset.min(part.text.len()),
+                    TemplatePart::Static(part) => {
+                        offset + char_offset_to_byte_offset(&part.text, position.offset)
+                    }
                     TemplatePart::Interpolation(_) => offset + position.offset.min(2),
                 };
             }
@@ -4213,6 +4230,12 @@ impl TemplateStringInfo {
             .trim_end_matches(['\'', '"'])
             .trim_end_matches(['\'', '"'])
     }
+}
+
+fn char_offset_to_byte_offset(text: &str, char_offset: usize) -> usize {
+    text.char_indices()
+        .nth(char_offset)
+        .map_or(text.len(), |(offset, _)| offset)
 }
 
 fn formatting_wrapper_location(node: Node) -> Option<Location> {
@@ -4275,7 +4298,10 @@ fn unescape_template_text(text: &str, is_raw: bool) -> String {
     processed_content
 }
 
-fn next_template_unit(chars: &mut Peekable<Chars<'_>>, is_raw: bool) -> Option<DecodedTemplateUnit> {
+fn next_template_unit(
+    chars: &mut Peekable<Chars<'_>>,
+    is_raw: bool,
+) -> Option<DecodedTemplateUnit> {
     let ch = chars.next()?;
 
     if !is_raw
@@ -4354,7 +4380,11 @@ fn decode_python_escape(chars: &mut Peekable<Chars<'_>>) -> Option<(String, usiz
     }
 }
 
-fn decode_fixed_width_escape(chars: &mut Peekable<Chars<'_>>, digits: usize, radix: u32) -> Option<(String, usize)> {
+fn decode_fixed_width_escape(
+    chars: &mut Peekable<Chars<'_>>,
+    digits: usize,
+    radix: u32,
+) -> Option<(String, usize)> {
     let mut probe = chars.clone();
     let prefix = probe.next()?;
     let mut raw = String::new();
@@ -4480,8 +4510,8 @@ fn map_template_position_to_document(
 
                 let remaining_template = position_in_template.saturating_sub(template_idx);
                 let consumed = remaining_template.min(part.text.len());
-                actual_idx =
-                    (actual_idx + raw_static_prefix_len(part, consumed, is_raw)).min(actual_bytes.len());
+                actual_idx = (actual_idx + raw_static_prefix_len(part, consumed, is_raw))
+                    .min(actual_bytes.len());
                 template_idx += consumed;
 
                 if consumed < part.text.len() {
@@ -4711,14 +4741,28 @@ mod tests {
 
     #[test]
     fn test_raw_template_string() {
-        let source = r#"path = tr"Path: {path}\n""#;
+        for prefix in ["tr", "rt", "Rt", "tR", "RT", "TR"] {
+            let source = format!(r#"path = {prefix}"Path: {{path}}\n""#);
 
-        let mut parser = TemplateStringParser::new().unwrap();
-        let templates = parser.find_template_strings(source).unwrap();
+            let mut parser = TemplateStringParser::new().unwrap();
+            let templates = parser.find_template_strings(&source).unwrap();
 
-        assert_eq!(templates.len(), 1);
-        assert!(templates[0].flags.is_raw);
-        assert!(templates[0].flags.is_template);
+            assert_eq!(templates.len(), 1, "{prefix}");
+            assert!(templates[0].flags.is_raw, "{prefix}");
+            assert!(templates[0].flags.is_template, "{prefix}");
+        }
+    }
+
+    #[test]
+    fn test_invalid_template_prefix_combinations_are_ignored() {
+        for prefix in ["tf", "ft", "tb", "bt", "ut", "tu"] {
+            let source = format!(r#"path = {prefix}"Path: {{path}}""#);
+
+            let mut parser = TemplateStringParser::new().unwrap();
+            let templates = parser.find_template_strings(&source).unwrap();
+
+            assert!(templates.is_empty(), "{prefix}");
+        }
     }
 
     #[test]
@@ -4862,15 +4906,39 @@ html = t"""
             raw_text: "A\\\nB".to_string(),
         })];
         assert_eq!(
-            map_template_position_to_document(&static_with_continuation, false, "A\\\nB", 0, 0, 0, 0),
+            map_template_position_to_document(
+                &static_with_continuation,
+                false,
+                "A\\\nB",
+                0,
+                0,
+                0,
+                0
+            ),
             (0, 0)
         );
         assert_eq!(
-            map_template_position_to_document(&static_with_continuation, false, "A\\\nB", 1, 0, 0, 0),
+            map_template_position_to_document(
+                &static_with_continuation,
+                false,
+                "A\\\nB",
+                1,
+                0,
+                0,
+                0
+            ),
             (1, 0)
         );
         assert_eq!(
-            map_template_position_to_document(&static_with_continuation, false, "A\\\nB", 2, 0, 0, 0),
+            map_template_position_to_document(
+                &static_with_continuation,
+                false,
+                "A\\\nB",
+                2,
+                0,
+                0,
+                0
+            ),
             (1, 1)
         );
 
@@ -4925,7 +4993,7 @@ html = t"""
             content: "{}{}".to_string(),
             raw_content: r#"t"{a}\
 {b}""#
-            .to_string(),
+                .to_string(),
             variable_name: None,
             function_name: None,
             language: Some("html".to_string()),
@@ -4980,6 +5048,62 @@ html = t"""
                 offset: 0,
             }),
             2
+        );
+    }
+
+    #[test]
+    fn test_token_position_to_content_offset_treats_backend_offsets_as_chars() {
+        let template = TemplateStringInfo {
+            content: "説明: {}".to_string(),
+            raw_content: "t\"説明: {value}\"".to_string(),
+            variable_name: None,
+            function_name: None,
+            language: Some("yaml".to_string()),
+            string_start: "t\"".to_string(),
+            string_end: "\"".to_string(),
+            location: Location {
+                start_line: 1,
+                start_column: 1,
+                end_line: 1,
+                end_column: 18,
+            },
+            formatting_wrapper_location: None,
+            expressions: vec![],
+            parts: vec![
+                TemplatePart::Static(StaticTextSegment {
+                    text: "説明: ".to_string(),
+                    raw_text: "説明: ".to_string(),
+                }),
+                TemplatePart::Interpolation(InterpolationInfo {
+                    expression: "value".to_string(),
+                    conversion: None,
+                    format_spec: String::new(),
+                    raw_source: "{value}".to_string(),
+                    location: Location {
+                        start_line: 1,
+                        start_column: 8,
+                        end_line: 1,
+                        end_column: 15,
+                    },
+                    interpolation_index: 0,
+                }),
+            ],
+            flags: TemplateStringFlags::default(),
+        };
+
+        assert_eq!(
+            template.token_position_to_content_offset(&SourcePosition {
+                token_index: 0,
+                offset: 3,
+            }),
+            "説明:".len()
+        );
+        assert_eq!(
+            template.token_position_to_content_offset(&SourcePosition {
+                token_index: 0,
+                offset: usize::MAX,
+            }),
+            "説明: ".len()
         );
     }
 
