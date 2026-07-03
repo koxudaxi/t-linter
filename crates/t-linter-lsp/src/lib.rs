@@ -16,6 +16,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tracing::{debug, info, warn};
 
+mod lsp_helpers;
 mod ruff;
 mod type_checker;
 
@@ -462,6 +463,7 @@ impl LanguageServer for TLinterLanguageServer {
                 }
             }
         }
+        self.ruff_document_locks.remove(&params.text_document.uri);
         let type_checker = self.type_checker.lock().await.client.clone();
         if let Some(type_checker) = type_checker
             && let Err(error) = type_checker.close_shadow(&params.text_document.uri).await

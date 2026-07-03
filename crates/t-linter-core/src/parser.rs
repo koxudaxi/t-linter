@@ -4312,25 +4312,33 @@ impl TemplateStringInfo {
         let mut visible_token_index = 0;
 
         for part in &self.parts {
-            let contributes_token =
-                !matches!(part, TemplatePart::Static(part) if part.text.is_empty());
-
-            if contributes_token && visible_token_index == position.token_index {
-                return match part {
-                    TemplatePart::Static(part) => {
-                        offset + char_offset_to_byte_offset(&part.text, position.offset)
+            match part {
+                TemplatePart::Static(part) => {
+                    let contributes_token = !part.text.is_empty();
+                    if contributes_token && visible_token_index == position.token_index {
+                        return offset + char_offset_to_byte_offset(&part.text, position.offset);
                     }
-                    TemplatePart::Interpolation(_) => offset + position.offset.min(2),
-                };
-            }
+                    offset += part.text.len();
+                    if contributes_token {
+                        visible_token_index += 1;
+                    }
+                }
+                TemplatePart::Interpolation(part) => {
+                    if let Some(debug_prefix) = &part.debug_prefix {
+                        if visible_token_index == position.token_index {
+                            return offset
+                                + char_offset_to_byte_offset(debug_prefix, position.offset);
+                        }
+                        offset += debug_prefix.len();
+                        visible_token_index += 1;
+                    }
 
-            offset += match part {
-                TemplatePart::Static(part) => part.text.len(),
-                TemplatePart::Interpolation(_) => 2,
-            };
-
-            if contributes_token {
-                visible_token_index += 1;
+                    if visible_token_index == position.token_index {
+                        return offset + position.offset.min(2);
+                    }
+                    offset += 2;
+                    visible_token_index += 1;
+                }
             }
         }
 
@@ -4665,6 +4673,39 @@ fn map_template_position_to_document(
                 }
             }
             TemplatePart::Interpolation(part) => {
+                if let Some(prefix) = &part.debug_prefix {
+                    let raw_prefix_start = debug_prefix_raw_start(part, prefix);
+                    let raw_prefix_end =
+                        (raw_prefix_start + prefix.len()).min(part.raw_source.len());
+                    let prefix_end = template_idx + prefix.len();
+
+                    if position_in_template <= template_idx {
+                        actual_idx = (actual_idx + raw_prefix_start).min(actual_bytes.len());
+                        break;
+                    }
+
+                    if position_in_template < prefix_end {
+                        let prefix_offset = position_in_template - template_idx;
+                        actual_idx =
+                            (actual_idx + raw_prefix_start + prefix_offset.min(prefix.len()))
+                                .min(actual_bytes.len());
+                        break;
+                    }
+
+                    template_idx = prefix_end;
+                    actual_idx = (actual_idx + raw_prefix_end).min(actual_bytes.len());
+
+                    if position_in_template < template_idx + 2 {
+                        break;
+                    }
+
+                    template_idx += 2;
+                    actual_idx = (actual_idx
+                        + part.raw_source.len().saturating_sub(raw_prefix_end))
+                    .min(actual_bytes.len());
+                    continue;
+                }
+
                 if template_idx >= position_in_template {
                     break;
                 }
@@ -4692,6 +4733,14 @@ fn map_template_position_to_document(
     }
 
     (line, col)
+}
+
+fn debug_prefix_raw_start(part: &InterpolationInfo, prefix: &str) -> usize {
+    part.raw_source
+        .strip_prefix('{')
+        .and_then(|raw| raw.find(prefix).map(|start| start + 1))
+        .unwrap_or(1)
+        .min(part.raw_source.len())
 }
 
 fn choose_raw_delimiters(
@@ -5010,6 +5059,39 @@ mod tests {
         assert_eq!(interpolation.expression, "value");
         assert_eq!(interpolation.conversion.as_deref(), Some("r"));
         assert_eq!(interpolation.raw_source.as_deref(), Some("{value = }"));
+    }
+
+    #[test]
+    fn test_debug_interpolation_maps_backend_positions_after_prefix() {
+        let source = r#"payload = t"{value = } tail""#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+        let template = &templates[0];
+
+        assert_eq!(
+            template.token_position_to_content_offset(&SourcePosition {
+                token_index: 2,
+                offset: 0,
+            }),
+            "value = {}".len()
+        );
+
+        let tail_location = template.backend_span_to_location(&SourceSpan {
+            start: SourcePosition {
+                token_index: 2,
+                offset: 0,
+            },
+            end: SourcePosition {
+                token_index: 2,
+                offset: 5,
+            },
+        });
+        assert_eq!(
+            tail_location.start_column,
+            source.find(" tail").unwrap() + 1
+        );
+        assert_eq!(tail_location.end_column, source.len());
     }
 
     #[test]

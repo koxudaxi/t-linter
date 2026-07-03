@@ -213,10 +213,7 @@ fn format_template_edit(
         formatted
             .map(|content| TemplateEdit {
                 location: template.formatting_location(&content).clone(),
-                replacement: {
-                    let replacement = template.formatted_literal(&content);
-                    replacement
-                },
+                replacement: template.formatted_literal(&content),
             })
             .map_err(|error| FormatError::from_backend_error(template, &language, error).into()),
     )
@@ -238,7 +235,11 @@ fn ranges_overlap(left: &Location, right: &Location) -> bool {
     let right_start = (right.start_line, right.start_column);
     let right_end = (right.end_line, right.end_column);
 
-    left_start < right_end && right_start < left_end
+    if right_start == right_end {
+        left_start <= right_start && right_start < left_end
+    } else {
+        left_start < right_end && right_start < left_end
+    }
 }
 
 fn line_start_offsets(source: &[u8]) -> Vec<usize> {
@@ -358,6 +359,31 @@ config: Annotated[Template, "json"] = t'{"name": {name}}'
         .expect("expected range format success");
 
         assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn ranges_overlap_includes_zero_width_cursor_at_start() {
+        let template = Location {
+            start_line: 1,
+            start_column: 5,
+            end_line: 1,
+            end_column: 10,
+        };
+        let start_cursor = Location {
+            start_line: 1,
+            start_column: 5,
+            end_line: 1,
+            end_column: 5,
+        };
+        let end_cursor = Location {
+            start_line: 1,
+            start_column: 10,
+            end_line: 1,
+            end_column: 10,
+        };
+
+        assert!(ranges_overlap(&template, &start_cursor));
+        assert!(!ranges_overlap(&template, &end_cursor));
     }
 
     #[test]

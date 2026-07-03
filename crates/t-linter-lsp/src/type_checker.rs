@@ -1,3 +1,4 @@
+use crate::lsp_helpers::{is_uv_pyproject_table, response_id, server_request_id};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -927,32 +928,6 @@ fn dedupe_launch_candidates(candidates: Vec<TyLaunchConfig>) -> Vec<TyLaunchConf
 
 fn path_string(path: PathBuf) -> String {
     path.display().to_string()
-}
-
-fn response_id(message: &Value) -> Option<u64> {
-    if message.get("method").is_some() {
-        return None;
-    }
-    message.get("id").and_then(Value::as_u64)
-}
-
-fn server_request_id(message: &Value) -> Option<Value> {
-    message.get("method")?;
-    message.get("id").cloned()
-}
-
-fn is_uv_pyproject_table(line: &str) -> bool {
-    let Some(table) = toml_table_name(line) else {
-        return false;
-    };
-    table == "dependency-groups" || table == "tool.uv" || table.starts_with("tool.uv.")
-}
-
-fn toml_table_name(line: &str) -> Option<&str> {
-    let table = line.split('#').next()?.trim();
-    let table = table.strip_prefix('[')?.strip_suffix(']')?.trim();
-    let table = table.strip_prefix('[').unwrap_or(table);
-    Some(table.strip_suffix(']').unwrap_or(table).trim())
 }
 
 async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Option<Value>> {
