@@ -28,6 +28,7 @@ The LSP server provides:
 
 - **Semantic Tokens** — syntax highlighting for embedded languages in template strings
 - **Diagnostics** — real-time validation of embedded language syntax (debounced at 250ms)
+- **Interpolation Type Checking** — optional JSON, YAML, and TOML interpolation value diagnostics through `ty`
 - **Document Formatting** — full document formatting of template literals
 - **Range Formatting** — format a single template literal by selecting its range
 - **Code Actions** — save-time and manual rewrite actions for VSCode and other editors
@@ -49,6 +50,37 @@ For HTML, T-HTML, JSON, YAML, and TOML templates:
 
 - Diagnostics are published from the dedicated Rust backends for strict validation
 - Formatting requests and code actions rewrite the whole template literal using the backend formatter
+
+### Interpolation Type Checking
+
+Interpolation value type checking is opt-in and applies to JSON, YAML, and TOML templates. When enabled, t-linter starts a separate `ty server`, sends it an in-memory shadow copy of the open Python document, and maps `ty` assignment diagnostics back to the original interpolation expression.
+
+For example, a `User` object interpolated into a structured-data value position is reported on the `{user}` expression, while backend-compatible values such as `int`, `str`, `list`, and `dict` are accepted.
+
+Enable it from an LSP client with initialization options:
+
+```json
+{
+  "typeChecking": {
+    "enabled": true,
+    "command": "/path/to/ty",
+    "args": ["server"]
+  }
+}
+```
+
+`command` is optional. Without it, t-linter tries candidates in this order:
+
+1. `$VIRTUAL_ENV/bin/ty` or `$CONDA_PREFIX/bin/ty`
+2. workspace `.venv/bin/ty` or `venv/bin/ty`
+3. uv project server: `uv run --project <workspace> --frozen --no-progress ty server`
+4. PATH fallback: `ty server`
+
+The `t-linter check` CLI does not run interpolation value type checking yet.
+
+See [Interpolation Type Checking](../interpolation-type-checking.md) for the
+architecture, shadow document behavior, diagnostic mapping, and implementation
+entry points.
 
 ## Code Action Kinds
 

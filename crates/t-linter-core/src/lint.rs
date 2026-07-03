@@ -4,15 +4,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
-use tstring_html as backend_html;
 use tstring_html::{Attribute, AttributeLike, Node as HtmlNode};
-use tstring_json as backend_json;
 use tstring_syntax::Diagnostic;
 use tstring_tdom as backend_tdom;
 use tstring_thtml as backend_thtml;
-use tstring_toml as backend_toml;
-use tstring_yaml as backend_yaml;
 
+use crate::backend::TemplateBackend;
 use crate::parser::{CallableParameter, CallableSignature, CallableValueType, ModuleContext};
 use crate::{TemplateStringInfo, TemplateStringParser};
 
@@ -211,15 +208,13 @@ fn lint_template(
         return Ok(Vec::new());
     };
 
-    if matches!(
-        language.as_str(),
-        "html" | "thtml" | "tdom" | "json" | "yaml" | "yml" | "toml"
-    ) {
+    if let Some(backend) = TemplateBackend::for_language(&language) {
         return lint_backend_template(
             path,
             source,
             template,
             &language,
+            backend,
             module_context,
             static_spread_analysis,
         );
@@ -275,19 +270,12 @@ fn lint_backend_template(
     source: &str,
     template: &TemplateStringInfo,
     language: &str,
+    backend: TemplateBackend,
     module_context: &ModuleContext,
     static_spread_analysis: &StaticSpreadAnalysis,
 ) -> Result<Vec<LintDiagnostic>> {
     let input = template.to_template_input();
-    let result = match language {
-        "html" => backend_html::check_template(&input),
-        "thtml" => backend_thtml::check_template(&input),
-        "tdom" => backend_tdom::check_template(&input),
-        "json" => backend_json::check_template(&input),
-        "yaml" | "yml" => backend_yaml::check_template(&input),
-        "toml" => backend_toml::check_template(&input),
-        other => return Err(anyhow::anyhow!("Unsupported backend language: {other}")),
-    };
+    let result = backend.check_template(&input);
 
     let Err(error) = result else {
         let mut diagnostics = Vec::new();

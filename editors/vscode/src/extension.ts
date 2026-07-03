@@ -104,7 +104,8 @@ async function startLanguageServer(context: vscode.ExtensionContext) {
         initializationOptions: {
             enableTypeChecking: vscode.workspace.getConfiguration('t-linter').get<boolean>('enableTypeChecking', true),
             highlightUntyped: vscode.workspace.getConfiguration('t-linter').get<boolean>('highlightUntyped', true),
-            ruffPipeline: await resolveRuffPipelineOptions()
+            ruffPipeline: await resolveRuffPipelineOptions(),
+            typeChecking: await resolveTypeCheckingOptions()
         }
     };
 
@@ -258,6 +259,23 @@ async function resolveRuffPipelineOptions(): Promise<Record<string, unknown>> {
     };
     if (ruffPath) {
         options.command = ruffPath;
+    }
+    return options;
+}
+
+async function resolveTypeCheckingOptions(): Promise<Record<string, unknown>> {
+    const config = vscode.workspace.getConfiguration('t-linter');
+    if (!config.get<boolean>('typeChecking.enabled', false)) {
+        return { enabled: false };
+    }
+
+    const tyPath = config.get<string>('typeChecking.tyPath', '').trim();
+    const options: Record<string, unknown> = {
+        enabled: true,
+        args: ['server']
+    };
+    if (tyPath) {
+        options.command = tyPath;
     }
     return options;
 }

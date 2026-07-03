@@ -10,6 +10,7 @@ nav = [
   { "Installation" = "installation.md" },
   { "Usage" = [
     { "VSCode Extension" = "usage/vscode.md" },
+    { "Interpolation Type Checking" = "usage/interpolation-type-checking.md" },
     { "CLI" = [
       { "Check Command" = "usage/cli/check.md" },
       { "Format Command" = "usage/cli/format.md" },
