@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 This changelog is generated from GitHub Releases and may include manual corrections when release metadata needs adjustment.
 
 ---
+## [0.8.1](https://github.com/koxudaxi/t-linter/releases/tag/0.8.1) - 2026-07-03
+
+## What's Changed
+* Add interpolation type checking by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/46
+* Defer code action edits until resolve by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/48
+
+
+**Full Changelog**: https://github.com/koxudaxi/t-linter/compare/0.8.0...0.8.1
+
+---
+
 ## [0.8.0](https://github.com/koxudaxi/t-linter/releases/tag/0.8.0) - 2026-05-31
 
 ## Breaking Changes
