@@ -459,6 +459,11 @@ impl TemplateHighlighter {
         let prefix_len = template.string_start.len();
 
         for expr in &template.expressions {
+            if expr.location.start_line != expr.location.end_line
+                || expr.location.end_column <= expr.location.start_column
+            {
+                continue;
+            }
             tokens.push((
                 (expr.location.start_line - 1) as u32,
                 (expr.location.start_column - 1) as u32,
@@ -649,6 +654,7 @@ mod tests {
                 .unwrap_or_else(|| format!("slot_{interpolation_index}"));
             parts.push(TemplatePart::Interpolation(InterpolationInfo {
                 expression: expression.clone(),
+                debug_prefix: None,
                 conversion: None,
                 format_spec: String::new(),
                 raw_source: format!("{{{expression}}}"),
@@ -684,6 +690,7 @@ mod tests {
             variable_name: Some(language.to_string()),
             function_name: None,
             language: Some(language.to_string()),
+            profile: None,
             string_start,
             string_end,
             location,
@@ -701,8 +708,17 @@ mod tests {
     fn parse_single_template(source: &str) -> TemplateStringInfo {
         let mut parser = TemplateStringParser::new().unwrap();
         let templates = parser.find_template_strings(source).unwrap();
-        assert_eq!(templates.len(), 1);
-        templates.into_iter().next().unwrap()
+        assert!(!templates.is_empty());
+        templates
+            .into_iter()
+            .min_by_key(|template| {
+                (
+                    template.location.start_line,
+                    template.location.start_column,
+                    usize::MAX - template.raw_content.len(),
+                )
+            })
+            .unwrap()
     }
 
     fn placeholder_ranges(template: &TemplateStringInfo) -> Vec<(usize, usize)> {
@@ -741,6 +757,11 @@ mod tests {
         template: &TemplateStringInfo,
     ) {
         for expr in &template.expressions {
+            if expr.location.start_line != expr.location.end_line
+                || expr.location.end_column <= expr.location.start_column
+            {
+                continue;
+            }
             assert!(tokens.iter().any(|token| {
                 token.0 == (expr.location.start_line - 1) as u32
                     && token.1 == (expr.location.start_column - 1) as u32
@@ -1047,6 +1068,28 @@ page: Annotated[Template, "html"] = t"""<section class="panel">
         assert_expression_tokens_match_template(&tokens, &template);
         assert_non_variable_tokens_avoid_expression_ranges(&highlighter, &tokens, &template);
         assert_has_token_start(&tokens, 10, 4, highlighter.token_type_to_index("tag"), 1);
+    }
+
+    #[test]
+    fn test_multiline_expression_does_not_emit_invalid_variable_token() {
+        let mut highlighter = TemplateHighlighter::new().unwrap();
+        let template = parse_single_template(
+            r#"from typing import Annotated
+from string.templatelib import Template
+
+page: Annotated[Template, "html"] = t"""<div>{
+    first
+    + second
+}</div>"""
+"#,
+        );
+
+        let ranges = highlighter.highlight_template(&template).unwrap();
+        let tokens = highlighter.to_lsp_tokens(ranges, &template);
+        let variable_type = highlighter.token_type_to_index("variable.parameter");
+
+        assert!(tokens.iter().all(|token| token.3 != variable_type));
+        assert!(!tokens.is_empty());
     }
 
     #[test]
@@ -1566,6 +1609,7 @@ B<span>{value}</span>
             variable_name: Some("html".to_string()),
             function_name: None,
             language: Some("html".to_string()),
+            profile: None,
             string_start: "t\"".to_string(),
             string_end: "\"".to_string(),
             location: Location {
@@ -1638,12 +1682,12 @@ project_name = "demo-project"
 payload = {"nested": {"enabled": True}}
 
 config: Annotated[Template, "json"] = t"""
-{
-  "meta": {
+{{
+  "meta": {{
     "pattern": "{{}}"
-  },
+  }},
   "payload": {payload["nested"]}
-}
+}}
 """
 "#,
         );

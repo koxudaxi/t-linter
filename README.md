@@ -152,7 +152,7 @@ t-linter check file.py --error-on-issues
 
 Example output:
 ```text
-example.py:4:46: error[embedded-parse-error] Invalid json syntax in template string (language=json)
+example.py:4:47: error[embedded-parse-error] Expected a JSON value. (language=json)
 1 files scanned, 1 templates scanned, 1 diagnostics, 0 failed files
 ```
 
@@ -166,7 +166,7 @@ Exit codes:
 
 ### Format
 
-Rewrite supported template literals (HTML, T-HTML, JSON, YAML, TOML) in place:
+Rewrite supported template literals (HTML, T-HTML, TDOM, JSON, YAML, TOML) in place:
 
 ```bash
 # Format a single file
@@ -284,7 +284,7 @@ ignore-file = ".t-linterignore"
 
 | Key | Description |
 |-----|-------------|
-| `line-length` | Formatter print width (applies to HTML and T-HTML only; JSON, YAML, and TOML use fixed formatting rules) |
+| `line-length` | Formatter print width (applies to HTML, T-HTML, and TDOM only; JSON, YAML, and TOML use fixed formatting rules) |
 | `exclude` | Override the built-in default excludes |
 | `extend-exclude` | Add more exclude patterns on top of the defaults |
 | `ignore-file` | Path to a gitignore-style ignore file, relative to the project root |
@@ -387,10 +387,9 @@ For `html`, `<title>{value}</title>` is allowed and treated as escaped text.
 
 ### Planned Features
 - ✅ **Language Server Protocol (LSP)** - Fully implemented
-- ✅ **Syntax Highlighting** - Supports HTML, T-HTML, SQL, JavaScript, CSS, JSON, YAML, TOML
+- ✅ **Syntax Highlighting** - Supports HTML, T-HTML, TDOM, SQL, JavaScript, CSS, JSON, YAML, TOML
 - ✅ **Type Alias Support** - Recognizes `type html = Annotated[Template, "html"]`
 - ✅ **Linting (`check` command)** - Validate template strings for syntax errors
-- ✅ **Formatting (`format` command)** - Canonical formatting for HTML, T-HTML, JSON, YAML, TOML
+- ✅ **Formatting (`format` command)** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML
 - 🚧 **Statistics (`stats` command)** - Analyze template string usage across codebases
 - 📋 **Cross-file Type Resolution** - Track type aliases across module boundaries
-- 📋 **Auto-completion** - Context-aware completions within template strings

@@ -3,7 +3,7 @@
 ## Completed
 
 - **Language Server Protocol (LSP)** — Fully implemented
-- **Syntax Highlighting** — Supports HTML, T-HTML, SQL, JavaScript, CSS, JSON, YAML, TOML
+- **Syntax Highlighting** — Supports HTML, T-HTML, TDOM, SQL, JavaScript, CSS, JSON, YAML, TOML
 - **Type Alias Support** — Recognizes `type html = Annotated[Template, "html"]`
 - **Linting (`check` command)** — Validate template strings for syntax errors
 
@@ -14,4 +14,3 @@
 ## Planned
 
 - **Cross-file Type Resolution** — Track type aliases across module boundaries
-- **Auto-completion** — Context-aware completions within template strings

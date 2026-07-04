@@ -46,7 +46,7 @@ The LSP server provides:
 | JavaScript | ✅ | — | ✅ |
 | SQL | ✅ | — | ✅ |
 
-For HTML, T-HTML, JSON, YAML, and TOML templates:
+For HTML, T-HTML, TDOM, JSON, YAML, and TOML templates:
 
 - Diagnostics are published from the dedicated Rust backends for strict validation
 - Formatting requests and code actions rewrite the whole template literal using the backend formatter
@@ -151,7 +151,7 @@ If both CLI flags and `initializationOptions.ruffPipeline` are provided, the ini
 
 ### Line Length Resolution
 
-For HTML and T-HTML formatting, line length is resolved in this order:
+For HTML, T-HTML, and TDOM formatting, line length is resolved in this order:
 
 1. `textDocument/formatting` or `textDocument/rangeFormatting` custom option `printWidth`
 2. custom option `lineLength`

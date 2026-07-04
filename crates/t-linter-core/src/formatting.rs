@@ -3,6 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tstring_syntax::BackendError;
 
+use crate::backend::TemplateBackend;
 use crate::{Location, TemplateStringInfo, TemplateStringParser};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,24 +191,8 @@ fn format_template_edit(
     let input = template.to_template_input();
     let line_length = options.line_length.max(1);
 
-    let formatted = match language.as_str() {
-        "html" => tstring_html::format_template_with_options(
-            &input,
-            &tstring_html::FormatOptions { line_length },
-        ),
-        "thtml" => tstring_thtml::format_template_with_options(
-            &input,
-            &tstring_html::FormatOptions { line_length },
-        ),
-        "tdom" => tstring_tdom::format_template_with_options(
-            &input,
-            &tstring_tdom::FormatOptions { line_length },
-        ),
-        "json" => tstring_json::format_template(&input),
-        "yaml" | "yml" => tstring_yaml::format_template(&input),
-        "toml" => tstring_toml::format_template(&input),
-        _ => return None,
-    };
+    let backend = TemplateBackend::for_language(&language)?;
+    let formatted = backend.format_template(&input, template.profile.as_deref(), line_length);
 
     Some(
         formatted
@@ -235,7 +220,13 @@ fn ranges_overlap(left: &Location, right: &Location) -> bool {
     let right_start = (right.start_line, right.start_column);
     let right_end = (right.end_line, right.end_column);
 
-    left_start <= right_end && right_start <= left_end
+    // A zero-width `right` range acts as a cursor and uses the template's
+    // inclusive start / exclusive end boundary.
+    if right_start == right_end {
+        left_start <= right_start && right_start < left_end
+    } else {
+        left_start < right_end && right_start < left_end
+    }
 }
 
 fn line_start_offsets(source: &[u8]) -> Vec<usize> {
@@ -332,6 +323,54 @@ config: Annotated[Template, "json"] = t'{"name": {name}}'
 
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].replacement, "t'{\"name\": {name}}'");
+    }
+
+    #[test]
+    fn range_formatting_uses_half_open_boundaries() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+config: Annotated[Template, "json"] = t'{"name": {name}}'
+"#;
+
+        let edits = format_document_range(
+            source,
+            &Location {
+                start_line: 5,
+                start_column: 58,
+                end_line: 5,
+                end_column: 60,
+            },
+        )
+        .expect("expected range format success");
+
+        assert!(edits.is_empty());
+    }
+
+    #[test]
+    fn ranges_overlap_includes_zero_width_cursor_at_start() {
+        let template = Location {
+            start_line: 1,
+            start_column: 5,
+            end_line: 1,
+            end_column: 10,
+        };
+        let start_cursor = Location {
+            start_line: 1,
+            start_column: 5,
+            end_line: 1,
+            end_column: 5,
+        };
+        let end_cursor = Location {
+            start_line: 1,
+            start_column: 10,
+            end_line: 1,
+            end_column: 10,
+        };
+
+        assert!(ranges_overlap(&template, &start_cursor));
+        assert!(!ranges_overlap(&template, &end_cursor));
     }
 
     #[test]

@@ -1,6 +1,8 @@
+use std::str::FromStr;
 use tstring_html as backend_html;
 use tstring_json as backend_json;
-use tstring_syntax::{BackendResult, InterpolationTypeRequirement, TemplateInput};
+
+use tstring_syntax::{BackendError, BackendResult, InterpolationTypeRequirement, TemplateInput};
 use tstring_tdom as backend_tdom;
 use tstring_thtml as backend_thtml;
 use tstring_toml as backend_toml;
@@ -31,26 +33,134 @@ impl TemplateBackend {
         }
     }
 
-    pub(crate) fn check_template(self, input: &TemplateInput) -> BackendResult<()> {
-        match self {
-            Self::Html => backend_html::check_template(input),
-            Self::Thtml => backend_thtml::check_template(input),
-            Self::Tdom => backend_tdom::check_template(input),
-            Self::Json => backend_json::check_template(input),
-            Self::Yaml => backend_yaml::check_template(input),
-            Self::Toml => backend_toml::check_template(input),
+    pub(crate) fn check_template(
+        self,
+        input: &TemplateInput,
+        profile: Option<&str>,
+    ) -> BackendResult<()> {
+        match (self, profile) {
+            (Self::Html, None) => backend_html::check_template(input),
+            (Self::Thtml, None) => backend_thtml::check_template(input),
+            (Self::Tdom, None) => backend_tdom::check_template(input),
+            (Self::Json, None) => backend_json::check_template(input),
+            (Self::Yaml, None) => backend_yaml::check_template(input),
+            (Self::Toml, None) => backend_toml::check_template(input),
+            (Self::Json, Some(profile)) => backend_json::check_template_with_profile(
+                input,
+                parse_profile::<backend_json::JsonProfile>(profile)?,
+            ),
+            (Self::Yaml, Some(profile)) => backend_yaml::check_template_with_profile(
+                input,
+                parse_profile::<backend_yaml::YamlProfile>(profile)?,
+            ),
+            (Self::Toml, Some(profile)) => backend_toml::check_template_with_profile(
+                input,
+                parse_profile::<backend_toml::TomlProfile>(profile)?,
+            ),
+            (backend @ (Self::Html | Self::Thtml | Self::Tdom), Some(profile)) => {
+                Err(unsupported_profile_error(backend, profile))
+            }
         }
     }
 
     pub(crate) fn interpolation_type_requirements(
         self,
         input: &TemplateInput,
+        profile: Option<&str>,
     ) -> BackendResult<Vec<InterpolationTypeRequirement>> {
+        match (self, profile) {
+            (Self::Json, None) => backend_json::interpolation_type_requirements(input),
+            (Self::Yaml, None) => backend_yaml::interpolation_type_requirements(input),
+            (Self::Toml, None) => backend_toml::interpolation_type_requirements(input),
+            (Self::Json, Some(profile)) => {
+                backend_json::interpolation_type_requirements_with_profile(
+                    input,
+                    parse_profile::<backend_json::JsonProfile>(profile)?,
+                )
+            }
+            (Self::Yaml, Some(profile)) => {
+                backend_yaml::interpolation_type_requirements_with_profile(
+                    input,
+                    parse_profile::<backend_yaml::YamlProfile>(profile)?,
+                )
+            }
+            (Self::Toml, Some(profile)) => {
+                backend_toml::interpolation_type_requirements_with_profile(
+                    input,
+                    parse_profile::<backend_toml::TomlProfile>(profile)?,
+                )
+            }
+            (Self::Html | Self::Thtml | Self::Tdom, None) => Ok(Vec::new()),
+            (backend @ (Self::Html | Self::Thtml | Self::Tdom), Some(profile)) => {
+                Err(unsupported_profile_error(backend, profile))
+            }
+        }
+    }
+
+    pub(crate) fn format_template(
+        self,
+        input: &TemplateInput,
+        profile: Option<&str>,
+        line_length: usize,
+    ) -> BackendResult<String> {
+        match (self, profile) {
+            (Self::Html, None) => backend_html::format_template_with_options(
+                input,
+                &backend_html::FormatOptions { line_length },
+            ),
+            (Self::Thtml, None) => backend_thtml::format_template_with_options(
+                input,
+                &backend_html::FormatOptions { line_length },
+            ),
+            (Self::Tdom, None) => backend_tdom::format_template_with_options(
+                input,
+                &backend_tdom::FormatOptions { line_length },
+            ),
+            (Self::Json, None) => backend_json::format_template(input),
+            (Self::Yaml, None) => backend_yaml::format_template(input),
+            (Self::Toml, None) => backend_toml::format_template(input),
+            (Self::Json, Some(profile)) => backend_json::format_template_with_profile(
+                input,
+                parse_profile::<backend_json::JsonProfile>(profile)?,
+            ),
+            (Self::Yaml, Some(profile)) => backend_yaml::format_template_with_profile(
+                input,
+                parse_profile::<backend_yaml::YamlProfile>(profile)?,
+            ),
+            (Self::Toml, Some(profile)) => backend_toml::format_template_with_profile(
+                input,
+                parse_profile::<backend_toml::TomlProfile>(profile)?,
+            ),
+            (backend @ (Self::Html | Self::Thtml | Self::Tdom), Some(profile)) => {
+                Err(unsupported_profile_error(backend, profile))
+            }
+        }
+    }
+}
+
+fn parse_profile<T>(profile: &str) -> BackendResult<T>
+where
+    T: FromStr<Err = String>,
+{
+    profile.parse().map_err(BackendError::semantic)
+}
+
+fn unsupported_profile_error(backend: TemplateBackend, profile: &str) -> BackendError {
+    BackendError::semantic(format!(
+        "Profiles are not supported for {} templates: {profile:?}.",
+        backend.name()
+    ))
+}
+
+impl TemplateBackend {
+    fn name(self) -> &'static str {
         match self {
-            Self::Json => backend_json::interpolation_type_requirements(input),
-            Self::Yaml => backend_yaml::interpolation_type_requirements(input),
-            Self::Toml => backend_toml::interpolation_type_requirements(input),
-            Self::Html | Self::Thtml | Self::Tdom => Ok(Vec::new()),
+            Self::Html => "html",
+            Self::Thtml => "thtml",
+            Self::Tdom => "tdom",
+            Self::Json => "json",
+            Self::Yaml => "yaml",
+            Self::Toml => "toml",
         }
     }
 }
@@ -83,7 +193,7 @@ mod tests {
         ]);
 
         let requirements = TemplateBackend::Json
-            .interpolation_type_requirements(&input)
+            .interpolation_type_requirements(&input, None)
             .expect("requirements");
 
         assert_eq!(requirements.len(), 3);
@@ -104,7 +214,7 @@ mod tests {
         ]);
 
         let requirements = TemplateBackend::Yaml
-            .interpolation_type_requirements(&input)
+            .interpolation_type_requirements(&input, None)
             .expect("requirements");
 
         assert_eq!(requirements.len(), 3);
@@ -125,7 +235,7 @@ mod tests {
         ]);
 
         let requirements = TemplateBackend::Toml
-            .interpolation_type_requirements(&input)
+            .interpolation_type_requirements(&input, None)
             .expect("requirements");
 
         assert_eq!(requirements.len(), 3);
@@ -160,7 +270,7 @@ mod tests {
 
         assert!(
             TemplateBackend::Html
-                .interpolation_type_requirements(&input)
+                .interpolation_type_requirements(&input, None)
                 .expect("requirements")
                 .is_empty()
         );

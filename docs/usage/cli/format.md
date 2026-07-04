@@ -59,7 +59,7 @@ directory.
 
 ## Line Length
 
-HTML and T-HTML formatting uses the following precedence. JSON, YAML, and TOML
+HTML, T-HTML, and TDOM formatting uses the following precedence. JSON, YAML, and TOML
 formatters ignore `line-length`.
 
 1. `--line-length`

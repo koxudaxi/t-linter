@@ -17,7 +17,7 @@ ignore-file = ".t-linterignore"
 
 | Key | Description |
 |-----|-------------|
-| `line-length` | Formatter print width for HTML and T-HTML templates only |
+| `line-length` | Formatter print width for HTML, T-HTML, and TDOM templates only |
 | `exclude` | Override the built-in default excludes |
 | `extend-exclude` | Add more exclude patterns on top of the defaults |
 | `ignore-file` | Path to a gitignore-style ignore file, relative to the project root |
