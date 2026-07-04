@@ -1029,28 +1029,62 @@ fn lint_tdom_component_signature(
     }
 
     for (prop_name, resolved_prop) in &resolved_props {
-        let Some(parameter) = signature
+        if prop_name == "children" {
+            diagnostics.push(make_component_diagnostic(
+                path,
+                template,
+                "tdom",
+                RULE_COMPONENT_UNEXPECTED_PROP,
+                format!(
+                    "Component '{}' cannot receive prop 'children' because tdom reserves it for component children.",
+                    component.start_tag.expression
+                ),
+                resolved_prop
+                    .span
+                    .as_ref()
+                    .or(component.start_tag.span.as_ref())
+                    .or(component.span.as_ref()),
+            ));
+            continue;
+        }
+
+        match signature
             .parameters
             .iter()
             .find(|parameter| parameter.name == *prop_name && parameter.allows_keyword)
-        else {
-            // Match tdom runtime semantics: unknown attrs are ignored rather than
-            // reported as unexpected props.
-            continue;
-        };
-
-        if let Some(diagnostic) =
-            lint_tdom_component_attribute_type(path, template, component, resolved_prop, parameter)
         {
-            diagnostics.push(diagnostic);
+            Some(parameter) => {
+                if let Some(diagnostic) = lint_tdom_component_attribute_type(
+                    path,
+                    template,
+                    component,
+                    resolved_prop,
+                    parameter,
+                ) {
+                    diagnostics.push(diagnostic);
+                }
+            }
+            None if signature.accepts_kwargs => {}
+            None => diagnostics.push(make_component_diagnostic(
+                path,
+                template,
+                "tdom",
+                RULE_COMPONENT_UNEXPECTED_PROP,
+                format!(
+                    "Component '{}' does not accept prop '{}'.",
+                    component.start_tag.expression, prop_name
+                ),
+                resolved_prop
+                    .span
+                    .as_ref()
+                    .or(component.start_tag.span.as_ref())
+                    .or(component.span.as_ref()),
+            )),
         }
     }
 
     for parameter in &signature.parameters {
-        if !parameter.required
-            || parameter.name == "children"
-            || parameter.template_language.is_some()
-        {
+        if !parameter.required || parameter.name == "children" {
             continue;
         }
         if resolved_props.contains_key(&parameter.name) {

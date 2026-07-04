@@ -2025,6 +2025,70 @@ page = tdom.html(t'<{Card} title = {title}><span class = "badge" >{status}</span
 }
 
 #[test]
+fn format_rewrites_tdom_template_inferred_via_direct_svg_call() {
+    let dir = test_dir("tdom-svg-format");
+    let path = dir.join("example.py");
+    write_file(
+        &path,
+        r#"import tdom
+
+icon = tdom.svg(t'<clipPath id = "mask" ><rect width = {size} /></clipPath>')
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t'<clipPath id="mask"><rect width={size}></rect></clipPath>'"#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_preserves_tdom_svg_namespace_inside_html_call() {
+    let dir = test_dir("tdom-html-svg-namespace-format");
+    let path = dir.join("example.py");
+    write_file(
+        &path,
+        r#"import tdom
+
+icon = tdom.html(t'<svg viewBox = "0 0 10 10" ><clipPath id = "mask" ><rect width = {size} /></clipPath></svg>')
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"<svg viewBox="0 0 10 10">"#));
+    assert!(content.contains(r#"<clipPath id="mask"><rect width={size}></rect></clipPath>"#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn format_uses_html_names_for_tdom_html_outside_svg_namespace() {
+    let dir = test_dir("tdom-html-name-format");
+    let path = dir.join("example.py");
+    write_file(
+        &path,
+        r#"import tdom
+
+page = tdom.html(t'<clipPath viewBox = "0 0 1 1" ></clipPath>')
+"#,
+    );
+
+    let output = run_t_linter(&dir, &["format", "example.py"], None);
+    let content = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(content.contains(r#"t'<clippath viewbox="0 0 1 1"></clippath>'"#));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn format_rewrites_tdom_template_inferred_via_reexported_html_call() {
     let dir = test_dir("tdom-reexported-format");
     let path = dir.join("example.py");
