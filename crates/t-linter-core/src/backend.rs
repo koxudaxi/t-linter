@@ -42,6 +42,9 @@ impl TemplateBackend {
             (Self::Html, None) => backend_html::check_template(input),
             (Self::Thtml, None) => backend_thtml::check_template(input),
             (Self::Tdom, None) => backend_tdom::check_template(input),
+            (Self::Tdom, Some(profile)) if profile.eq_ignore_ascii_case("svg") => {
+                backend_tdom::check_template(input)
+            }
             (Self::Json, None) => backend_json::check_template(input),
             (Self::Yaml, None) => backend_yaml::check_template(input),
             (Self::Toml, None) => backend_toml::check_template(input),
@@ -91,6 +94,7 @@ impl TemplateBackend {
                 )
             }
             (Self::Html | Self::Thtml | Self::Tdom, None) => Ok(Vec::new()),
+            (Self::Tdom, Some(profile)) if profile.eq_ignore_ascii_case("svg") => Ok(Vec::new()),
             (backend @ (Self::Html | Self::Thtml | Self::Tdom), Some(profile)) => {
                 Err(unsupported_profile_error(backend, profile))
             }
@@ -116,6 +120,12 @@ impl TemplateBackend {
                 input,
                 &backend_tdom::FormatOptions { line_length },
             ),
+            (Self::Tdom, Some(profile)) if profile.eq_ignore_ascii_case("svg") => {
+                backend_tdom::format_template_as_svg_with_options(
+                    input,
+                    &backend_tdom::FormatOptions { line_length },
+                )
+            }
             (Self::Json, None) => backend_json::format_template(input),
             (Self::Yaml, None) => backend_yaml::format_template(input),
             (Self::Toml, None) => backend_toml::format_template(input),

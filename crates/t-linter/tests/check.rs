@@ -1891,9 +1891,10 @@ fn check_reports_tdom_missing_required_props_via_direct_html_call() {
     let dir = test_dir("tdom-missing-prop");
     write_file(
         &dir.join("broken.py"),
-        r#"from tdom import html
+        r#"from string.templatelib import Template
+from tdom import html
 
-def Button(*, label: str, disabled: bool = False, children: tuple[object, ...] = ()) -> object:
+def Button(*, label: str, disabled: bool = False, children: Template = t"") -> object:
     return None
 
 page = html(t"<{Button} disabled />")
@@ -1919,13 +1920,47 @@ page = html(t"<{Button} disabled />")
 }
 
 #[test]
-fn check_ignores_unknown_tdom_props() {
+fn check_reports_unknown_tdom_props_without_kwargs() {
     let dir = test_dir("tdom-unknown-props");
     write_file(
-        &dir.join("ok.py"),
-        r#"from tdom import html
+        &dir.join("broken.py"),
+        r#"from string.templatelib import Template
+from tdom import html
 
-def Button(*, label: str, children: tuple[object, ...] = ()) -> object:
+def Button(*, label: str, children: Template = t"") -> object:
+    return None
+
+page = html(t"<{Button} label='Save' tone='info' />")
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "tdom");
+    assert_eq!(json["diagnostics"][0]["rule"], "component-unexpected-prop");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not accept prop 'tone'")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_allows_unknown_tdom_props_with_kwargs() {
+    let dir = test_dir("tdom-kwargs-props");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from string.templatelib import Template
+from tdom import html
+
+def Button(*, label: str, children: Template = t"", **attrs: object) -> object:
     return None
 
 page = html(t"<{Button} label='Save' tone='info' />")
@@ -1943,6 +1978,242 @@ page = html(t"<{Button} label='Save' tone='info' />")
 }
 
 #[test]
+fn check_rejects_tdom_children_attribute() {
+    let dir = test_dir("tdom-children-attribute");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from string.templatelib import Template
+from tdom import html
+
+def Panel(*, children: Template = t"", **attrs: object) -> object:
+    return None
+
+page = html(t"<{Panel} children='manual'>Body</{Panel}>")
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "tdom");
+    assert_eq!(json["diagnostics"][0]["rule"], "component-unexpected-prop");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("reserves it for component children")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_tdom_dataclass_missing_required_props() {
+    let dir = test_dir("tdom-dataclass-missing-prop");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from dataclasses import dataclass
+from string.templatelib import Template
+from typing_extensions import ClassVar
+from tdom import html
+
+@dataclass
+class Card:
+    title: str
+    variant: str = "info"
+    component_type: ClassVar[str] = "card"
+    children: Template = t""
+
+page = html(t"<{Card} variant='success' />")
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "tdom");
+    assert_eq!(json["diagnostics"][0]["rule"], "component-missing-prop");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing required prop 'title'")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_ignores_tdom_dataclass_fields_when_init_is_disabled() {
+    let dir = test_dir("tdom-dataclass-init-false");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from dataclasses import dataclass
+from tdom import html
+
+@dataclass(init=False)
+class Card:
+    title: str
+
+page = html(t"<{Card} />")
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_skips_tdom_dataclass_keyword_only_marker() {
+    let dir = test_dir("tdom-dataclass-kw-only");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from dataclasses import KW_ONLY, dataclass
+from string.templatelib import Template
+from tdom import html
+
+@dataclass
+class Card:
+    title: str
+    _: KW_ONLY
+    tone: str
+    children: Template = t""
+
+page = html(t"<{Card} title='Hello' />")
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "tdom");
+    assert_eq!(json["diagnostics"][0]["rule"], "component-missing-prop");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing required prop 'tone'")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_uses_tdom_dataclass_init_var_inner_type() {
+    let dir = test_dir("tdom-dataclass-init-var");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from dataclasses import InitVar, dataclass
+from tdom import html
+
+@dataclass
+class Counter:
+    count: InitVar[int]
+
+page = html(t"<{Counter} count='many' />")
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "tdom");
+    assert_eq!(json["diagnostics"][0]["rule"], "component-prop-type-error");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("count")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_allows_tdom_dataclass_defaulted_fields() {
+    let dir = test_dir("tdom-dataclass-defaulted-fields");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from dataclasses import dataclass as component, field
+from string.templatelib import Template
+from tdom import html
+
+@component(frozen=True)
+class Card:
+    title: str
+    variant: str = field(default_factory=str)
+    internal_id: str = field(init=False)
+    children: Template = t""
+
+page = html(t"<{Card} title='Hello' />")
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_tdom_props_via_reexported_dataclass_signature() {
+    let dir = test_dir("tdom-reexported-dataclass");
+    write_file(
+        &dir.join("widgets.py"),
+        r#"from dataclasses import dataclass
+from string.templatelib import Template
+
+@dataclass
+class Card:
+    title: str
+    children: Template = t""
+"#,
+    );
+    write_file(&dir.join("ui.py"), r#"from widgets import Card as Panel"#);
+    write_file(
+        &dir.join("broken.py"),
+        r#"from tdom import html
+from ui import Panel
+
+page = html(t"<{Panel} />")
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "tdom");
+    assert_eq!(json["diagnostics"][0]["rule"], "component-missing-prop");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_supports_explicit_tdom_annotations() {
     let dir = test_dir("tdom-annotated");
     write_file(
@@ -1950,10 +2221,36 @@ fn check_supports_explicit_tdom_annotations() {
         r#"from typing import Annotated
 from string.templatelib import Template
 
-def Button(*, label: str, children: tuple[object, ...] = ()) -> object:
+def Button(*, label: str, children: Template = t"") -> object:
     return None
 
 template: Annotated[Template, "tdom"] = t"<{Button} />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["language"], "tdom");
+    assert_eq!(json["diagnostics"][0]["rule"], "component-missing-prop");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_infers_tdom_via_svg_call() {
+    let dir = test_dir("tdom-svg-call");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from tdom import svg
+
+def Icon(*, label: str) -> object:
+    return None
+
+icon = svg(t"<{Icon} />")
 "#,
     );
 
@@ -2038,9 +2335,10 @@ fn check_expands_tdom_data_attrs_before_kebab_normalization() {
     let dir = test_dir("tdom-data-attrs");
     write_file(
         &dir.join("broken.py"),
-        r#"from tdom import html
+        r#"from string.templatelib import Template
+from tdom import html
 
-def Badge(*, data_user_id: int, children: tuple[object, ...] = ()) -> object:
+def Badge(*, data_user_id: int, children: Template = t"") -> object:
     return None
 
 attrs = {"user-id": "wrong"}

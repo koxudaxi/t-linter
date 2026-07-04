@@ -763,12 +763,16 @@ impl TemplateStringParser {
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
-            match child.kind() {
+            let Some(definition) = definition_node_for_statement(child) else {
+                continue;
+            };
+            let decorators = decorators_for_statement(child);
+            match definition.kind() {
                 "function_definition" => {
-                    let Some(name_node) = child.child_by_field_name("name") else {
+                    let Some(name_node) = definition.child_by_field_name("name") else {
                         continue;
                     };
-                    let Some(params_node) = child.child_by_field_name("parameters") else {
+                    let Some(params_node) = definition.child_by_field_name("parameters") else {
                         continue;
                     };
                     let name = name_node.utf8_text(source.as_bytes())?.to_string();
@@ -787,18 +791,21 @@ impl TemplateStringParser {
                     }
                 }
                 "class_definition" => {
-                    let Some(name_node) = child.child_by_field_name("name") else {
+                    let Some(name_node) = definition.child_by_field_name("name") else {
                         continue;
                     };
-                    let Some(body_node) = child.child_by_field_name("body") else {
+                    let Some(body_node) = definition.child_by_field_name("body") else {
                         continue;
                     };
                     let name = name_node.utf8_text(source.as_bytes())?.to_string();
+                    let dataclass_generates_init =
+                        dataclass_decorator_generates_init(decorators, source, module_type_data)?;
                     if let Some(signature) = self.extract_class_constructor_languages(
                         body_node,
                         source,
                         module_type_data,
                         module_cache,
+                        dataclass_generates_init,
                     )? && !signature.is_empty()
                     {
                         module_type_data
@@ -820,6 +827,7 @@ impl TemplateStringParser {
         source: &str,
         module_type_data: &ModuleTypeData,
         module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        dataclass_generates_init: bool,
     ) -> Result<Option<CallableSignature>> {
         let mut cursor = body_node.walk();
         for child in body_node.children(&mut cursor) {
@@ -847,7 +855,81 @@ impl TemplateStringParser {
             return Ok(Some(signature));
         }
 
+        if dataclass_generates_init {
+            return self.extract_dataclass_constructor_signature(
+                body_node,
+                source,
+                module_type_data,
+                module_cache,
+            );
+        }
+
         Ok(None)
+    }
+
+    fn extract_dataclass_constructor_signature(
+        &mut self,
+        body_node: Node,
+        source: &str,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+    ) -> Result<Option<CallableSignature>> {
+        let mut signature = CallableSignature::default();
+        let mut cursor = body_node.walk();
+        let mut position = 0;
+        let mut keyword_only = false;
+
+        for statement in body_node.children(&mut cursor) {
+            let Some(assignment) = dataclass_field_assignment_node(statement) else {
+                continue;
+            };
+            let Some(left_node) = assignment.child_by_field_name("left") else {
+                continue;
+            };
+            if left_node.kind() != "identifier" {
+                continue;
+            }
+            let Some(type_node) = assignment.child_by_field_name("type") else {
+                continue;
+            };
+            let type_text = type_node.utf8_text(source.as_bytes())?;
+            let type_expr = parse_type_expr(type_text);
+            let field_type_expr = match dataclass_annotation_kind(&type_expr, module_type_data) {
+                DataclassAnnotationKind::ClassVar => continue,
+                DataclassAnnotationKind::KeywordOnlyMarker => {
+                    keyword_only = true;
+                    continue;
+                }
+                DataclassAnnotationKind::Field(expr) => expr,
+            };
+            let Some(required) =
+                dataclass_field_requiredness(assignment, source, module_type_data)?
+            else {
+                continue;
+            };
+
+            let mut visited = HashSet::new();
+            let type_hints = self.resolve_type_expr(
+                field_type_expr,
+                module_type_data,
+                module_cache,
+                &mut visited,
+            )?;
+            signature.parameters.push(CallableParameter {
+                position,
+                name: left_node.utf8_text(source.as_bytes())?.to_string(),
+                template_language: type_hints.template_language,
+                template_profile: type_hints.template_profile,
+                value_types: type_hints.value_types,
+                accepts_none: type_hints.accepts_none,
+                required,
+                allows_keyword: true,
+                keyword_only,
+            });
+            position += 1;
+        }
+
+        Ok((!signature.is_empty()).then_some(signature))
     }
 
     fn extract_callable_signature(
@@ -1888,25 +1970,20 @@ impl TemplateStringParser {
             return Ok(None);
         };
 
-        Ok(self
-            .resolve_language_from_explicit_callee_target(&target, &mut HashSet::new())?
-            .map(|language| TemplateHint {
-                language,
-                profile: None,
-            }))
+        self.resolve_template_hint_from_explicit_callee_target(&target, &mut HashSet::new())
     }
 
-    fn resolve_language_from_explicit_callee_target(
+    fn resolve_template_hint_from_explicit_callee_target(
         &self,
         target: &str,
         visited: &mut HashSet<String>,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<TemplateHint>> {
         if !visited.insert(target.to_string()) {
             return Ok(None);
         }
 
-        if matches!(target, "tdom.html" | "tdom.processor.html") {
-            return Ok(Some("tdom".to_string()));
+        if let Some(hint) = tdom_template_processor_hint(target) {
+            return Ok(Some(hint));
         }
 
         let Some((module_name, symbol_name)) = target.rsplit_once('.') else {
@@ -1943,7 +2020,7 @@ impl TemplateStringParser {
             return Ok(None);
         };
 
-        self.resolve_language_from_explicit_callee_target(next_target, visited)
+        self.resolve_template_hint_from_explicit_callee_target(next_target, visited)
     }
 
     fn lookup_callable_signatures<'a>(
@@ -2797,6 +2874,239 @@ fn parameter_template_hint(parameter: &CallableParameter) -> Option<TemplateHint
             language: language.clone(),
             profile: parameter.template_profile.clone(),
         })
+}
+
+fn definition_node_for_statement(statement: Node) -> Option<Node> {
+    match statement.kind() {
+        "function_definition" | "class_definition" => Some(statement),
+        "decorated_definition" => {
+            let mut cursor = statement.walk();
+            for child in statement.children(&mut cursor) {
+                if matches!(child.kind(), "function_definition" | "class_definition") {
+                    return Some(child);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn decorators_for_statement(statement: Node) -> Option<Node> {
+    (statement.kind() == "decorated_definition").then_some(statement)
+}
+
+fn dataclass_decorator_generates_init(
+    decorators: Option<Node>,
+    source: &str,
+    module_type_data: &ModuleTypeData,
+) -> Result<bool> {
+    let Some(decorators) = decorators else {
+        return Ok(false);
+    };
+
+    let mut cursor = decorators.walk();
+    for child in decorators.children(&mut cursor) {
+        if child.kind() != "decorator" {
+            continue;
+        }
+        let decorator_text = child.utf8_text(source.as_bytes())?;
+        let target = decorator_callable_target(decorator_text);
+        if qualified_text_resolves_to(target, module_type_data, "dataclasses.dataclass") {
+            return Ok(!decorator_keyword_is_false(decorator_text, "init"));
+        }
+    }
+
+    Ok(false)
+}
+
+fn decorator_callable_target(text: &str) -> &str {
+    let text = text.trim().strip_prefix('@').unwrap_or(text.trim()).trim();
+    text.split_once('(')
+        .map_or(text, |(target, _)| target)
+        .trim()
+}
+
+fn decorator_keyword_is_false(text: &str, keyword: &str) -> bool {
+    let Some(args_text) = decorator_arguments_text(text) else {
+        return false;
+    };
+
+    split_top_level_tokens(args_text, ',')
+        .into_iter()
+        .filter_map(|argument| argument.split_once('='))
+        .any(|(name, value)| name.trim() == keyword && value.trim() == "False")
+}
+
+fn decorator_arguments_text(text: &str) -> Option<&str> {
+    let text = text.trim().strip_prefix('@').unwrap_or(text.trim()).trim();
+    let (_, args_with_suffix) = text.split_once('(')?;
+    args_with_suffix.trim_end().strip_suffix(')').map(str::trim)
+}
+
+fn dataclass_field_assignment_node(statement: Node) -> Option<Node> {
+    match statement.kind() {
+        "assignment" => Some(statement),
+        "expression_statement" => {
+            let mut cursor = statement.walk();
+            for child in statement.children(&mut cursor) {
+                if child.kind() == "assignment" {
+                    return Some(child);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+enum DataclassAnnotationKind<'a> {
+    Field(&'a TypeExpr),
+    ClassVar,
+    KeywordOnlyMarker,
+}
+
+fn dataclass_annotation_kind<'a>(
+    expr: &'a TypeExpr,
+    module_type_data: &ModuleTypeData,
+) -> DataclassAnnotationKind<'a> {
+    match expr {
+        TypeExpr::Name(name)
+            if qualified_name_resolves_to(
+                name,
+                module_type_data,
+                &["KW_ONLY", "dataclasses.KW_ONLY"],
+            ) =>
+        {
+            DataclassAnnotationKind::KeywordOnlyMarker
+        }
+        TypeExpr::Name(name) | TypeExpr::Generic { base: name, .. }
+            if qualified_name_resolves_to(
+                name,
+                module_type_data,
+                &["ClassVar", "typing.ClassVar", "typing_extensions.ClassVar"],
+            ) =>
+        {
+            DataclassAnnotationKind::ClassVar
+        }
+        TypeExpr::Generic { base, args }
+            if qualified_name_resolves_to(
+                base,
+                module_type_data,
+                &["InitVar", "dataclasses.InitVar"],
+            ) =>
+        {
+            DataclassAnnotationKind::Field(args.first().unwrap_or(expr))
+        }
+        _ => DataclassAnnotationKind::Field(expr),
+    }
+}
+
+fn dataclass_field_requiredness(
+    assignment: Node,
+    source: &str,
+    module_type_data: &ModuleTypeData,
+) -> Result<Option<bool>> {
+    let Some(value_node) = assignment.child_by_field_name("right") else {
+        return Ok(Some(true));
+    };
+    if !dataclass_field_value_is_field_call(value_node, source, module_type_data)? {
+        return Ok(Some(false));
+    }
+    if call_keyword_value(value_node, source, "init")?.is_some_and(|value| {
+        value
+            .utf8_text(source.as_bytes())
+            .is_ok_and(|text| text.trim() == "False")
+    }) {
+        return Ok(None);
+    }
+
+    let has_default = dataclass_field_call_supplies_default(value_node, source, module_type_data)?;
+    Ok(Some(!has_default))
+}
+
+fn dataclass_field_value_is_field_call(
+    value_node: Node,
+    source: &str,
+    module_type_data: &ModuleTypeData,
+) -> Result<bool> {
+    if value_node.kind() != "call" {
+        return Ok(false);
+    }
+    let Some(function_node) = value_node.child_by_field_name("function") else {
+        return Ok(false);
+    };
+    Ok(qualified_text_resolves_to(
+        function_node.utf8_text(source.as_bytes())?,
+        module_type_data,
+        "dataclasses.field",
+    ))
+}
+
+fn dataclass_field_call_supplies_default(
+    call_node: Node,
+    source: &str,
+    module_type_data: &ModuleTypeData,
+) -> Result<bool> {
+    for keyword in ["default", "default_factory"] {
+        let Some(value_node) = call_keyword_value(call_node, source, keyword)? else {
+            continue;
+        };
+        if !qualified_text_resolves_to(
+            value_node.utf8_text(source.as_bytes())?,
+            module_type_data,
+            "dataclasses.MISSING",
+        ) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn call_keyword_value<'tree>(
+    call_node: Node<'tree>,
+    source: &'tree str,
+    keyword: &str,
+) -> Result<Option<Node<'tree>>> {
+    let Some(arguments) = call_node.child_by_field_name("arguments") else {
+        return Ok(None);
+    };
+    for argument in call_arguments(arguments, source)? {
+        if argument.keyword == Some(keyword) {
+            return Ok(Some(argument.value));
+        }
+    }
+    Ok(None)
+}
+
+fn qualified_name_resolves_to(
+    name: &QualifiedName,
+    module_type_data: &ModuleTypeData,
+    targets: &[&str],
+) -> bool {
+    let raw = name.as_string();
+    if targets.contains(&raw.as_str()) {
+        return true;
+    }
+    expand_qualified_name(name, &module_type_data.imports)
+        .is_some_and(|expanded| targets.contains(&expanded.as_str()))
+}
+
+fn qualified_text_resolves_to(
+    target: &str,
+    module_type_data: &ModuleTypeData,
+    expected: &str,
+) -> bool {
+    let target = target.trim();
+    if target == expected {
+        return true;
+    }
+    let Some(name) = parse_qualified_name(target) else {
+        return false;
+    };
+    expand_qualified_name(&name, &module_type_data.imports)
+        .is_some_and(|expanded| expanded == expected)
 }
 
 fn template_profile_metadata(arg: &TypeExpr) -> Option<String> {
@@ -4455,11 +4765,27 @@ fn should_resolve_imported_signatures(import_path: &str) -> bool {
             | "templatelib.Template"
             | "tdom"
             | "tdom.html"
+            | "tdom.svg"
             | "tdom.processor"
             | "tdom.processor.html"
+            | "tdom.processor.svg"
             | "typing.Annotated"
             | "typing_extensions.Annotated"
     )
+}
+
+fn tdom_template_processor_hint(target: &str) -> Option<TemplateHint> {
+    match target {
+        "tdom.html" | "tdom.processor.html" => Some(TemplateHint {
+            language: "tdom".to_string(),
+            profile: None,
+        }),
+        "tdom.svg" | "tdom.processor.svg" => Some(TemplateHint {
+            language: "tdom".to_string(),
+            profile: Some("svg".to_string()),
+        }),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6309,19 +6635,36 @@ page = tdom.html(t"<div>{name}</div>")
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("tdom".to_string()));
+        assert_eq!(templates[0].profile, None);
+    }
+
+    #[test]
+    fn test_tdom_language_is_inferred_from_direct_svg_call() {
+        let source = r#"
+import tdom
+
+icon = tdom.svg(t"<clipPath id='mask'></clipPath>")
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("tdom".to_string()));
+        assert_eq!(templates[0].profile, Some("svg".to_string()));
     }
 
     #[test]
     fn test_tdom_language_is_inferred_from_reexported_module_call() {
         let dir = parser_test_dir("tdom-reexport");
-        write_file(&dir.join("bindings.py"), r#"from tdom import html"#);
+        write_file(&dir.join("bindings.py"), r#"from tdom import svg"#);
         write_file(
             &dir.join("api.py"),
-            r#"from bindings import html as render_html"#,
+            r#"from bindings import svg as render_svg"#,
         );
-        let source = r#"from api import render_html
+        let source = r#"from api import render_svg
 
-page = render_html(t"<div>{name}</div>")
+icon = render_svg(t"<clipPath id='mask'></clipPath>")
 "#;
 
         let mut parser = TemplateStringParser::new().unwrap();
@@ -6331,6 +6674,7 @@ page = render_html(t"<div>{name}</div>")
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("tdom".to_string()));
+        assert_eq!(templates[0].profile, Some("svg".to_string()));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -6358,6 +6702,35 @@ page = render_html(t"<div>{name}</div>")
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("tdom".to_string()));
+        assert_eq!(templates[0].profile, None);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_installed_package_tdom_language_inference_works_for_processor_svg() {
+        let dir = parser_test_dir("tdom-installed-package-svg");
+        let site_packages = project_site_packages(&dir);
+        write_file(&site_packages.join("tdom/__init__.py"), "");
+        write_file(
+            &site_packages.join("tdom/processor.py"),
+            r#"def svg(template):
+    return template
+"#,
+        );
+        let source = r#"from tdom.processor import svg as render_svg
+
+icon = render_svg(t"<clipPath id='mask'></clipPath>")
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("main.py"))
+            .unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("tdom".to_string()));
+        assert_eq!(templates[0].profile, Some("svg".to_string()));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -8307,6 +8680,8 @@ render_data(config)
             "string.templatelib.Template"
         ));
         assert!(!should_resolve_imported_signatures("tdom.html"));
+        assert!(!should_resolve_imported_signatures("tdom.svg"));
+        assert!(!should_resolve_imported_signatures("tdom.processor.svg"));
         assert!(should_resolve_imported_signatures("typed_api.render_yaml"));
     }
 
