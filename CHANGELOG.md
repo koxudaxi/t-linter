@@ -4,6 +4,37 @@ All notable changes to this project are documented in this file.
 This changelog is generated from GitHub Releases and may include manual corrections when release metadata needs adjustment.
 
 ---
+## [0.9.0](https://github.com/koxudaxi/t-linter/releases/tag/0.9.0) - 2026-07-04
+
+## Breaking Changes
+
+### CLI Changes
+* `check` now rejects explicit non-`.py` file operands - Previously, passing a non-`.py` file (e.g., `notes.txt`) to `t-linter check` was silently ignored. It now emits a `file-read-error` diagnostic with message "Explicit file operands must use the .py extension" and exits with code 2. Scripts or CI pipelines that pass non-Python files to `check` will see new failures. (#50)
+
+### Language Detection Changes
+* Diagnostic messages and positions for JSON parse errors changed - Backend error messages are now passed through directly from the upstream parser (e.g., `"Expected a JSON value."` instead of `"Invalid json syntax in template string"`), and column offsets shifted by 1 (e.g., column 46 → 47). Tools that parse diagnostic message text or rely on exact column positions will need updating. (#50)
+* Template-typed required parameters now checked in tdom components - Previously, required parameters with a `template_language` annotation were exempt from the missing-required-prop check in tdom components. Now only `children` is exempt, so required template-typed props (other than `children`) that are missing will produce `component-missing-prop` diagnostics. (#51)
+
+### Default Behavior Changes
+* Process working directory removed from Python module search roots - `python_search_roots()` no longer implicitly includes the process's current working directory. Only `PYTHONPATH`, the explicit `--search-root`, and virtualenv roots are used. Users who relied on CWD-based implicit module resolution for template language inference may see templates that previously had a detected language now treated as untyped. (#50)
+* Range formatting now uses half-open boundary semantics - `ranges_overlap` changed from inclusive (`<=`) to strict half-open (`<`) comparisons. A zero-width cursor at a template's end position no longer triggers formatting for that template, and ranges that merely touch a template boundary without overlapping are no longer considered overlapping. Editor integrations that relied on the old inclusive boundary behavior may see different formatting results at template boundaries. (#50)
+* Dataclass-based tdom components now have signatures analyzed - Python `@dataclass` classes used as tdom components now have their fields analyzed as constructor parameters, producing `component-missing-prop` and `component-prop-type-error` diagnostics. Previously these components had no analyzed signature and no prop diagnostics were emitted. Supports `ClassVar` (excluded), `KW_ONLY`, `InitVar`, `field(init=False)`, and `field(default=...)` semantics. (#51)
+
+### LSP Protocol Changes
+* Unknown tdom component props now reported as diagnostics - Previously, unknown attributes on tdom components were silently ignored to match older tdom runtime semantics. Now, props not in the component signature produce a `component-unexpected-prop` diagnostic unless the component accepts `**kwargs`. Users must add `**kwargs` to component signatures that intentionally accept arbitrary attributes, or suppress the new diagnostics. (#51)
+* `children` prop is now always rejected as a tdom attribute - Passing `children` as an explicit attribute to a tdom component now always produces a `component-unexpected-prop` diagnostic with the message "tdom reserves it for component children", regardless of the component signature. Code that previously set `children` as an attribute must use nested content instead. (#51)
+
+## What's Changed
+* Fix template prefixes and spans by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/49
+* Fix template parsing and LSP sync by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/50
+* Use released tstring backends by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/52
+* Support latest tdom semantics by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/51
+
+
+**Full Changelog**: https://github.com/koxudaxi/t-linter/compare/0.8.1...0.9.0
+
+---
+
 ## [0.8.1](https://github.com/koxudaxi/t-linter/releases/tag/0.8.1) - 2026-07-03
 
 ## What's Changed
