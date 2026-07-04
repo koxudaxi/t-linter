@@ -1669,16 +1669,18 @@ dependencies = [
 
 [[package]]
 name = "tstring-format-doc"
-version = "0.1.10"
-source = "git+https://github.com/koxudaxi/tstring-html.git?rev=9764666adab654a38156a3920ee7fb3c69183f18#9764666adab654a38156a3920ee7fb3c69183f18"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de4352d579143a4ff28e4c2b673f3d6e339a8791c17226cd152d692016faae2c"
 dependencies = [
  "unicode-width",
 ]
 
 [[package]]
 name = "tstring-html"
-version = "0.1.10"
-source = "git+https://github.com/koxudaxi/tstring-html.git?rev=9764666adab654a38156a3920ee7fb3c69183f18#9764666adab654a38156a3920ee7fb3c69183f18"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c38b343a04f3e05eeac51fb342f2f8c3a0695c522f97c95664d115eb40e01997"
 dependencies = [
  "tstring-format-doc",
  "tstring-syntax",
@@ -1705,8 +1707,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-tdom"
-version = "0.1.10"
-source = "git+https://github.com/koxudaxi/tstring-html.git?rev=9764666adab654a38156a3920ee7fb3c69183f18#9764666adab654a38156a3920ee7fb3c69183f18"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4070dab242967736c0bf4670a59030e223070e0364bcdaa9c927e420532719c8"
 dependencies = [
  "tstring-format-doc",
  "tstring-syntax",
@@ -1714,8 +1717,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-thtml"
-version = "0.1.10"
-source = "git+https://github.com/koxudaxi/tstring-html.git?rev=9764666adab654a38156a3920ee7fb3c69183f18#9764666adab654a38156a3920ee7fb3c69183f18"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2aa766706a9658836ce77c2539221b868501fb9495f2d926f72cdcb78521a872"
 dependencies = [
  "tstring-html",
  "tstring-syntax",
