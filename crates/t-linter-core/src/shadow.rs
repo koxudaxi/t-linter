@@ -231,7 +231,8 @@ fn type_requirements_by_template(
 ) -> Vec<TemplateTypeRequirements> {
     templates
         .iter()
-        .map(|template| {
+        .enumerate()
+        .map(|(template_index, template)| {
             let Some(language) = template.language.as_deref() else {
                 return TemplateTypeRequirements::default();
             };
@@ -243,7 +244,12 @@ fn type_requirements_by_template(
                     if profile.is_none_or(|profile| profile.eq_ignore_ascii_case("svg")) =>
                 {
                     requirement_result_or_default(
-                        tdom_interpolation_type_requirements(template, module_context, prefix),
+                        tdom_interpolation_type_requirements(
+                            template,
+                            module_context,
+                            prefix,
+                            template_index,
+                        ),
                         language,
                         template,
                     )
@@ -295,8 +301,9 @@ fn tdom_interpolation_type_requirements(
     template: &TemplateStringInfo,
     module_context: &ModuleContext,
     prefix: &str,
+    template_index: usize,
 ) -> tstring_syntax::BackendResult<TemplateTypeRequirements> {
-    let mut resolver = TdomTypeRequirementResolver::new(prefix);
+    let mut resolver = TdomTypeRequirementResolver::new(prefix, template_index);
     let requirements = backend_tdom::interpolation_type_requirements_with_component_props(
         &template.to_template_input(),
         |context| {
@@ -323,13 +330,15 @@ fn tdom_interpolation_type_requirements(
 
 struct TdomTypeRequirementResolver<'a> {
     prefix: &'a str,
+    template_index: usize,
     import_aliases: BTreeMap<String, String>,
 }
 
 impl<'a> TdomTypeRequirementResolver<'a> {
-    fn new(prefix: &'a str) -> Self {
+    fn new(prefix: &'a str, template_index: usize) -> Self {
         Self {
             prefix,
+            template_index,
             import_aliases: BTreeMap::new(),
         }
     }
@@ -342,7 +351,14 @@ impl<'a> TdomTypeRequirementResolver<'a> {
             .import_aliases
             .get(&module)
             .cloned()
-            .unwrap_or_else(|| format!("{}type_{}", self.prefix, self.import_aliases.len()));
+            .unwrap_or_else(|| {
+                format!(
+                    "{}type_{}_{}",
+                    self.prefix,
+                    self.template_index,
+                    self.import_aliases.len()
+                )
+            });
         let (annotation, uses_import) =
             qualify_imported_type_annotation(&expected.annotation, &alias);
         if uses_import {
@@ -367,14 +383,13 @@ fn qualify_imported_type_annotation(annotation: &str, module_alias: &str) -> (St
     let mut used_import = false;
 
     while index < annotation.len() {
+        if push_python_string_literal_token_if_present(annotation, &mut index, &mut qualified) {
+            continue;
+        }
         let ch = annotation[index..]
             .chars()
             .next()
             .expect("valid char boundary");
-        if matches!(ch, '\'' | '"') {
-            push_python_string_literal_token(annotation, &mut index, &mut qualified, ch);
-            continue;
-        }
         if is_python_identifier_start(ch) {
             let start = index;
             index += ch.len_utf8();
@@ -407,6 +422,39 @@ fn qualify_imported_type_annotation(annotation: &str, module_alias: &str) -> (St
     }
 
     (qualified, used_import)
+}
+
+fn push_python_string_literal_token_if_present(
+    source: &str,
+    index: &mut usize,
+    target: &mut String,
+) -> bool {
+    let Some((prefix_end, quote)) = python_string_literal_prefix(source, *index) else {
+        return false;
+    };
+    target.push_str(&source[*index..prefix_end]);
+    *index = prefix_end;
+    push_python_string_literal_token(source, index, target, quote);
+    true
+}
+
+fn python_string_literal_prefix(source: &str, index: usize) -> Option<(usize, char)> {
+    let mut prefix_end = index;
+    while prefix_end < source.len() {
+        let ch = source[prefix_end..]
+            .chars()
+            .next()
+            .expect("valid char boundary");
+        if !matches!(
+            ch,
+            'r' | 'R' | 'u' | 'U' | 'b' | 'B' | 'f' | 'F' | 't' | 'T'
+        ) {
+            break;
+        }
+        prefix_end += ch.len_utf8();
+    }
+    let ch = source[prefix_end..].chars().next()?;
+    matches!(ch, '\'' | '"').then_some((prefix_end, ch))
 }
 
 fn push_python_string_literal_token(
@@ -892,21 +940,90 @@ def handler(age: int, name: str) -> None:
 
         let _ = fs::remove_dir_all(dir);
 
-        assert!(shadow.text.contains("import components as __tl_type_0"));
-        assert!(shadow.text.contains("__tl_0_1: \"__tl_type_0.User\" = age"));
+        assert!(shadow.text.contains("import components as __tl_type_0_0"));
         assert!(
             shadow
                 .text
-                .contains("__tl_0_2: \"list[__tl_type_0.User]\" = name")
+                .contains("__tl_0_1: \"__tl_type_0_0.User\" = age")
         );
         assert!(
             shadow
                 .text
-                .contains("__tl_0_3: \"__tl_type_0.Literal[\\\"open\\\"]\" = name"),
+                .contains("__tl_0_2: \"list[__tl_type_0_0.User]\" = name")
+        );
+        assert!(
+            shadow
+                .text
+                .contains("__tl_0_3: \"__tl_type_0_0.Literal[\\\"open\\\"]\" = name"),
             "{}",
             shadow.text
         );
         assert_python_parses(&shadow.text);
+    }
+
+    #[test]
+    fn imported_tdom_component_prop_type_aliases_do_not_collide_in_one_statement() {
+        let dir = shadow_test_dir("imported-tdom-component-prop-alias-collision");
+        write_file(
+            &dir.join("card_a.py"),
+            r#"class UserA:
+    name: str
+
+def CardA(*, owner: UserA) -> object:
+    return object()
+"#,
+        );
+        write_file(
+            &dir.join("card_b.py"),
+            r#"class UserB:
+    name: str
+
+def CardB(*, owner: UserB) -> object:
+    return object()
+"#,
+        );
+        let source = r#"from card_a import CardA
+from card_b import CardB
+from tdom import html
+
+def handler(age: int, name: str) -> None:
+    payload = (html(t'<{CardA} owner={age} />'), html(t'<{CardB} owner={name} />'))
+"#;
+        let shadow = synthesize_for_type_check(&dir.join("app.py"), source)
+            .expect("synthesize")
+            .expect("shadow");
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(shadow.text.contains("import card_a as __tl_type_0_0"));
+        assert!(shadow.text.contains("import card_b as __tl_type_1_0"));
+        assert!(
+            shadow
+                .text
+                .contains("__tl_0_1: \"__tl_type_0_0.UserA\" = age")
+        );
+        assert!(
+            shadow
+                .text
+                .contains("__tl_1_1: \"__tl_type_1_0.UserB\" = name"),
+            "{}",
+            shadow.text
+        );
+        assert_python_parses(&shadow.text);
+    }
+
+    #[test]
+    fn imported_tdom_component_prop_annotation_keeps_prefixed_string_literals() {
+        let (annotation, uses_import) = qualify_imported_type_annotation(
+            r#"Literal[r"open", b"closed", u'pending']"#,
+            "__tl_type_0_0",
+        );
+
+        assert!(uses_import);
+        assert_eq!(
+            annotation,
+            r#"__tl_type_0_0.Literal[r"open", b"closed", u'pending']"#
+        );
     }
 
     #[test]
