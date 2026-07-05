@@ -44,6 +44,102 @@ fn ty_command() -> Option<String> {
     }
 }
 
+fn pyright_command() -> Option<String> {
+    if let Ok(command) = std::env::var("PYRIGHT_LANGSERVER_BIN") {
+        return Some(command);
+    }
+
+    command_on_path("pyright-langserver")
+}
+
+fn pyrefly_command() -> Option<String> {
+    if let Ok(command) = std::env::var("PYREFLY_BIN") {
+        return Some(command);
+    }
+
+    command_on_path("pyrefly")
+}
+
+fn command_on_path(command: &str) -> Option<String> {
+    let executable_names = if cfg!(windows) {
+        vec![
+            format!("{command}.cmd"),
+            format!("{command}.exe"),
+            command.to_string(),
+        ]
+    } else {
+        vec![command.to_string()]
+    };
+    for dir in std::env::split_paths(&std::env::var_os("PATH")?) {
+        for executable_name in &executable_names {
+            if dir.join(executable_name).is_file() {
+                return Some(command.to_string());
+            }
+        }
+    }
+    None
+}
+
+struct TypeCheckerCase {
+    name: &'static str,
+    checker: &'static str,
+    command: String,
+    args: Vec<&'static str>,
+}
+
+fn available_type_checkers() -> Vec<TypeCheckerCase> {
+    let mut checkers = Vec::new();
+    if let Some(command) = ty_command() {
+        checkers.push(TypeCheckerCase {
+            name: "ty",
+            checker: "ty",
+            command,
+            args: vec!["server"],
+        });
+    } else {
+        eprintln!("skipped ty: command not found");
+    }
+    if let Some(command) = pyright_command() {
+        checkers.push(TypeCheckerCase {
+            name: "pyright",
+            checker: "pyright",
+            command,
+            args: vec!["--stdio"],
+        });
+    } else {
+        eprintln!("skipped pyright: pyright-langserver not found");
+    }
+    if let Some(command) = pyrefly_command() {
+        checkers.push(TypeCheckerCase {
+            name: "pyrefly",
+            checker: "pyrefly",
+            command,
+            args: vec!["lsp"],
+        });
+    } else {
+        eprintln!("skipped pyrefly: command not found");
+    }
+    checkers
+}
+
+fn write_type_checker_config_files(workspace: &Path, checker: &str) {
+    match checker {
+        "pyright" => write_file(
+            &workspace.join("pyrightconfig.json"),
+            r#"{
+  "pythonVersion": "3.14",
+  "typeCheckingMode": "strict"
+}
+"#,
+        ),
+        "pyrefly" => write_file(
+            &workspace.join("pyrefly.toml"),
+            "python-version = \"3.14\"\n",
+        ),
+        _ => {}
+    }
+}
+
 struct LspClient {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -83,7 +179,7 @@ impl LspClient {
         }
     }
 
-    fn initialize(&mut self, workspace: &Path, ty_command: &str) {
+    fn initialize(&mut self, workspace: &Path, checker: &TypeCheckerCase) {
         let workspace_uri = file_uri(workspace);
         let response = self.request(
             "initialize",
@@ -106,8 +202,9 @@ impl LspClient {
                     "highlightUntyped": true,
                     "typeChecking": {
                         "enabled": true,
-                        "command": ty_command,
-                        "args": ["server"]
+                        "checker": checker.checker,
+                        "command": checker.command.clone(),
+                        "args": checker.args.clone()
                     }
                 },
                 "workspaceFolders": [
@@ -391,58 +488,71 @@ fn diagnostic_with_message<'a>(diagnostics: &'a [&Value], needle: &str) -> &'a V
 }
 
 #[test]
-fn lsp_reports_interpolation_type_error_from_real_ty() {
-    let Some(ty_command) = ty_command() else {
-        eprintln!("skipped: ty not found");
+fn lsp_reports_interpolation_type_error_from_real_type_checkers() {
+    let checkers = available_type_checkers();
+    if checkers.is_empty() {
+        eprintln!("skipped: no supported type checker found");
         return;
-    };
-    let dir = test_dir("diagnostics");
-    let file = dir.join("example.py");
-    let source = type_check_input();
-    write_file(&file, source);
-    let uri = file_uri(&file);
-
-    let mut client = LspClient::start(&dir);
-    client.initialize(&dir, &ty_command);
-    client.did_open(&uri, source);
-
-    let diagnostics = client.wait_for_type_diagnostics(&uri);
-    let type_diagnostics = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic["code"] == TYPE_DIAGNOSTIC_RULE)
-        .collect::<Vec<_>>();
-    assert_eq!(type_diagnostics.len(), 6, "diagnostics: {diagnostics:?}");
-
-    for diagnostic in &type_diagnostics {
-        assert_eq!(diagnostic["source"], "t-linter (ty)");
-        assert_eq!(diagnostic["severity"], 2);
     }
 
-    assert_diagnostic_span(
-        diagnostic_with_message(&type_diagnostics, "json value"),
-        expected_payload_span(source, "payload_json =", "{user}"),
-    );
-    assert_diagnostic_span(
-        diagnostic_with_message(&type_diagnostics, "json string fragment"),
-        expected_payload_span(source, "payload_json =", "\"label\": \"{age}\""),
-    );
-    assert_diagnostic_span(
-        diagnostic_with_message(&type_diagnostics, "yaml mapping key"),
-        expected_payload_span(source, "payload_yaml =", "{user}"),
-    );
-    assert_diagnostic_span(
-        diagnostic_with_message(&type_diagnostics, "yaml scalar fragment"),
-        expected_payload_span(source, "payload_yaml =", "label: \"{age}\""),
-    );
-    assert_diagnostic_span(
-        diagnostic_with_message(&type_diagnostics, "toml key"),
-        expected_payload_span(source, "payload_toml =", "{user}"),
-    );
-    assert_diagnostic_span(
-        diagnostic_with_message(&type_diagnostics, "toml string fragment"),
-        expected_payload_span(source, "payload_toml =", "label = \"{age}\""),
-    );
+    for checker in checkers {
+        let dir = test_dir(checker.name);
+        write_type_checker_config_files(&dir, checker.checker);
+        let file = dir.join("example.py");
+        let source = type_check_input();
+        write_file(&file, source);
+        let uri = file_uri(&file);
 
-    client.shutdown();
-    let _ = fs::remove_dir_all(dir);
+        let mut client = LspClient::start(&dir);
+        client.initialize(&dir, &checker);
+        client.did_open(&uri, source);
+
+        let diagnostics = client.wait_for_type_diagnostics(&uri);
+        let type_diagnostics = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic["code"] == TYPE_DIAGNOSTIC_RULE)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            type_diagnostics.len(),
+            6,
+            "{} diagnostics: {diagnostics:?}",
+            checker.name
+        );
+
+        for diagnostic in &type_diagnostics {
+            assert_eq!(
+                diagnostic["source"],
+                format!("t-linter ({})", checker.checker)
+            );
+            assert_eq!(diagnostic["severity"], 2);
+        }
+
+        assert_diagnostic_span(
+            diagnostic_with_message(&type_diagnostics, "json value"),
+            expected_payload_span(source, "payload_json =", "{user}"),
+        );
+        assert_diagnostic_span(
+            diagnostic_with_message(&type_diagnostics, "json string fragment"),
+            expected_payload_span(source, "payload_json =", "\"label\": \"{age}\""),
+        );
+        assert_diagnostic_span(
+            diagnostic_with_message(&type_diagnostics, "yaml mapping key"),
+            expected_payload_span(source, "payload_yaml =", "{user}"),
+        );
+        assert_diagnostic_span(
+            diagnostic_with_message(&type_diagnostics, "yaml scalar fragment"),
+            expected_payload_span(source, "payload_yaml =", "label: \"{age}\""),
+        );
+        assert_diagnostic_span(
+            diagnostic_with_message(&type_diagnostics, "toml key"),
+            expected_payload_span(source, "payload_toml =", "{user}"),
+        );
+        assert_diagnostic_span(
+            diagnostic_with_message(&type_diagnostics, "toml string fragment"),
+            expected_payload_span(source, "payload_toml =", "label = \"{age}\""),
+        );
+
+        client.shutdown();
+        let _ = fs::remove_dir_all(dir);
+    }
 }

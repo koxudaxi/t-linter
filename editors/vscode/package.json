@@ -94,12 +94,27 @@
         "t-linter.typeChecking.enabled": {
           "type": "boolean",
           "default": false,
-          "description": "Enable JSON, YAML, and TOML interpolation value type checking in typed template strings using ty."
+          "description": "Enable JSON, YAML, and TOML interpolation value type checking in typed template strings using Ty, Pyright, or Pyrefly."
+        },
+        "t-linter.typeChecking.checker": {
+          "type": "string",
+          "enum": [
+            "ty",
+            "pyright",
+            "pyrefly"
+          ],
+          "default": "ty",
+          "description": "Type checker backend for interpolation value type checking."
+        },
+        "t-linter.typeChecking.command": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to the selected type checker executable. Leave empty to let t-linter discover it."
         },
         "t-linter.typeChecking.tyPath": {
           "type": "string",
           "default": "",
-          "description": "Optional path to a ty executable for interpolation value type checking. Leave empty to let t-linter discover ty."
+          "description": "Deprecated optional path to a ty executable. Use t-linter.typeChecking.command instead."
         },
         "t-linter.enableTypeChecking": {
           "type": "boolean",

@@ -269,15 +269,32 @@ async function resolveTypeCheckingOptions(): Promise<Record<string, unknown>> {
         return { enabled: false };
     }
 
+    const checker = config.get<string>('typeChecking.checker', 'ty');
+    const command = config.get<string>('typeChecking.command', '').trim();
     const tyPath = config.get<string>('typeChecking.tyPath', '').trim();
     const options: Record<string, unknown> = {
         enabled: true,
-        args: ['server']
+        checker,
+        args: typeCheckerArgs(checker)
     };
-    if (tyPath) {
+    if (command) {
+        options.command = command;
+    } else if (checker === 'ty' && tyPath) {
         options.command = tyPath;
     }
     return options;
+}
+
+function typeCheckerArgs(checker: string): string[] {
+    switch (checker) {
+        case 'pyright':
+            return ['--stdio'];
+        case 'pyrefly':
+            return ['lsp'];
+        case 'ty':
+        default:
+            return ['server'];
+    }
 }
 
 function collectRuffServerSettings(config: vscode.WorkspaceConfiguration): Record<string, unknown> {
