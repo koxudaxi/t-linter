@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 This changelog is generated from GitHub Releases and may include manual corrections when release metadata needs adjustment.
 
 ---
+## [0.9.1](https://github.com/koxudaxi/t-linter/releases/tag/0.9.1) - 2026-07-05
+
+## What's Changed
+* Support Pyright and Pyrefly type checking by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/53
+* Support tdom prop type checking by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/54
+
+
+**Full Changelog**: https://github.com/koxudaxi/t-linter/compare/0.9.0...0.9.1
+
+---
+
 ## [0.9.0](https://github.com/koxudaxi/t-linter/releases/tag/0.9.0) - 2026-07-04
 
 ## Breaking Changes
