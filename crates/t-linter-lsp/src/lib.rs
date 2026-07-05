@@ -22,8 +22,8 @@ mod type_checker;
 
 use ruff::RuffPipelineClient;
 pub use ruff::RuffPipelineConfig;
-pub use type_checker::TypeCheckerConfig;
 use type_checker::{NegotiatedEncoding, TypeCheckerState, ensure_type_checker};
+pub use type_checker::{TypeCheckerBackend, TypeCheckerConfig};
 
 const TOKEN_TYPE_MACRO: u32 = 14;
 const TOKEN_MODIFIER_NONE: u32 = 0;
@@ -32,6 +32,8 @@ const SOURCE_FIX_ALL_T_LINTER: &str = "source.fixAll.t-linter";
 const REFACTOR_REWRITE_T_LINTER: &str = "refactor.rewrite.t-linter";
 const INTERPOLATION_TYPE_RULE: &str = "interpolation-type-error";
 const TY_INVALID_ASSIGNMENT_RULE: &str = "invalid-assignment";
+const PYRIGHT_ASSIGNMENT_RULE: &str = "reportAssignmentType";
+const PYREFLY_ASSIGNMENT_RULE: &str = "bad-assignment";
 
 pub struct TLinterLanguageServer {
     client: Client,
@@ -197,7 +199,7 @@ impl LanguageServer for TLinterLanguageServer {
             self.client
                 .log_message(
                     MessageType::WARNING,
-                    "t-linter.pyrightPath is deprecated and has no effect; use typeChecking.command with ty",
+                    "t-linter.pyrightPath is deprecated and has no effect; use typeChecking.command",
                 )
                 .await;
         }
@@ -471,7 +473,7 @@ impl LanguageServer for TLinterLanguageServer {
             self.client
                 .log_message(
                     MessageType::WARNING,
-                    format!("Failed to close ty shadow document: {error}"),
+                    format!("Failed to close type checker shadow document: {error}"),
                 )
                 .await;
         }
@@ -1541,7 +1543,13 @@ async fn run_interpolation_type_check(
         .open_or_update_shadow(uri, &shadow.text, version)
         .await?;
     let diagnostics = checker.pull_diagnostics(uri).await?;
-    remap_interpolation_type_diagnostics(shadow, source, &diagnostics, checker.position_encoding())
+    remap_interpolation_type_diagnostics(
+        shadow,
+        source,
+        &diagnostics,
+        checker.position_encoding(),
+        checker.backend(),
+    )
 }
 
 fn remap_interpolation_type_diagnostics(
@@ -1549,15 +1557,22 @@ fn remap_interpolation_type_diagnostics(
     source: &str,
     diagnostics: &[Diagnostic],
     encoding: NegotiatedEncoding,
+    backend: TypeCheckerBackend,
 ) -> Result<Vec<Diagnostic>> {
     let mut candidates = diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic_rule_code(diagnostic) == Some(TY_INVALID_ASSIGNMENT_RULE))
+        .filter(|diagnostic| {
+            diagnostic_rule_code(diagnostic)
+                .is_some_and(|code| is_assignment_diagnostic(backend, code))
+        })
         .filter_map(|diagnostic| {
             match diagnostic_range_to_byte_range(&shadow.text, &diagnostic.range, encoding) {
                 Ok(range) => Some((range, diagnostic)),
                 Err(error) => {
-                    debug!("Skipping ty diagnostic with invalid range: {error}");
+                    debug!(
+                        "Skipping {} diagnostic with invalid range: {error}",
+                        backend.as_str()
+                    );
                     None
                 }
             }
@@ -1578,12 +1593,20 @@ fn remap_interpolation_type_diagnostics(
             range: location_to_lsp_range(&site.original_location, source)?,
             severity: Some(DiagnosticSeverity::WARNING),
             code: Some(NumberOrString::String(INTERPOLATION_TYPE_RULE.to_string())),
-            source: Some("t-linter (ty)".to_string()),
-            message: interpolation_type_message(diagnostic, site),
+            source: Some(format!("t-linter ({})", backend.as_str())),
+            message: interpolation_type_message(diagnostic, site, backend),
             ..Default::default()
         });
     }
     Ok(remapped)
+}
+
+fn is_assignment_diagnostic(backend: TypeCheckerBackend, code: &str) -> bool {
+    match backend {
+        TypeCheckerBackend::Ty => code == TY_INVALID_ASSIGNMENT_RULE,
+        TypeCheckerBackend::Pyright => code == PYRIGHT_ASSIGNMENT_RULE,
+        TypeCheckerBackend::Pyrefly => code == PYREFLY_ASSIGNMENT_RULE,
+    }
 }
 
 fn diagnostic_rule_code(diagnostic: &Diagnostic) -> Option<&str> {
@@ -1596,8 +1619,9 @@ fn diagnostic_rule_code(diagnostic: &Diagnostic) -> Option<&str> {
 fn interpolation_type_message(
     diagnostic: &Diagnostic,
     site: &t_linter_core::ShadowCheckSite,
+    backend: TypeCheckerBackend,
 ) -> String {
-    if let Some(found) = found_type_from_ty_message(&diagnostic.message) {
+    if let Some(found) = found_type_from_message(&diagnostic.message, backend) {
         return format!(
             "Interpolation value of type `{found}` is not assignable to {} (expected: {})",
             site.expected_description,
@@ -1607,15 +1631,42 @@ fn interpolation_type_message(
     diagnostic.message.clone()
 }
 
-fn found_type_from_ty_message(message: &str) -> Option<&str> {
-    for marker in ["found `", "Object of type `"] {
-        let Some(start) = message.find(marker).map(|start| start + marker.len()) else {
-            continue;
-        };
-        let end = message[start..].find('`')?;
-        return Some(&message[start..start + end]);
+fn found_type_from_message(message: &str, backend: TypeCheckerBackend) -> Option<&str> {
+    match backend {
+        TypeCheckerBackend::Ty => {
+            for marker in ["found `", "Object of type `"] {
+                let Some(start) = message.find(marker).map(|start| start + marker.len()) else {
+                    continue;
+                };
+                let end = message[start..].find('`')?;
+                return Some(&message[start..start + end]);
+            }
+            None
+        }
+        TypeCheckerBackend::Pyright => quoted_type_before(message, " is not assignable")
+            .or_else(|| quoted_type_after_marker(message, "Type \""))
+            .or_else(|| quoted_type_after_marker(message, "Expression of type \"")),
+        TypeCheckerBackend::Pyrefly => {
+            let message = message.trim_start();
+            let remainder = message.strip_prefix('`')?;
+            let end = remainder.find('`')?;
+            Some(&remainder[..end])
+        }
     }
-    None
+}
+
+fn quoted_type_before<'a>(message: &'a str, suffix: &str) -> Option<&'a str> {
+    let suffix_start = message.find(suffix)?;
+    let before = &message[..suffix_start];
+    let end = before.rfind('"')?;
+    let start = before[..end].rfind('"')? + 1;
+    Some(&before[start..end])
+}
+
+fn quoted_type_after_marker<'a>(message: &'a str, marker: &str) -> Option<&'a str> {
+    let start = message.find(marker)? + marker.len();
+    let end = message[start..].find('"')?;
+    Some(&message[start..start + end])
 }
 
 fn compact_expected_type(expected_type: &str) -> String {
@@ -2684,6 +2735,7 @@ payload: Annotated[Template, "json"] = t'{{"name": {名前}, "age": {age}}}'
             message: "Type `User` is not assignable; found `User`".to_string(),
             ..Default::default()
         };
+        let matching_range = matching.range;
         let ignored = Diagnostic {
             range: matching.range,
             code: Some(NumberOrString::String("unresolved-reference".to_string())),
@@ -2713,6 +2765,7 @@ payload: Annotated[Template, "json"] = t'{{"name": {名前}, "age": {age}}}'
             source,
             &[ignored, invalid_range, matching],
             NegotiatedEncoding::Utf8,
+            TypeCheckerBackend::Ty,
         )
         .expect("remap");
 
@@ -2731,6 +2784,40 @@ payload: Annotated[Template, "json"] = t'{{"name": {名前}, "age": {age}}}'
             remapped[0].range.end.character - remapped[0].range.start.character,
             2
         );
+
+        let pyright_matching = Diagnostic {
+            range: matching_range,
+            code: Some(NumberOrString::String(PYRIGHT_ASSIGNMENT_RULE.to_string())),
+            message: "Type \"User\" is not assignable to declared type \"str\"".to_string(),
+            ..Default::default()
+        };
+        let pyright = remap_interpolation_type_diagnostics(
+            &shadow,
+            source,
+            &[pyright_matching],
+            NegotiatedEncoding::Utf8,
+            TypeCheckerBackend::Pyright,
+        )
+        .expect("pyright remap");
+        assert_eq!(pyright[0].source.as_deref(), Some("t-linter (pyright)"));
+        assert!(pyright[0].message.contains("`User`"));
+
+        let pyrefly_matching = Diagnostic {
+            range: matching_range,
+            code: Some(NumberOrString::String(PYREFLY_ASSIGNMENT_RULE.to_string())),
+            message: "`User` is not assignable to `str`".to_string(),
+            ..Default::default()
+        };
+        let pyrefly = remap_interpolation_type_diagnostics(
+            &shadow,
+            source,
+            &[pyrefly_matching],
+            NegotiatedEncoding::Utf8,
+            TypeCheckerBackend::Pyrefly,
+        )
+        .expect("pyrefly remap");
+        assert_eq!(pyrefly[0].source.as_deref(), Some("t-linter (pyrefly)"));
+        assert!(pyrefly[0].message.contains("`User`"));
     }
 
     #[test]

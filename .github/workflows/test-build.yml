@@ -14,10 +14,17 @@ jobs:
     - name: Set up uv
       uses: astral-sh/setup-uv@v7
 
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+
     - name: Install LSP e2e tools
       run: |
         uv tool install ruff==0.15.13
         uv tool install ty==0.0.56
+        uv tool install pyrefly==1.1.1
+        npm install -g pyright@1.1.411
         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
     
     - name: Setup Rust

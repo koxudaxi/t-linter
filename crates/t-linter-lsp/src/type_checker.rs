@@ -1,7 +1,7 @@
 use crate::lsp_helpers::{is_uv_pyproject_table, response_id, server_request_id};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
@@ -17,7 +17,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     process::{Child, ChildStdin, Command},
-    sync::{Mutex, OwnedMutexGuard, oneshot},
+    sync::{Mutex, Notify, OwnedMutexGuard, oneshot},
 };
 use tower_lsp::{
     Client,
@@ -25,9 +25,9 @@ use tower_lsp::{
         ClientCapabilities, Diagnostic, DiagnosticClientCapabilities, DocumentDiagnosticParams,
         DocumentDiagnosticReport, DocumentDiagnosticReportResult, GeneralClientCapabilities,
         InitializeParams, MessageType, PartialResultParams, PositionEncodingKind,
-        TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-        TextDocumentItem, Url, VersionedTextDocumentIdentifier, WorkDoneProgressParams,
-        WorkspaceClientCapabilities, WorkspaceFolder,
+        PublishDiagnosticsParams, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
+        TextDocumentIdentifier, TextDocumentItem, Url, VersionedTextDocumentIdentifier,
+        WorkDoneProgressParams, WorkspaceClientCapabilities, WorkspaceFolder,
     },
 };
 use tracing::warn;
@@ -35,14 +35,72 @@ use tracing::warn;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const TESTED_TY_VERSION_RANGE: &str = "0.0.11..=0.0.56";
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TypeCheckerBackend {
+    #[default]
+    Ty,
+    Pyright,
+    Pyrefly,
+}
+
+impl TypeCheckerBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ty => "ty",
+            Self::Pyright => "pyright",
+            Self::Pyrefly => "pyrefly",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Ty => "ty",
+            Self::Pyright => "Pyright",
+            Self::Pyrefly => "Pyrefly",
+        }
+    }
+
+    fn default_command(self) -> &'static str {
+        match self {
+            Self::Ty => "ty",
+            Self::Pyright => "pyright-langserver",
+            Self::Pyrefly => "pyrefly",
+        }
+    }
+
+    fn default_args(self) -> Vec<String> {
+        match self {
+            Self::Ty => vec!["server".to_string()],
+            Self::Pyright => vec!["--stdio".to_string()],
+            Self::Pyrefly => vec!["lsp".to_string()],
+        }
+    }
+
+    fn diagnostic_transport(self) -> DiagnosticTransport {
+        match self {
+            Self::Ty => DiagnosticTransport::Pull,
+            Self::Pyright | Self::Pyrefly => DiagnosticTransport::Publish,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticTransport {
+    Pull,
+    Publish,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TypeCheckerConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
+    pub checker: TypeCheckerBackend,
+    #[serde(default)]
     pub command: Option<String>,
-    #[serde(default = "default_ty_args")]
+    #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub python: Option<String>,
@@ -52,8 +110,9 @@ impl Default for TypeCheckerConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            checker: TypeCheckerBackend::Ty,
             command: None,
-            args: default_ty_args(),
+            args: Vec::new(),
             python: None,
         }
     }
@@ -66,12 +125,12 @@ pub enum NegotiatedEncoding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TyLaunchConfig {
+pub struct TypeCheckerLaunchConfig {
     pub command: String,
     pub args: Vec<String>,
 }
 
-impl TyLaunchConfig {
+impl TypeCheckerLaunchConfig {
     fn new(command: impl Into<String>, args: Vec<String>) -> Self {
         Self {
             command: command.into(),
@@ -84,6 +143,7 @@ impl TyLaunchConfig {
 pub struct TypeCheckerClient {
     inner: Arc<TypeCheckerClientInner>,
     child: Mutex<Child>,
+    backend: TypeCheckerBackend,
     position_encoding: NegotiatedEncoding,
     server_version: Option<String>,
 }
@@ -94,7 +154,14 @@ struct TypeCheckerClientInner {
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>,
     open_documents: Mutex<HashMap<Url, i32>>,
+    published_diagnostics: Mutex<HashMap<Url, PublishedDiagnostics>>,
+    diagnostics_notify: Notify,
     dead: AtomicBool,
+}
+
+#[derive(Debug, Clone)]
+struct PublishedDiagnostics {
+    diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,7 +186,27 @@ impl TypeCheckerClientInner {
         }
     }
 
-    async fn respond_method_not_found(&self, message: &Value) {
+    async fn record_published_diagnostics(&self, params: Value) {
+        let Ok(params) = serde_json::from_value::<PublishDiagnosticsParams>(params) else {
+            tracing::debug!("Ignoring invalid type checker publishDiagnostics payload");
+            return;
+        };
+        self.published_diagnostics.lock().await.insert(
+            params.uri,
+            PublishedDiagnostics {
+                diagnostics: params.diagnostics,
+            },
+        );
+        self.diagnostics_notify.notify_waiters();
+    }
+
+    async fn respond_to_server_request(
+        &self,
+        message: &Value,
+        backend: TypeCheckerBackend,
+        workspace_folders: &[WorkspaceFolder],
+        python: Option<&str>,
+    ) {
         let Some(id) = server_request_id(message) else {
             return;
         };
@@ -127,21 +214,43 @@ impl TypeCheckerClientInner {
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or("<unknown>");
-        let response = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {
-                "code": -32601,
-                "message": format!("Method not found: {method}"),
-            }
-        });
+        let response = match method {
+            "workspace/configuration" => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": workspace_configuration_response(message, backend, python),
+            }),
+            "workspace/workspaceFolders" => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": workspace_folders,
+            }),
+            "client/registerCapability"
+            | "client/unregisterCapability"
+            | "window/workDoneProgress/create"
+            | "workspace/diagnostic/refresh"
+            | "workspace/inlayHint/refresh"
+            | "workspace/semanticTokens/refresh" => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": null,
+            }),
+            _ => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32601,
+                    "message": format!("Method not found: {method}"),
+                }
+            }),
+        };
         let result = {
             let mut stdin = self.stdin.lock().await;
             write_message(&mut *stdin, &response).await
         };
         if let Err(error) = result {
-            tracing::warn!("failed to write ty MethodNotFound response: {error}");
-            self.fail_pending(format!("ty server stdin write failed: {error}"))
+            tracing::warn!("failed to write type checker response: {error}");
+            self.fail_pending(format!("type checker stdin write failed: {error}"))
                 .await;
         }
     }
@@ -174,9 +283,12 @@ impl TypeCheckerState {
 
 impl TypeCheckerClient {
     pub async fn start(config: &TypeCheckerConfig, workspace_roots: &[PathBuf]) -> Result<Self> {
-        let candidates = ty_launch_candidates(config, workspace_roots);
+        let candidates = type_checker_launch_candidates(config, workspace_roots);
         if candidates.is_empty() {
-            return Err(anyhow!("no ty launch candidates available"));
+            return Err(anyhow!(
+                "no {} launch candidates available",
+                config.checker.as_str()
+            ));
         }
 
         let explicit = explicit_command(config).is_some();
@@ -185,7 +297,8 @@ impl TypeCheckerClient {
             match Self::start_with_launch(config, &launch, workspace_roots).await {
                 Ok(client) => {
                     tracing::info!(
-                        "Started ty server with command: {} {}",
+                        "Started {} server with command: {} {}",
+                        config.checker.display_name(),
                         launch.command,
                         launch.args.join(" ")
                     );
@@ -194,7 +307,8 @@ impl TypeCheckerClient {
                 Err(error) if explicit => return Err(error),
                 Err(error) => {
                     warn!(
-                        "failed to start ty candidate {} {}: {error}",
+                        "failed to start {} candidate {} {}: {error}",
+                        config.checker.display_name(),
                         launch.command,
                         launch.args.join(" ")
                     );
@@ -203,12 +317,13 @@ impl TypeCheckerClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| anyhow!("failed to start ty server")))
+        Err(last_error
+            .unwrap_or_else(|| anyhow!("failed to start {} server", config.checker.as_str())))
     }
 
     async fn start_with_launch(
         config: &TypeCheckerConfig,
-        launch: &TyLaunchConfig,
+        launch: &TypeCheckerLaunchConfig,
         workspace_roots: &[PathBuf],
     ) -> Result<Self> {
         let mut child = Command::new(&launch.command)
@@ -218,36 +333,65 @@ impl TypeCheckerClient {
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("failed to spawn ty server: {}", launch.command))?;
+            .with_context(|| {
+                format!(
+                    "failed to spawn {} server: {}",
+                    config.checker.as_str(),
+                    launch.command
+                )
+            })?;
 
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| anyhow!("ty server did not expose stdin"))?;
+            .ok_or_else(|| anyhow!("{} server did not expose stdin", config.checker.as_str()))?;
         let mut stdout = child
             .stdout
             .take()
-            .ok_or_else(|| anyhow!("ty server did not expose stdout"))?;
+            .ok_or_else(|| anyhow!("{} server did not expose stdout", config.checker.as_str()))?;
+        let workspace_folders = workspace_folders(workspace_roots);
         let inner = Arc::new(TypeCheckerClientInner {
             stdin: Mutex::new(stdin),
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             open_documents: Mutex::new(HashMap::new()),
+            published_diagnostics: Mutex::new(HashMap::new()),
+            diagnostics_notify: Notify::new(),
             dead: AtomicBool::new(false),
         });
         let reader_inner = Arc::clone(&inner);
+        let backend = config.checker;
+        let python = config.python.clone();
         tokio::spawn(async move {
             let exit_message = loop {
                 let message = match read_message(&mut stdout).await {
                     Ok(Some(message)) => message,
-                    Ok(None) => break "ty server stdout closed".to_string(),
+                    Ok(None) => break format!("{} server stdout closed", backend.as_str()),
                     Err(error) => {
-                        tracing::warn!("failed to read ty server message: {error}");
-                        break format!("ty server reader failed: {error}");
+                        tracing::warn!(
+                            "failed to read {} server message: {error}",
+                            backend.as_str()
+                        );
+                        break format!("{} server reader failed: {error}", backend.as_str());
                     }
                 };
-                if message.get("method").is_some() {
-                    reader_inner.respond_method_not_found(&message).await;
+                if let Some(method) = message.get("method").and_then(Value::as_str) {
+                    if server_request_id(&message).is_some() {
+                        reader_inner
+                            .respond_to_server_request(
+                                &message,
+                                backend,
+                                &workspace_folders,
+                                python.as_deref(),
+                            )
+                            .await;
+                    } else if method == "textDocument/publishDiagnostics"
+                        && let Some(params) = message.get("params")
+                    {
+                        reader_inner
+                            .record_published_diagnostics(params.clone())
+                            .await;
+                    }
                     continue;
                 }
                 if let Some(id) = response_id(&message) {
@@ -257,7 +401,10 @@ impl TypeCheckerClient {
                             .unwrap_or_else(|error| {
                                 Err(RpcError {
                                     code: -32603,
-                                    message: format!("invalid ty error response: {error}"),
+                                    message: format!(
+                                        "invalid {} error response: {error}",
+                                        backend.as_str()
+                                    ),
                                     data: None,
                                 })
                             })
@@ -275,6 +422,7 @@ impl TypeCheckerClient {
         let mut client = Self {
             inner,
             child: Mutex::new(child),
+            backend: config.checker,
             position_encoding: NegotiatedEncoding::Utf16,
             server_version: None,
         };
@@ -305,6 +453,10 @@ impl TypeCheckerClient {
         enum SyncAction {
             Open(i32),
             Change(i32),
+        }
+
+        if self.backend.diagnostic_transport() == DiagnosticTransport::Publish {
+            self.inner.published_diagnostics.lock().await.remove(uri);
         }
 
         let action = {
@@ -358,6 +510,10 @@ impl TypeCheckerClient {
     }
 
     pub async fn pull_diagnostics(&self, uri: &Url) -> Result<Vec<Diagnostic>> {
+        if self.backend.diagnostic_transport() == DiagnosticTransport::Publish {
+            return self.wait_for_published_diagnostics(uri).await;
+        }
+
         let params = DocumentDiagnosticParams {
             text_document: TextDocumentIdentifier { uri: uri.clone() },
             identifier: None,
@@ -368,9 +524,14 @@ impl TypeCheckerClient {
         let result = self
             .request("textDocument/diagnostic", serde_json::to_value(params)?)
             .await?;
-        match serde_json::from_value::<DocumentDiagnosticReportResult>(result)
-            .context("ty returned invalid diagnostic report")?
-        {
+        match serde_json::from_value::<DocumentDiagnosticReportResult>(result).with_context(
+            || {
+                format!(
+                    "{} returned invalid diagnostic report",
+                    self.backend.as_str()
+                )
+            },
+        )? {
             DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(report)) => {
                 Ok(report.full_document_diagnostic_report.items)
             }
@@ -379,8 +540,26 @@ impl TypeCheckerClient {
         }
     }
 
+    async fn wait_for_published_diagnostics(&self, uri: &Url) -> Result<Vec<Diagnostic>> {
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            loop {
+                let notified = self.inner.diagnostics_notify.notified();
+                if let Some(published) = self.inner.published_diagnostics.lock().await.get(uri) {
+                    return Ok(published.diagnostics.clone());
+                }
+                notified.await;
+            }
+        })
+        .await
+        .with_context(|| format!("{} publishDiagnostics timed out", self.backend.as_str()))?
+    }
+
     pub fn position_encoding(&self) -> NegotiatedEncoding {
         self.position_encoding
+    }
+
+    pub fn backend(&self) -> TypeCheckerBackend {
+        self.backend
     }
 
     pub fn server_version(&self) -> Option<&str> {
@@ -398,16 +577,25 @@ impl TypeCheckerClient {
         match status {
             Ok(None) => true,
             Ok(Some(status)) => {
-                tracing::warn!("ty server exited before reuse: {status}");
+                tracing::warn!(
+                    "{} server exited before reuse: {status}",
+                    self.backend.as_str()
+                );
                 self.inner
-                    .fail_pending(format!("ty server exited: {status}"))
+                    .fail_pending(format!("{} server exited: {status}", self.backend.as_str()))
                     .await;
                 false
             }
             Err(error) => {
-                tracing::warn!("failed to inspect ty server process: {error}");
+                tracing::warn!(
+                    "failed to inspect {} server process: {error}",
+                    self.backend.as_str()
+                );
                 self.inner
-                    .fail_pending(format!("failed to inspect ty server process: {error}"))
+                    .fail_pending(format!(
+                        "failed to inspect {} server process: {error}",
+                        self.backend.as_str()
+                    ))
                     .await;
                 false
             }
@@ -416,6 +604,9 @@ impl TypeCheckerClient {
 
     pub async fn close_shadow(&self, uri: &Url) -> Result<()> {
         let removed = self.inner.open_documents.lock().await.remove(uri).is_some();
+        if self.backend.diagnostic_transport() == DiagnosticTransport::Publish {
+            self.inner.published_diagnostics.lock().await.remove(uri);
+        }
         if !removed {
             return Ok(());
         }
@@ -435,7 +626,9 @@ impl TypeCheckerClient {
     }
 
     async fn terminate(&self) {
-        self.inner.fail_pending("ty server is shutting down").await;
+        self.inner
+            .fail_pending(format!("{} server is shutting down", self.backend.as_str()))
+            .await;
         let mut child = self.child.lock().await;
         match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
             Ok(Ok(_)) => {}
@@ -448,14 +641,14 @@ impl TypeCheckerClient {
 
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
         if self.inner.dead.load(Ordering::SeqCst) {
-            return Err(anyhow!("ty server is not running"));
+            return Err(anyhow!("{} server is not running", self.backend.as_str()));
         }
         let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = oneshot::channel();
         {
             let mut pending = self.inner.pending.lock().await;
             if self.inner.dead.load(Ordering::SeqCst) {
-                return Err(anyhow!("ty server is not running"));
+                return Err(anyhow!("{} server is not running", self.backend.as_str()));
             }
             pending.insert(id, sender);
         }
@@ -471,17 +664,23 @@ impl TypeCheckerClient {
         }
 
         let response = match tokio::time::timeout(REQUEST_TIMEOUT, receiver).await {
-            Ok(response) => {
-                response.with_context(|| format!("ty request {method} response channel closed"))?
-            }
+            Ok(response) => response.with_context(|| {
+                format!(
+                    "{} request {method} response channel closed",
+                    self.backend.as_str()
+                )
+            })?,
             Err(error) => {
                 self.inner.pending.lock().await.remove(&id);
-                return Err(error).with_context(|| format!("ty request {method} timed out"));
+                return Err(error).with_context(|| {
+                    format!("{} request {method} timed out", self.backend.as_str())
+                });
             }
         };
         response.map_err(|error| {
             anyhow!(
-                "ty request {method} failed: {} ({})",
+                "{} request {method} failed: {} ({})",
+                self.backend.as_str(),
                 error.message,
                 error.code
             )
@@ -499,7 +698,7 @@ impl TypeCheckerClient {
 
     async fn write(&self, message: Value) -> Result<()> {
         if self.inner.dead.load(Ordering::SeqCst) {
-            return Err(anyhow!("ty server is not running"));
+            return Err(anyhow!("{} server is not running", self.backend.as_str()));
         }
         let result = {
             let mut stdin = self.inner.stdin.lock().await;
@@ -507,9 +706,14 @@ impl TypeCheckerClient {
         };
         if let Err(error) = result {
             self.inner
-                .fail_pending(format!("ty server stdin write failed: {error}"))
+                .fail_pending(format!(
+                    "{} server stdin write failed: {error}",
+                    self.backend.as_str()
+                ))
                 .await;
-            return Err(error).context("failed to write ty server message");
+            return Err(error).with_context(|| {
+                format!("failed to write {} server message", self.backend.as_str())
+            });
         }
         Ok(())
     }
@@ -598,10 +802,14 @@ pub async fn ensure_type_checker(
 
         match TypeCheckerClient::start(&config, &workspace_roots).await {
             Ok(client) => {
-                let version_warning = client
-                    .server_version()
-                    .filter(|version| !tested_ty_version(version))
-                    .map(ToOwned::to_owned);
+                let version_warning = (client.backend() == TypeCheckerBackend::Ty)
+                    .then(|| {
+                        client
+                            .server_version()
+                            .filter(|version| !tested_ty_version(version))
+                            .map(ToOwned::to_owned)
+                    })
+                    .flatten();
                 let client = Arc::new(client);
                 let store_result = {
                     let mut state = state.lock().await;
@@ -677,10 +885,14 @@ pub async fn ensure_type_checker(
                         MessageType::WARNING,
                         if disabled {
                             format!(
-                                "Disabled t-linter interpolation type check after repeated ty startup failures: {error}"
+                                "Disabled t-linter interpolation type check after repeated {} startup failures: {error}",
+                                config.checker.as_str()
                             )
                         } else {
-                            format!("Failed to start ty for interpolation type check: {error}")
+                            format!(
+                                "Failed to start {} for interpolation type check: {error}",
+                                config.checker.as_str()
+                            )
                         },
                     )
                     .await;
@@ -690,40 +902,54 @@ pub async fn ensure_type_checker(
     }
 }
 
-pub fn ty_launch_candidates(
+pub fn type_checker_launch_candidates(
     config: &TypeCheckerConfig,
     workspace_roots: &[PathBuf],
-) -> Vec<TyLaunchConfig> {
+) -> Vec<TypeCheckerLaunchConfig> {
     if let Some(command) = explicit_command(config) {
-        return vec![TyLaunchConfig::new(command, ty_args(config))];
+        return vec![TypeCheckerLaunchConfig::new(command, checker_args(config))];
     }
 
     let mut candidates = Vec::new();
     for env_name in ["VIRTUAL_ENV", "CONDA_PREFIX"] {
         if let Some(path) = std::env::var_os(env_name)
             .map(PathBuf::from)
-            .and_then(|prefix| first_existing_ty(&environment_ty_paths(&prefix)))
+            .and_then(|prefix| {
+                first_existing_checker(&environment_checker_paths(&prefix, config.checker))
+            })
         {
-            candidates.push(TyLaunchConfig::new(path_string(path), ty_args(config)));
+            candidates.push(TypeCheckerLaunchConfig::new(
+                path_string(path),
+                checker_args(config),
+            ));
         }
     }
 
     for root in workspace_roots {
-        for relative in workspace_ty_relative_paths() {
+        for relative in workspace_checker_relative_paths(config.checker) {
             let path = root.join(relative);
             if is_executable_file(&path) {
-                candidates.push(TyLaunchConfig::new(path_string(path), ty_args(config)));
+                candidates.push(TypeCheckerLaunchConfig::new(
+                    path_string(path),
+                    checker_args(config),
+                ));
             }
         }
     }
 
     for root in workspace_roots {
         if is_uv_project(root) {
-            candidates.push(TyLaunchConfig::new("uv", uv_args(root)));
+            candidates.push(TypeCheckerLaunchConfig::new(
+                "uv",
+                uv_args(root, config.checker),
+            ));
         }
     }
 
-    candidates.push(TyLaunchConfig::new("ty", ty_args(config)));
+    candidates.push(TypeCheckerLaunchConfig::new(
+        config.checker.default_command(),
+        checker_args(config),
+    ));
     dedupe_launch_candidates(candidates)
 }
 
@@ -731,20 +957,6 @@ fn initialize_params(config: &TypeCheckerConfig, workspace_roots: &[PathBuf]) ->
     let root_uri = workspace_roots
         .first()
         .and_then(|root| Url::from_file_path(root).ok());
-    let workspace_folders = workspace_roots
-        .iter()
-        .filter_map(|root| {
-            let uri = Url::from_file_path(root).ok()?;
-            Some(WorkspaceFolder {
-                name: root
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("workspace")
-                    .to_string(),
-                uri,
-            })
-        })
-        .collect::<Vec<_>>();
     let params = InitializeParams {
         process_id: None,
         root_uri,
@@ -754,10 +966,11 @@ fn initialize_params(config: &TypeCheckerConfig, workspace_roots: &[PathBuf]) ->
                 ..Default::default()
             }),
             text_document: Some(TextDocumentClientCapabilities {
-                diagnostic: Some(DiagnosticClientCapabilities {
-                    dynamic_registration: Some(false),
-                    related_document_support: Some(false),
-                }),
+                diagnostic: (config.checker.diagnostic_transport() == DiagnosticTransport::Pull)
+                    .then_some(DiagnosticClientCapabilities {
+                        dynamic_registration: Some(false),
+                        related_document_support: Some(false),
+                    }),
                 ..Default::default()
             }),
             general: Some(GeneralClientCapabilities {
@@ -769,17 +982,16 @@ fn initialize_params(config: &TypeCheckerConfig, workspace_roots: &[PathBuf]) ->
             }),
             ..Default::default()
         },
-        workspace_folders: Some(workspace_folders),
-        initialization_options: config.python.as_ref().map(|python| {
-            json!({
-                "settings": {
-                    "python": python
-                }
-            })
-        }),
+        workspace_folders: Some(workspace_folders(workspace_roots)),
+        initialization_options: initialization_options(config),
         ..Default::default()
     };
-    serde_json::to_value(params).context("failed to serialize ty initialize params")
+    serde_json::to_value(params).with_context(|| {
+        format!(
+            "failed to serialize {} initialize params",
+            config.checker.as_str()
+        )
+    })
 }
 
 fn negotiated_position_encoding(initialize_result: &Value) -> NegotiatedEncoding {
@@ -820,69 +1032,105 @@ fn explicit_command(config: &TypeCheckerConfig) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn ty_args(config: &TypeCheckerConfig) -> Vec<String> {
+fn checker_args(config: &TypeCheckerConfig) -> Vec<String> {
     if config.args.is_empty() {
-        default_ty_args()
+        config.checker.default_args()
     } else {
         config.args.clone()
     }
 }
 
-fn default_ty_args() -> Vec<String> {
-    vec!["server".to_string()]
-}
-
-fn uv_args(root: &Path) -> Vec<String> {
-    vec![
+fn uv_args(root: &Path, backend: TypeCheckerBackend) -> Vec<String> {
+    let mut args = vec![
         "run".to_string(),
         "--project".to_string(),
         root.display().to_string(),
         "--frozen".to_string(),
         "--no-progress".to_string(),
-        "ty".to_string(),
-        "server".to_string(),
-    ]
+        backend.default_command().to_string(),
+    ];
+    args.extend(backend.default_args());
+    args
 }
 
-fn environment_ty_paths(prefix: &Path) -> Vec<PathBuf> {
-    environment_ty_paths_for_platform(prefix, cfg!(windows))
+fn environment_checker_paths(prefix: &Path, backend: TypeCheckerBackend) -> Vec<PathBuf> {
+    environment_checker_paths_for_platform(prefix, backend, cfg!(windows))
 }
 
-fn environment_ty_paths_for_platform(prefix: &Path, windows: bool) -> Vec<PathBuf> {
+fn environment_checker_paths_for_platform(
+    prefix: &Path,
+    backend: TypeCheckerBackend,
+    windows: bool,
+) -> Vec<PathBuf> {
+    let executable_names = checker_executable_names(backend, windows);
     if windows {
-        vec![
-            prefix.join("Scripts").join("ty.exe"),
-            prefix.join("bin").join("ty.exe"),
-            prefix.join("bin").join("ty"),
-        ]
+        executable_names
+            .iter()
+            .flat_map(|name| {
+                [
+                    prefix.join("Scripts").join(name),
+                    prefix.join("bin").join(name),
+                ]
+            })
+            .collect()
     } else {
-        vec![prefix.join("bin").join("ty")]
+        executable_names
+            .iter()
+            .map(|name| prefix.join("bin").join(name))
+            .collect()
     }
 }
 
-fn workspace_ty_relative_paths() -> Vec<PathBuf> {
-    workspace_ty_relative_paths_for_platform(cfg!(windows))
+fn workspace_checker_relative_paths(backend: TypeCheckerBackend) -> Vec<PathBuf> {
+    workspace_checker_relative_paths_for_platform(backend, cfg!(windows))
 }
 
-fn workspace_ty_relative_paths_for_platform(windows: bool) -> Vec<PathBuf> {
+fn workspace_checker_relative_paths_for_platform(
+    backend: TypeCheckerBackend,
+    windows: bool,
+) -> Vec<PathBuf> {
+    let executable_names = checker_executable_names(backend, windows);
+    let envs = [".venv", "venv"];
     if windows {
-        vec![
-            PathBuf::from(".venv").join("Scripts").join("ty.exe"),
-            PathBuf::from("venv").join("Scripts").join("ty.exe"),
-            PathBuf::from(".venv").join("bin").join("ty.exe"),
-            PathBuf::from("venv").join("bin").join("ty.exe"),
-            PathBuf::from(".venv").join("bin").join("ty"),
-            PathBuf::from("venv").join("bin").join("ty"),
-        ]
+        envs.iter()
+            .flat_map(|env| {
+                executable_names.iter().flat_map(move |name| {
+                    [
+                        PathBuf::from(env).join("Scripts").join(name),
+                        PathBuf::from(env).join("bin").join(name),
+                    ]
+                })
+            })
+            .collect()
     } else {
-        vec![
-            PathBuf::from(".venv").join("bin").join("ty"),
-            PathBuf::from("venv").join("bin").join("ty"),
-        ]
+        envs.iter()
+            .flat_map(|env| {
+                executable_names
+                    .iter()
+                    .map(move |name| PathBuf::from(env).join("bin").join(name))
+            })
+            .collect()
     }
 }
 
-fn first_existing_ty(paths: &[PathBuf]) -> Option<PathBuf> {
+fn checker_executable_names(backend: TypeCheckerBackend, windows: bool) -> Vec<&'static str> {
+    match (backend, windows) {
+        (TypeCheckerBackend::Ty, true) => vec!["ty.exe", "ty"],
+        (TypeCheckerBackend::Ty, false) => vec!["ty"],
+        (TypeCheckerBackend::Pyright, true) => {
+            vec![
+                "pyright-langserver.cmd",
+                "pyright-langserver.exe",
+                "pyright-langserver",
+            ]
+        }
+        (TypeCheckerBackend::Pyright, false) => vec!["pyright-langserver"],
+        (TypeCheckerBackend::Pyrefly, true) => vec!["pyrefly.exe", "pyrefly"],
+        (TypeCheckerBackend::Pyrefly, false) => vec!["pyrefly"],
+    }
+}
+
+fn first_existing_checker(paths: &[PathBuf]) -> Option<PathBuf> {
     paths.iter().find(|path| is_executable_file(path)).cloned()
 }
 
@@ -914,7 +1162,152 @@ fn is_uv_project(root: &Path) -> bool {
     content.lines().any(is_uv_pyproject_table)
 }
 
-fn dedupe_launch_candidates(candidates: Vec<TyLaunchConfig>) -> Vec<TyLaunchConfig> {
+fn workspace_folders(workspace_roots: &[PathBuf]) -> Vec<WorkspaceFolder> {
+    workspace_roots
+        .iter()
+        .filter_map(|root| {
+            let uri = Url::from_file_path(root).ok()?;
+            Some(WorkspaceFolder {
+                name: root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("workspace")
+                    .to_string(),
+                uri,
+            })
+        })
+        .collect()
+}
+
+fn initialization_options(config: &TypeCheckerConfig) -> Option<Value> {
+    match config.checker {
+        TypeCheckerBackend::Ty => config.python.as_ref().map(|python| {
+            json!({
+                "settings": {
+                    "python": python
+                }
+            })
+        }),
+        TypeCheckerBackend::Pyright => Some(json!({
+            "disablePullDiagnostics": true,
+            "settings": {
+                "python": pyright_python_settings(config.python.as_deref()),
+                "python.analysis": pyright_analysis_settings(),
+            }
+        })),
+        TypeCheckerBackend::Pyrefly => {
+            Some(pyrefly_initialization_options(config.python.as_deref()))
+        }
+    }
+}
+
+fn workspace_configuration_response(
+    message: &Value,
+    backend: TypeCheckerBackend,
+    python: Option<&str>,
+) -> Value {
+    let Some(items) = message.pointer("/params/items").and_then(Value::as_array) else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        items
+            .iter()
+            .map(|item| {
+                let section = item
+                    .get("section")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                backend_configuration_section(backend, section, python)
+            })
+            .collect(),
+    )
+}
+
+fn backend_configuration_section(
+    backend: TypeCheckerBackend,
+    section: &str,
+    python: Option<&str>,
+) -> Value {
+    match backend {
+        TypeCheckerBackend::Ty => ty_configuration_section(section, python),
+        TypeCheckerBackend::Pyright => pyright_configuration_section(section, python),
+        TypeCheckerBackend::Pyrefly => pyrefly_configuration_section(section, python),
+    }
+}
+
+fn ty_configuration_section(section: &str, python: Option<&str>) -> Value {
+    match (section, python) {
+        ("python", Some(python)) => json!(python),
+        _ => json!({}),
+    }
+}
+
+fn pyright_configuration_section(section: &str, python: Option<&str>) -> Value {
+    match section {
+        "python" => pyright_python_settings(python),
+        "python.analysis" => pyright_analysis_settings(),
+        "pyright" => json!({
+            "disablePullDiagnostics": true,
+        }),
+        _ => json!({}),
+    }
+}
+
+fn pyright_python_settings(python: Option<&str>) -> Value {
+    let mut settings = Map::new();
+    if let Some(python) = python {
+        settings.insert("defaultInterpreterPath".to_string(), json!(python));
+        settings.insert("pythonPath".to_string(), json!(python));
+    }
+    Value::Object(settings)
+}
+
+fn pyright_analysis_settings() -> Value {
+    json!({
+        "typeCheckingMode": "strict",
+        "diagnosticMode": "openFilesOnly",
+        "pythonVersion": "3.14",
+    })
+}
+
+fn pyrefly_configuration_section(section: &str, python: Option<&str>) -> Value {
+    match section {
+        "python" | "pyrefly" => pyrefly_workspace_settings(python),
+        _ => json!({}),
+    }
+}
+
+fn pyrefly_initialization_options(python: Option<&str>) -> Value {
+    let mut options = pyrefly_workspace_settings(python);
+    if let Value::Object(settings) = &mut options
+        && let Some(python) = python
+    {
+        settings.insert("pythonPath".to_string(), json!(python));
+    }
+    options
+}
+
+fn pyrefly_workspace_settings(python: Option<&str>) -> Value {
+    let mut settings = Map::new();
+    settings.insert(
+        "pyrefly".to_string(),
+        json!({
+            "typeCheckingMode": "strict",
+            "disableTypeErrors": false,
+            "analysis": {
+                "diagnosticMode": "openFilesOnly",
+            },
+        }),
+    );
+    if let Some(python) = python {
+        settings.insert("defaultInterpreterPath".to_string(), json!(python));
+    }
+    Value::Object(settings)
+}
+
+fn dedupe_launch_candidates(
+    candidates: Vec<TypeCheckerLaunchConfig>,
+) -> Vec<TypeCheckerLaunchConfig> {
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
     for candidate in candidates {
@@ -1003,45 +1396,122 @@ mod tests {
         let config: TypeCheckerConfig =
             serde_json::from_value(json!({"enabled": true, "command": "/tmp/ty"})).unwrap();
         assert!(config.enabled);
+        assert_eq!(config.checker, TypeCheckerBackend::Ty);
         assert_eq!(config.command.as_deref(), Some("/tmp/ty"));
-        assert_eq!(config.args, default_ty_args());
+        assert!(config.args.is_empty());
+        assert_eq!(checker_args(&config), vec!["server"]);
         assert_eq!(TypeCheckerConfig::default().enabled, false);
     }
 
     #[test]
-    fn ty_launch_candidates_use_explicit_command_first() {
+    fn type_checker_launch_candidates_use_explicit_command_first() {
         let config = TypeCheckerConfig {
             enabled: true,
+            checker: TypeCheckerBackend::Ty,
             command: Some("/opt/ty".to_string()),
-            args: vec!["server".to_string()],
+            args: Vec::new(),
             python: None,
         };
         assert_eq!(
-            ty_launch_candidates(&config, &[]),
-            vec![TyLaunchConfig::new("/opt/ty", vec!["server".to_string()])]
+            type_checker_launch_candidates(&config, &[]),
+            vec![TypeCheckerLaunchConfig::new(
+                "/opt/ty",
+                vec!["server".to_string()]
+            )]
         );
     }
 
     #[test]
-    fn ty_launch_candidates_include_workspace_uv_and_path_fallback() {
+    fn type_checker_launch_candidates_include_workspace_uv_and_path_fallback() {
         let temp = TempDir::new().expect("tempdir");
         std::fs::write(temp.path().join("uv.lock"), "").expect("uv lock");
-        let candidates = ty_launch_candidates(&TypeCheckerConfig::default(), &[temp.path().into()]);
+        let candidates =
+            type_checker_launch_candidates(&TypeCheckerConfig::default(), &[temp.path().into()]);
         assert!(candidates.iter().any(|candidate| candidate.command == "uv"));
         assert!(candidates.iter().any(|candidate| candidate.command == "ty"));
     }
 
     #[test]
-    fn ty_launch_candidates_ignore_uvicorn_pyproject_table() {
+    fn type_checker_launch_candidates_ignore_uvicorn_pyproject_table() {
         let temp = TempDir::new().expect("tempdir");
         std::fs::write(
             temp.path().join("pyproject.toml"),
             "[project]\nname = \"demo\"\n\n[tool.uvicorn]\nreload = true\n",
         )
         .expect("pyproject");
-        let candidates = ty_launch_candidates(&TypeCheckerConfig::default(), &[temp.path().into()]);
+        let candidates =
+            type_checker_launch_candidates(&TypeCheckerConfig::default(), &[temp.path().into()]);
         assert!(!candidates.iter().any(|candidate| candidate.command == "uv"));
         assert!(candidates.iter().any(|candidate| candidate.command == "ty"));
+    }
+
+    #[test]
+    fn type_checker_launch_candidates_use_backend_defaults() {
+        let pyright = TypeCheckerConfig {
+            enabled: true,
+            checker: TypeCheckerBackend::Pyright,
+            command: None,
+            args: Vec::new(),
+            python: None,
+        };
+        let pyrefly = TypeCheckerConfig {
+            checker: TypeCheckerBackend::Pyrefly,
+            ..pyright.clone()
+        };
+
+        assert!(
+            type_checker_launch_candidates(&pyright, &[])
+                .iter()
+                .any(|candidate| candidate.command == "pyright-langserver"
+                    && candidate.args == ["--stdio"])
+        );
+        assert!(
+            type_checker_launch_candidates(&pyrefly, &[])
+                .iter()
+                .any(|candidate| candidate.command == "pyrefly" && candidate.args == ["lsp"])
+        );
+    }
+
+    #[test]
+    fn workspace_configuration_response_is_backend_specific() {
+        let message = json!({
+            "params": {
+                "items": [
+                    {"section": "python"},
+                    {"section": "python.analysis"},
+                    {"section": "pyright"}
+                ]
+            }
+        });
+
+        assert_eq!(
+            workspace_configuration_response(
+                &message,
+                TypeCheckerBackend::Pyright,
+                Some("/venv/bin/python")
+            ),
+            json!([
+                {
+                    "defaultInterpreterPath": "/venv/bin/python",
+                    "pythonPath": "/venv/bin/python"
+                },
+                {
+                    "typeCheckingMode": "strict",
+                    "diagnosticMode": "openFilesOnly",
+                    "pythonVersion": "3.14"
+                },
+                {
+                    "disablePullDiagnostics": true
+                }
+            ])
+        );
+
+        assert_eq!(
+            workspace_configuration_response(&message, TypeCheckerBackend::Pyrefly, None)
+                .pointer("/0/pyrefly/typeCheckingMode")
+                .and_then(Value::as_str),
+            Some("strict")
+        );
     }
 
     #[test]
@@ -1105,9 +1575,12 @@ mod tests {
                 next_id: AtomicU64::new(1),
                 pending: Mutex::new(HashMap::new()),
                 open_documents: Mutex::new(HashMap::new()),
+                published_diagnostics: Mutex::new(HashMap::new()),
+                diagnostics_notify: Notify::new(),
                 dead: AtomicBool::new(false),
             }),
             child: Mutex::new(child),
+            backend: TypeCheckerBackend::Ty,
             position_encoding: NegotiatedEncoding::Utf16,
             server_version: None,
         };

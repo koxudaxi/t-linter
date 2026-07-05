@@ -35,7 +35,7 @@ t-linter validates and formats embedded languages inside Python template strings
 - 🧹 **Formatting** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML templates
 - 🎨 **Syntax Highlighting** - Smart highlighting via LSP semantic tokens
 - 🔧 **Type-based Detection** - Understands `Annotated[Template, "html"]` and type aliases
-- 🧪 **Interpolation Type Checking** - Optional LSP diagnostics for JSON, YAML, and TOML interpolation values through `ty`
+- 🧪 **Interpolation Type Checking** - Optional LSP diagnostics for JSON, YAML, and TOML interpolation values through Ty, Pyright, or Pyrefly
 - 🧩 **Callee Inference** - Detects backend languages from helpers such as `tdom.html(...)`
 - 🚀 **Fast** - Single Rust binary with Tree-sitter parsers
 
@@ -209,7 +209,7 @@ The LSP server provides:
 
 - **Semantic Tokens** — syntax highlighting for embedded languages
 - **Diagnostics** — real-time validation with 250ms debouncing
-- **Interpolation Type Checking** — optional JSON, YAML, and TOML interpolation value diagnostics through `ty`
+- **Interpolation Type Checking** — optional JSON, YAML, and TOML interpolation value diagnostics through Ty, Pyright, or Pyrefly
 - **Document Formatting** — full document and range formatting
 - **Code Actions** — `source.fixAll.t-linter` for document-level rewrites and `refactor.rewrite.t-linter` for single-template selection rewrites
 
@@ -219,13 +219,14 @@ Interpolation value type checking is opt-in and applies to JSON, YAML, and TOML 
 {
   "typeChecking": {
     "enabled": true,
-    "command": "/path/to/ty",
-    "args": ["server"]
+    "checker": "pyright",
+    "command": "/path/to/pyright-langserver",
+    "args": ["--stdio"]
   }
 }
 ```
 
-When `command` is omitted, t-linter searches active virtual environments, workspace `.venv`/`venv`, uv projects, and then `ty` on `PATH`.
+When `command` and `args` are omitted, t-linter uses the selected checker defaults: `ty server`, `pyright-langserver --stdio`, or `pyrefly lsp`. It searches active virtual environments, workspace `.venv`/`venv`, uv projects, and then the checker on `PATH`.
 
 See [Interpolation Type Checking](docs/usage/interpolation-type-checking.md)
 for the architecture, behavior, and implementation details.
