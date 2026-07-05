@@ -1,10 +1,10 @@
 # Interpolation Type Checking
 
 Interpolation type checking is an opt-in LSP feature that checks values inserted
-into typed JSON, YAML, and TOML template strings. It uses each template backend
-to decide what Python type an interpolation position accepts, asks Ty, Pyright,
-or Pyrefly to check that expression, and reports the result back on the original
-`{expression}`.
+into typed JSON, YAML, TOML template strings and TDOM component props. It uses
+each template backend to decide what Python type an interpolation position
+accepts, asks Ty, Pyright, or Pyrefly to check that expression, and reports the
+result back on the original `{expression}`.
 
 The feature is intentionally separate from `t-linter check`. The CLI still runs
 the built-in template syntax checks only; interpolation value diagnostics require
@@ -17,7 +17,7 @@ The type checker has five parts:
 | Layer | Responsibility |
 |---|---|
 | Parser and language resolver | Finds PEP 750 template strings and resolves their embedded language from annotations, aliases, function parameters, and supported callees. |
-| Template backend | Computes contextual interpolation type requirements for a language. JSON, YAML, and TOML currently return requirements. |
+| Template backend | Computes contextual interpolation type requirements for a language. JSON, YAML, TOML, and TDOM component props currently return requirements. |
 | Shadow document synthesizer | Creates an in-memory Python document that preserves the original line count and adds type-check assignments for the selected checker. |
 | Type checker client | Starts and reuses a dedicated Ty, Pyright, or Pyrefly language server, syncs the shadow document, and collects diagnostics. |
 | Diagnostic remapper | Filters backend-specific assignment errors and maps them back to the original interpolation ranges. |
@@ -27,7 +27,7 @@ The data flow is:
 ```text
 open Python document
   -> parse template strings and resolve template languages
-  -> ask the JSON/YAML/TOML backend for interpolation requirements
+  -> ask the JSON/YAML/TOML backend or TDOM component-prop backend for interpolation requirements
   -> synthesize same-line annotated assignments in a shadow Python document
   -> sync that shadow document to a dedicated type checker server
   -> collect pull or publish diagnostics from that server
@@ -98,8 +98,8 @@ be matched against type checker diagnostics.
 
 ## Backend Requirements
 
-Backends own the logic for their DSL. t-linter does not hard-code JSON, YAML, or
-TOML grammar rules in the LSP layer.
+Backends own the logic for their DSL. t-linter does not hard-code JSON, YAML,
+TOML, or TDOM AST traversal rules in the LSP layer.
 
 Each backend returns an `InterpolationTypeRequirement` containing:
 
@@ -120,10 +120,14 @@ Examples of backend decisions:
 | TOML key | `str` |
 | TOML string fragment | `str` |
 | TOML value | `str \| int \| float \| bool \| datetime.date \| datetime.time \| datetime.datetime \| list[object] \| dict[str, object]` |
+| TDOM component prop `title={value}` where `title: str` | `str` |
+| TDOM component prop `items={value}` where `items: list[str]` | `list[str]` |
+| TDOM component prop string fragment `label="Hi {name}"` | `str` |
 
-HTML, T-HTML, and TDOM currently return no interpolation type requirements.
-Tree-sitter-only languages such as CSS, JavaScript, and SQL are also not part of
-this mechanism.
+HTML and T-HTML currently return no interpolation type requirements. TDOM
+returns requirements only for component prop interpolations whose component
+signature can be resolved by t-linter. Tree-sitter-only languages such as CSS,
+JavaScript, and SQL are also not part of this mechanism.
 
 ## Runtime Behavior
 
@@ -228,10 +232,12 @@ The relevant implementation files are:
 | `crates/t-linter-core/src/shadow.rs` | Builds `ShadowDocument` and `ShadowCheckSite` values, inserts same-line assignments, skips unsafe expressions, and preserves line counts. |
 | `crates/t-linter-lsp/src/type_checker.rs` | Manages `TypeCheckerConfig`, `TypeCheckerClient`, checker discovery, startup, JSON-RPC, document sync, diagnostic collection, and shutdown. |
 | `crates/t-linter-lsp/src/lib.rs` | Runs the LSP diagnostic pipeline, calls shadow synthesis, filters backend assignment diagnostics, remaps diagnostics, and merges the final publish payload. |
-| `crates/t-linter/tests/type_check_lsp.rs` | End-to-end coverage against real Ty, Pyright, and Pyrefly binaries for JSON, YAML, and TOML remapping. |
+| `crates/t-linter/tests/type_check_lsp.rs` | End-to-end coverage against real Ty, Pyright, and Pyrefly binaries for JSON, YAML, TOML, and TDOM component prop remapping. |
 
 The backend crates expose their requirements through
-`interpolation_type_requirements`. Adding another DSL to this mechanism should
-start in that DSL backend, not in the LSP remapper. The LSP layer should remain
-language-agnostic: it consumes requirement records, synthesizes Python
-assignments, and maps checker diagnostics back to source locations.
+`interpolation_type_requirements` or a resolver-backed variant such as
+`tstring_tdom::interpolation_type_requirements_with_component_props`. Adding
+another DSL to this mechanism should start in that DSL backend, not in the LSP
+remapper. The LSP layer should remain language-agnostic: it consumes requirement
+records, synthesizes Python assignments, and maps checker diagnostics back to
+source locations.

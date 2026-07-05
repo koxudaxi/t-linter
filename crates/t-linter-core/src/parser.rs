@@ -50,6 +50,8 @@ impl CallableSignature {
 pub struct CallableParameter {
     pub position: usize,
     pub name: String,
+    pub type_annotation: Option<String>,
+    pub type_annotation_module: Option<String>,
     pub template_language: Option<String>,
     pub template_profile: Option<String>,
     pub value_types: Vec<CallableValueType>,
@@ -915,9 +917,13 @@ impl TemplateStringParser {
                 module_cache,
                 &mut visited,
             )?;
+            let type_annotation = checker_type_annotation_from_expr(field_type_expr)
+                .or_else(|| checker_type_annotation_from_text(type_text));
             signature.parameters.push(CallableParameter {
                 position,
                 name: left_node.utf8_text(source.as_bytes())?.to_string(),
+                type_annotation,
+                type_annotation_module: None,
                 template_language: type_hints.template_language,
                 template_profile: type_hints.template_profile,
                 value_types: type_hints.value_types,
@@ -1010,20 +1016,25 @@ impl TemplateStringParser {
 
                     let required = matches!(child.kind(), "typed_parameter" | "identifier");
                     let type_node = child.child_by_field_name("type");
-                    let type_hints = if let Some(type_node) = type_node {
-                        self.resolve_type_info_from_type_node(
-                            type_node,
-                            source,
-                            module_type_data,
-                            module_cache,
-                        )?
+                    let (type_hints, type_annotation) = if let Some(type_node) = type_node {
+                        let type_text = type_node.utf8_text(source.as_bytes())?;
+                        (
+                            self.resolve_type_info_from_text(
+                                type_text,
+                                module_type_data,
+                                module_cache,
+                            )?,
+                            checker_type_annotation_from_text(type_text),
+                        )
                     } else {
-                        ResolvedTypeInfo::default()
+                        (ResolvedTypeInfo::default(), None)
                     };
 
                     signature.parameters.push(CallableParameter {
                         position,
                         name: parameter_name.to_string(),
+                        type_annotation,
+                        type_annotation_module: None,
                         template_language: type_hints.template_language,
                         template_profile: type_hints.template_profile,
                         value_types: type_hints.value_types,
@@ -1061,9 +1072,12 @@ impl TemplateStringParser {
             }
 
             if !self.import_path_resolves_to_module(&import_path) {
-                if let Some(signatures) =
+                if let Some(mut signatures) =
                     self.resolve_imported_callable_signature(&import_path, module_cache)?
                 {
+                    if let Some((module_name, _)) = import_path.rsplit_once('.') {
+                        mark_signature_type_annotation_module(&mut signatures, module_name);
+                    }
                     module_type_data
                         .callable_signatures
                         .entry(alias.clone())
@@ -1078,7 +1092,8 @@ impl TemplateStringParser {
             if let Some(module_signatures) =
                 self.load_imported_module_type_data(&import_path, module_cache)?
             {
-                for (callable_name, signatures) in module_signatures.callable_signatures {
+                for (callable_name, mut signatures) in module_signatures.callable_signatures {
+                    mark_signature_type_annotation_module(&mut signatures, &import_path);
                     module_type_data
                         .callable_signatures
                         .entry(format!("{import_path}.{callable_name}"))
@@ -1109,7 +1124,8 @@ impl TemplateStringParser {
             if let Some(module_signatures) =
                 self.load_imported_module_type_data(&import_path, module_cache)?
             {
-                for (callable_name, signatures) in module_signatures.callable_signatures {
+                for (callable_name, mut signatures) in module_signatures.callable_signatures {
+                    mark_signature_type_annotation_module(&mut signatures, &import_path);
                     module_type_data
                         .callable_signatures
                         .entry(format!("{import_path}.{callable_name}"))
@@ -2773,6 +2789,44 @@ fn parse_string_literal(input: &str) -> Option<String> {
     Some(input[1..input.len() - 1].to_string())
 }
 
+fn checker_type_annotation_from_text(type_text: &str) -> Option<String> {
+    let type_text = type_text.trim();
+    if type_text.is_empty() {
+        return None;
+    }
+    parse_string_literal(type_text).or_else(|| Some(type_text.to_string()))
+}
+
+fn checker_type_annotation_from_expr(expr: &TypeExpr) -> Option<String> {
+    match expr {
+        TypeExpr::Name(name) => Some(name.as_string()),
+        TypeExpr::StringLiteral(value) => Some(value.clone()),
+        TypeExpr::NoneLiteral => Some("None".to_string()),
+        TypeExpr::Generic { base, args } => {
+            let args = args
+                .iter()
+                .filter_map(checker_type_annotation_arg_from_expr)
+                .collect::<Vec<_>>();
+            Some(format!("{}[{}]", base.as_string(), args.join(", ")))
+        }
+        TypeExpr::Union(parts) => {
+            let parts = parts
+                .iter()
+                .filter_map(checker_type_annotation_from_expr)
+                .collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join(" | "))
+        }
+        TypeExpr::Unknown(value) => (!value.trim().is_empty()).then(|| value.trim().to_string()),
+    }
+}
+
+fn checker_type_annotation_arg_from_expr(expr: &TypeExpr) -> Option<String> {
+    match expr {
+        TypeExpr::StringLiteral(value) => Some(crate::python::double_quoted_string_literal(value)),
+        _ => checker_type_annotation_from_expr(expr),
+    }
+}
+
 fn split_top_level_tokens(input: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut start = 0usize;
@@ -3159,6 +3213,14 @@ fn merge_resolved_type_info(target: &mut ResolvedTypeInfo, other: ResolvedTypeIn
         push_value_type(&mut target.value_types, value_type);
     }
     target.accepts_none |= other.accepts_none;
+}
+
+fn mark_signature_type_annotation_module(signature: &mut CallableSignature, module_name: &str) {
+    for parameter in &mut signature.parameters {
+        if parameter.type_annotation.is_some() && parameter.type_annotation_module.is_none() {
+            parameter.type_annotation_module = Some(module_name.to_string());
+        }
+    }
 }
 
 fn resolve_import_module_name(
@@ -9173,6 +9235,96 @@ def render(flag: Literal[True, False] | None, value: Literal[1, 1.5, "x", None])
             ]
         );
         assert!(signature.parameters[1].accepts_none);
+    }
+
+    #[test]
+    fn test_callable_signatures_preserve_python_type_annotations() {
+        let source = r#"
+from dataclasses import InitVar, dataclass
+from typing import Literal
+
+class User:
+    name: str
+
+def render(user: User, labels: list[str], state: Literal["open", "closed"], maybe: "User | None") -> None:
+    return None
+
+@dataclass
+class Card:
+    title: str
+    owner: InitVar[User]
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert!(templates.is_empty());
+        let context = parser.module_context();
+        let render = context.callable_signatures.get("render").unwrap();
+        assert_eq!(
+            render.parameters[0].type_annotation,
+            Some("User".to_string())
+        );
+        assert_eq!(
+            render.parameters[1].type_annotation,
+            Some("list[str]".to_string())
+        );
+        assert_eq!(
+            render.parameters[2].type_annotation,
+            Some("Literal[\"open\", \"closed\"]".to_string())
+        );
+        assert_eq!(
+            render.parameters[3].type_annotation,
+            Some("User | None".to_string())
+        );
+
+        let card = context.callable_signatures.get("Card").unwrap();
+        assert_eq!(card.parameters[0].type_annotation, Some("str".to_string()));
+        assert_eq!(card.parameters[1].type_annotation, Some("User".to_string()));
+    }
+
+    #[test]
+    fn test_imported_callable_signature_tracks_type_annotation_module() {
+        let dir = parser_test_dir("imported-callable-type-annotation-module");
+        write_file(
+            &dir.join("components.py"),
+            r#"
+class User:
+    name: str
+
+def Card(*, owner: User) -> object:
+    return object()
+"#,
+        );
+        let source = r#"
+from components import Card
+from tdom import html
+
+def handler(age: int) -> None:
+    html(t'<{Card} owner={age} />')
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        assert_eq!(templates.len(), 1);
+        let signature = parser
+            .module_context()
+            .callable_signatures
+            .get("Card")
+            .unwrap();
+        assert_eq!(
+            signature.parameters[0].type_annotation,
+            Some("User".to_string())
+        );
+        assert_eq!(
+            signature.parameters[0].type_annotation_module,
+            Some("components".to_string())
+        );
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
