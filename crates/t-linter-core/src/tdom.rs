@@ -2,6 +2,12 @@ use tstring_tdom::ComponentPropValueKind;
 
 use crate::parser::{CallableParameter, CallableSignature, CallableValueType, ModuleContext};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ComponentPropExpectedType {
+    pub annotation: String,
+    pub import_module: Option<String>,
+}
+
 pub(crate) fn resolve_component_signature<'a>(
     module_context: &'a ModuleContext,
     expression: &str,
@@ -21,19 +27,32 @@ pub(crate) fn resolve_component_signature<'a>(
 pub(crate) fn expected_type_for_component_prop(
     parameter: &CallableParameter,
     value_kind: ComponentPropValueKind,
-) -> Option<String> {
+) -> Option<ComponentPropExpectedType> {
     match value_kind {
         ComponentPropValueKind::Typed => parameter
             .type_annotation
-            .clone()
-            .or_else(|| fallback_expected_type(parameter)),
+            .as_ref()
+            .map(|annotation| ComponentPropExpectedType {
+                annotation: annotation.clone(),
+                import_module: parameter.type_annotation_module.clone(),
+            })
+            .or_else(|| fallback_expected_type(parameter).map(ComponentPropExpectedType::local)),
         ComponentPropValueKind::StringLike | ComponentPropValueKind::StringFragment
             if parameter.value_types.contains(&CallableValueType::String) =>
         {
-            Some("str".to_string())
+            Some(ComponentPropExpectedType::local("str".to_string()))
         }
         ComponentPropValueKind::StringLike | ComponentPropValueKind::StringFragment => None,
         _ => None,
+    }
+}
+
+impl ComponentPropExpectedType {
+    fn local(annotation: String) -> Self {
+        Self {
+            annotation,
+            import_module: None,
+        }
     }
 }
 
@@ -68,6 +87,7 @@ mod tests {
             position: 0,
             name: "value".to_string(),
             type_annotation: type_annotation.map(str::to_string),
+            type_annotation_module: None,
             template_language: None,
             template_profile: None,
             value_types,
@@ -84,7 +104,7 @@ mod tests {
 
         assert_eq!(
             expected_type_for_component_prop(&parameter, ComponentPropValueKind::Typed),
-            Some("list[str]".to_string())
+            Some(ComponentPropExpectedType::local("list[str]".to_string()))
         );
     }
 
@@ -94,7 +114,21 @@ mod tests {
 
         assert_eq!(
             expected_type_for_component_prop(&parameter, ComponentPropValueKind::StringFragment),
-            Some("str".to_string())
+            Some(ComponentPropExpectedType::local("str".to_string()))
+        );
+    }
+
+    #[test]
+    fn typed_component_props_keep_import_module() {
+        let mut parameter = parameter(Some("User"), Vec::new());
+        parameter.type_annotation_module = Some("components".to_string());
+
+        assert_eq!(
+            expected_type_for_component_prop(&parameter, ComponentPropValueKind::Typed),
+            Some(ComponentPropExpectedType {
+                annotation: "User".to_string(),
+                import_module: Some("components".to_string()),
+            })
         );
     }
 }

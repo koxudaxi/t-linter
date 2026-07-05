@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::Path;
 
@@ -9,7 +9,9 @@ use tstring_tdom as backend_tdom;
 
 use crate::backend::TemplateBackend;
 use crate::parser::ModuleContext;
-use crate::tdom::{expected_type_for_component_prop, resolve_component_signature};
+use crate::tdom::{
+    ComponentPropExpectedType, expected_type_for_component_prop, resolve_component_signature,
+};
 use crate::{InterpolationInfo, Location, TemplatePart, TemplateStringInfo, TemplateStringParser};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +37,7 @@ struct PendingInsertion {
     text: String,
     sites: Vec<PendingSite>,
     datetime_imported: bool,
+    type_imports: BTreeSet<ShadowTypeImport>,
     mode: InsertionMode,
 }
 
@@ -62,12 +65,35 @@ struct PendingSite {
     expression: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ShadowTypeImport {
+    module: String,
+    alias: String,
+}
+
+#[derive(Debug, Default)]
+struct TemplateTypeRequirements {
+    requirements: Vec<tstring_syntax::InterpolationTypeRequirement>,
+    type_imports: Vec<ShadowTypeImport>,
+}
+
+impl TemplateTypeRequirements {
+    fn is_empty(&self) -> bool {
+        self.requirements.is_empty()
+    }
+}
+
 pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<ShadowDocument>> {
     let mut template_parser = TemplateStringParser::new()?;
     let templates = template_parser.find_template_strings_in_file(source, path)?;
     let module_context = template_parser.module_context().clone();
-    let requirements_by_template = type_requirements_by_template(&templates, &module_context);
-    if requirements_by_template.iter().all(Vec::is_empty) {
+    let prefix = available_shadow_prefix(source);
+    let requirements_by_template =
+        type_requirements_by_template(&templates, &module_context, &prefix);
+    if requirements_by_template
+        .iter()
+        .all(TemplateTypeRequirements::is_empty)
+    {
         return Ok(None);
     }
 
@@ -79,16 +105,15 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
         .parse(source, None)
         .context("Failed to parse source")?;
     let line_starts = line_start_offsets(source);
-    let prefix = available_shadow_prefix(source);
     let datetime_alias = format!("{prefix}datetime");
     let mut insertions = BTreeMap::<usize, PendingInsertion>::new();
 
-    for ((template_index, template), requirements) in templates
+    for ((template_index, template), template_requirements) in templates
         .iter()
         .enumerate()
         .zip(requirements_by_template.into_iter())
     {
-        if requirements.is_empty() {
+        if template_requirements.requirements.is_empty() {
             continue;
         }
         let template_start = location_start_byte(source, &line_starts, &template.location)?;
@@ -103,7 +128,7 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
             continue;
         };
 
-        for requirement in requirements {
+        for requirement in template_requirements.requirements {
             let Some(interpolation) =
                 interpolation_by_index(template, requirement.interpolation_index)
             else {
@@ -141,6 +166,7 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
                 insertion.text.push_str(&datetime_alias);
                 insertion.datetime_imported = true;
             }
+            push_shadow_type_imports(insertion, &template_requirements.type_imports);
             push_shadow_statement_prefix(&mut insertion.text, insertion.mode);
             let rhs_start = insertion.text.len() + lhs.len();
             insertion.text.push_str(&lhs);
@@ -201,50 +227,77 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
 fn type_requirements_by_template(
     templates: &[TemplateStringInfo],
     module_context: &ModuleContext,
-) -> Vec<Vec<tstring_syntax::InterpolationTypeRequirement>> {
+    prefix: &str,
+) -> Vec<TemplateTypeRequirements> {
     templates
         .iter()
         .map(|template| {
             let Some(language) = template.language.as_deref() else {
-                return Vec::new();
+                return TemplateTypeRequirements::default();
             };
             let Some(backend) = TemplateBackend::for_language(language) else {
-                return Vec::new();
+                return TemplateTypeRequirements::default();
             };
-            let requirements = match (backend, template.profile.as_deref()) {
-                (TemplateBackend::Tdom, None) => {
-                    tdom_interpolation_type_requirements(template, module_context)
-                }
-                (TemplateBackend::Tdom, Some(profile)) if profile.eq_ignore_ascii_case("svg") => {
-                    tdom_interpolation_type_requirements(template, module_context)
+            match (backend, template.profile.as_deref()) {
+                (TemplateBackend::Tdom, profile)
+                    if profile.is_none_or(|profile| profile.eq_ignore_ascii_case("svg")) =>
+                {
+                    requirement_result_or_default(
+                        tdom_interpolation_type_requirements(template, module_context, prefix),
+                        language,
+                        template,
+                    )
                 }
                 _ => backend.interpolation_type_requirements(
                     &template.to_template_input(),
                     template.profile.as_deref(),
+                )
+                .map(|requirements| TemplateTypeRequirements {
+                    requirements,
+                    type_imports: Vec::new(),
+                })
+                .map_or_else(
+                    |error| {
+                        tracing::debug!(
+                            "Skipping interpolation type requirements for {} template at {}:{}: {}",
+                            language,
+                            template.location.start_line,
+                            template.location.start_column,
+                            error.message
+                        );
+                        TemplateTypeRequirements::default()
+                    },
+                    |requirements| requirements,
                 ),
-            };
-            match requirements {
-                Ok(requirements) => requirements,
-                Err(error) => {
-                    tracing::debug!(
-                        "Skipping interpolation type requirements for {} template at {}:{}: {}",
-                        language,
-                        template.location.start_line,
-                        template.location.start_column,
-                        error.message
-                    );
-                    Vec::new()
-                }
             }
         })
         .collect()
 }
 
+fn requirement_result_or_default(
+    result: tstring_syntax::BackendResult<TemplateTypeRequirements>,
+    language: &str,
+    template: &TemplateStringInfo,
+) -> TemplateTypeRequirements {
+    result.unwrap_or_else(|error| {
+        tracing::debug!(
+            "Skipping interpolation type requirements for {} template at {}:{}: {}",
+            language,
+            template.location.start_line,
+            template.location.start_column,
+            error.message
+        );
+        TemplateTypeRequirements::default()
+    })
+}
+
 fn tdom_interpolation_type_requirements(
     template: &TemplateStringInfo,
     module_context: &ModuleContext,
-) -> tstring_syntax::BackendResult<Vec<tstring_syntax::InterpolationTypeRequirement>> {
-    backend_tdom::interpolation_type_requirements_with_component_props(
+    prefix: &str,
+) -> tstring_syntax::BackendResult<TemplateTypeRequirements> {
+    let mut resolver = TdomTypeRequirementResolver::new(prefix);
+    let requirements = backend_tdom::interpolation_type_requirements_with_component_props(
         &template.to_template_input(),
         |context| {
             if context.prop_name.as_ref() == "children" {
@@ -259,7 +312,167 @@ fn tdom_interpolation_type_requirements(
                 parameter.name == context.prop_name.as_ref() && parameter.allows_keyword
             })?;
             expected_type_for_component_prop(parameter, context.value_kind)
+                .map(|expected| resolver.annotation_for_expected_type(expected))
         },
+    )?;
+    Ok(TemplateTypeRequirements {
+        requirements,
+        type_imports: resolver.into_imports(),
+    })
+}
+
+struct TdomTypeRequirementResolver<'a> {
+    prefix: &'a str,
+    import_aliases: BTreeMap<String, String>,
+}
+
+impl<'a> TdomTypeRequirementResolver<'a> {
+    fn new(prefix: &'a str) -> Self {
+        Self {
+            prefix,
+            import_aliases: BTreeMap::new(),
+        }
+    }
+
+    fn annotation_for_expected_type(&mut self, expected: ComponentPropExpectedType) -> String {
+        let Some(module) = expected.import_module else {
+            return expected.annotation;
+        };
+        let alias = self
+            .import_aliases
+            .get(&module)
+            .cloned()
+            .unwrap_or_else(|| format!("{}type_{}", self.prefix, self.import_aliases.len()));
+        let (annotation, uses_import) =
+            qualify_imported_type_annotation(&expected.annotation, &alias);
+        if uses_import {
+            self.import_aliases.entry(module).or_insert(alias);
+            annotation
+        } else {
+            expected.annotation
+        }
+    }
+
+    fn into_imports(self) -> Vec<ShadowTypeImport> {
+        self.import_aliases
+            .into_iter()
+            .map(|(module, alias)| ShadowTypeImport { module, alias })
+            .collect()
+    }
+}
+
+fn qualify_imported_type_annotation(annotation: &str, module_alias: &str) -> (String, bool) {
+    let mut qualified = String::with_capacity(annotation.len());
+    let mut index = 0usize;
+    let mut used_import = false;
+
+    while index < annotation.len() {
+        let ch = annotation[index..]
+            .chars()
+            .next()
+            .expect("valid char boundary");
+        if matches!(ch, '\'' | '"') {
+            push_python_string_literal_token(annotation, &mut index, &mut qualified, ch);
+            continue;
+        }
+        if is_python_identifier_start(ch) {
+            let start = index;
+            index += ch.len_utf8();
+            while index < annotation.len() {
+                let ch = annotation[index..]
+                    .chars()
+                    .next()
+                    .expect("valid char boundary");
+                if !is_python_identifier_continue(ch) {
+                    break;
+                }
+                index += ch.len_utf8();
+            }
+            let identifier = &annotation[start..index];
+            if (start > 0 && annotation.as_bytes().get(start - 1) == Some(&b'.'))
+                || is_scope_safe_type_name(identifier)
+            {
+                qualified.push_str(identifier);
+            } else {
+                qualified.push_str(module_alias);
+                qualified.push('.');
+                qualified.push_str(identifier);
+                used_import = true;
+            }
+            continue;
+        }
+
+        qualified.push(ch);
+        index += ch.len_utf8();
+    }
+
+    (qualified, used_import)
+}
+
+fn push_python_string_literal_token(
+    source: &str,
+    index: &mut usize,
+    target: &mut String,
+    quote: char,
+) {
+    let mut escaped = false;
+    let mut opening = true;
+    while *index < source.len() {
+        let ch = source[*index..]
+            .chars()
+            .next()
+            .expect("valid char boundary");
+        target.push(ch);
+        *index += ch.len_utf8();
+        if opening {
+            opening = false;
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            break;
+        }
+    }
+}
+
+fn is_python_identifier_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_python_identifier_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn is_scope_safe_type_name(identifier: &str) -> bool {
+    matches!(
+        identifier,
+        "None"
+            | "True"
+            | "False"
+            | "bool"
+            | "int"
+            | "float"
+            | "complex"
+            | "str"
+            | "bytes"
+            | "bytearray"
+            | "memoryview"
+            | "object"
+            | "list"
+            | "dict"
+            | "set"
+            | "frozenset"
+            | "tuple"
+            | "type"
+            | "range"
+            | "slice"
     )
 }
 
@@ -272,6 +485,19 @@ fn shadow_annotation_type<'a>(expected_type: &'a str, datetime_alias: &str) -> C
         return Cow::Borrowed(expected_type);
     }
     Cow::Owned(expected_type.replace("datetime.", &format!("{datetime_alias}.")))
+}
+
+fn push_shadow_type_imports(insertion: &mut PendingInsertion, type_imports: &[ShadowTypeImport]) {
+    for type_import in type_imports {
+        if !insertion.type_imports.insert(type_import.clone()) {
+            continue;
+        }
+        push_shadow_statement_prefix(&mut insertion.text, insertion.mode);
+        insertion.text.push_str("import ");
+        insertion.text.push_str(&type_import.module);
+        insertion.text.push_str(" as ");
+        insertion.text.push_str(&type_import.alias);
+    }
 }
 
 fn interpolation_by_index(
@@ -441,6 +667,28 @@ fn line_count(source: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn shadow_test_dir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "t-linter-shadow-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
+    }
 
     fn synthesize(source: &str) -> Option<ShadowDocument> {
         synthesize_for_type_check(Path::new("example.py"), source).expect("synthesize")
@@ -614,6 +862,49 @@ def handler(user: User, age: int, name: str) -> None:
         assert_eq!(
             shadow.sites[5].expected_type,
             "Literal[\"open\", \"closed\"]"
+        );
+        assert_python_parses(&shadow.text);
+    }
+
+    #[test]
+    fn imported_tdom_component_prop_types_are_qualified_in_shadow_source() {
+        let dir = shadow_test_dir("imported-tdom-component-prop-types");
+        write_file(
+            &dir.join("components.py"),
+            r#"from typing import Literal
+
+class User:
+    name: str
+
+def Card(*, owner: User, items: list[User], state: Literal["open"]) -> object:
+    return object()
+"#,
+        );
+        let source = r#"from components import Card
+from tdom import html
+
+def handler(age: int, name: str) -> None:
+    payload = html(t'<{Card} owner={age} items={name} state={name} />')
+"#;
+        let shadow = synthesize_for_type_check(&dir.join("app.py"), source)
+            .expect("synthesize")
+            .expect("shadow");
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(shadow.text.contains("import components as __tl_type_0"));
+        assert!(shadow.text.contains("__tl_0_1: \"__tl_type_0.User\" = age"));
+        assert!(
+            shadow
+                .text
+                .contains("__tl_0_2: \"list[__tl_type_0.User]\" = name")
+        );
+        assert!(
+            shadow
+                .text
+                .contains("__tl_0_3: \"__tl_type_0.Literal[\\\"open\\\"]\" = name"),
+            "{}",
+            shadow.text
         );
         assert_python_parses(&shadow.text);
     }

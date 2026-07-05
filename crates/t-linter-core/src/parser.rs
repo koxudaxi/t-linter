@@ -51,6 +51,7 @@ pub struct CallableParameter {
     pub position: usize,
     pub name: String,
     pub type_annotation: Option<String>,
+    pub type_annotation_module: Option<String>,
     pub template_language: Option<String>,
     pub template_profile: Option<String>,
     pub value_types: Vec<CallableValueType>,
@@ -922,6 +923,7 @@ impl TemplateStringParser {
                 position,
                 name: left_node.utf8_text(source.as_bytes())?.to_string(),
                 type_annotation,
+                type_annotation_module: None,
                 template_language: type_hints.template_language,
                 template_profile: type_hints.template_profile,
                 value_types: type_hints.value_types,
@@ -1032,6 +1034,7 @@ impl TemplateStringParser {
                         position,
                         name: parameter_name.to_string(),
                         type_annotation,
+                        type_annotation_module: None,
                         template_language: type_hints.template_language,
                         template_profile: type_hints.template_profile,
                         value_types: type_hints.value_types,
@@ -1069,9 +1072,12 @@ impl TemplateStringParser {
             }
 
             if !self.import_path_resolves_to_module(&import_path) {
-                if let Some(signatures) =
+                if let Some(mut signatures) =
                     self.resolve_imported_callable_signature(&import_path, module_cache)?
                 {
+                    if let Some((module_name, _)) = import_path.rsplit_once('.') {
+                        mark_signature_type_annotation_module(&mut signatures, module_name);
+                    }
                     module_type_data
                         .callable_signatures
                         .entry(alias.clone())
@@ -1086,7 +1092,8 @@ impl TemplateStringParser {
             if let Some(module_signatures) =
                 self.load_imported_module_type_data(&import_path, module_cache)?
             {
-                for (callable_name, signatures) in module_signatures.callable_signatures {
+                for (callable_name, mut signatures) in module_signatures.callable_signatures {
+                    mark_signature_type_annotation_module(&mut signatures, &import_path);
                     module_type_data
                         .callable_signatures
                         .entry(format!("{import_path}.{callable_name}"))
@@ -1117,7 +1124,8 @@ impl TemplateStringParser {
             if let Some(module_signatures) =
                 self.load_imported_module_type_data(&import_path, module_cache)?
             {
-                for (callable_name, signatures) in module_signatures.callable_signatures {
+                for (callable_name, mut signatures) in module_signatures.callable_signatures {
+                    mark_signature_type_annotation_module(&mut signatures, &import_path);
                     module_type_data
                         .callable_signatures
                         .entry(format!("{import_path}.{callable_name}"))
@@ -3205,6 +3213,14 @@ fn merge_resolved_type_info(target: &mut ResolvedTypeInfo, other: ResolvedTypeIn
         push_value_type(&mut target.value_types, value_type);
     }
     target.accepts_none |= other.accepts_none;
+}
+
+fn mark_signature_type_annotation_module(signature: &mut CallableSignature, module_name: &str) {
+    for parameter in &mut signature.parameters {
+        if parameter.type_annotation.is_some() && parameter.type_annotation_module.is_none() {
+            parameter.type_annotation_module = Some(module_name.to_string());
+        }
+    }
 }
 
 fn resolve_import_module_name(
@@ -9265,6 +9281,50 @@ class Card:
         let card = context.callable_signatures.get("Card").unwrap();
         assert_eq!(card.parameters[0].type_annotation, Some("str".to_string()));
         assert_eq!(card.parameters[1].type_annotation, Some("User".to_string()));
+    }
+
+    #[test]
+    fn test_imported_callable_signature_tracks_type_annotation_module() {
+        let dir = parser_test_dir("imported-callable-type-annotation-module");
+        write_file(
+            &dir.join("components.py"),
+            r#"
+class User:
+    name: str
+
+def Card(*, owner: User) -> object:
+    return object()
+"#,
+        );
+        let source = r#"
+from components import Card
+from tdom import html
+
+def handler(age: int) -> None:
+    html(t'<{Card} owner={age} />')
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        assert_eq!(templates.len(), 1);
+        let signature = parser
+            .module_context()
+            .callable_signatures
+            .get("Card")
+            .unwrap();
+        assert_eq!(
+            signature.parameters[0].type_annotation,
+            Some("User".to_string())
+        );
+        assert_eq!(
+            signature.parameters[0].type_annotation_module,
+            Some("components".to_string())
+        );
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
