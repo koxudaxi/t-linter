@@ -215,7 +215,7 @@ This extension contributes the following settings:
 - **`t-linter.format.runRuffPipeline`**: Run Ruff fixAll, import organization, and formatting before t-linter formatting when t-linter is the Python formatter (default: false)
 - **`t-linter.highlightUntyped`**: Highlight template strings without type annotations (default: true)
 - **`t-linter.enableTypeChecking`**: Enable integration with Python type checkers for cross-module resolution (default: true)
-- **`t-linter.typeChecking.enabled`**: Enable JSON, YAML, and TOML interpolation value type checking through Ty, Pyright, or Pyrefly (default: false)
+- **`t-linter.typeChecking.enabled`**: Enable JSON, YAML, TOML interpolation value type checking and TDOM component prop interpolation type checking through Ty, Pyright, or Pyrefly (default: false)
 - **`t-linter.typeChecking.checker`**: Type checker backend for interpolation value type checking (`ty`, `pyright`, or `pyrefly`; default: `ty`)
 - **`t-linter.typeChecking.command`**: Optional path to the selected type checker executable
 - **`t-linter.typeChecking.tyPath`**: Deprecated optional path to a `ty` executable; use `t-linter.typeChecking.command`

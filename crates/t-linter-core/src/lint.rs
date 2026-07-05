@@ -10,7 +10,8 @@ use tstring_tdom as backend_tdom;
 use tstring_thtml as backend_thtml;
 
 use crate::backend::TemplateBackend;
-use crate::parser::{CallableParameter, CallableSignature, CallableValueType, ModuleContext};
+use crate::parser::{CallableParameter, CallableValueType, ModuleContext};
+use crate::tdom::resolve_component_signature;
 use crate::{TemplatePart, TemplateStringInfo, TemplateStringParser};
 
 const RULE_EMBEDDED_PARSE_ERROR: &str = "embedded-parse-error";
@@ -927,7 +928,7 @@ fn lint_tdom_component_signature(
     diagnostics: &mut Vec<LintDiagnostic>,
 ) {
     let Some(signature) =
-        resolve_tdom_component_signature(module_context, &component.start_tag.expression)
+        resolve_component_signature(module_context, &component.start_tag.expression)
     else {
         // Be conservative for opaque or instance-callable targets: keep syntax,
         // check, format, and highlighting support, but skip prop diagnostics.
@@ -1283,24 +1284,8 @@ fn lint_tdom_component_attribute_type(
     }
 }
 
-fn resolve_tdom_component_signature<'a>(
-    module_context: &'a ModuleContext,
-    expression: &str,
-) -> Option<&'a CallableSignature> {
-    module_context
-        .callable_signatures
-        .get(expression)
-        .or_else(|| {
-            let (base, suffix) = expression.split_once('.')?;
-            let import_target = module_context.imports.get(base)?;
-            module_context
-                .callable_signatures
-                .get(&format!("{import_target}.{suffix}"))
-        })
-}
-
 fn normalize_tdom_prop_name(name: &str) -> String {
-    name.replace('-', "_").to_ascii_lowercase()
+    backend_tdom::normalize_component_prop_name(name).into_owned()
 }
 
 fn make_component_diagnostic(

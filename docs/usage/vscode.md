@@ -68,16 +68,17 @@ This mode continues to use `textDocument/formatting` and `textDocument/rangeForm
 
 ## Interpolation Type Checking
 
-Interpolation value type checking is optional and checks JSON, YAML, and TOML templates. It requires `ty`; t-linter starts `ty server` in the background and maps assignment diagnostics back to the original interpolation expression.
+Interpolation value type checking is optional and checks JSON, YAML, TOML templates and TDOM component props. t-linter starts the selected Ty, Pyright, or Pyrefly server in the background and maps assignment diagnostics back to the original interpolation expression.
 
 ```json
 {
   "t-linter.typeChecking.enabled": true,
-  "t-linter.typeChecking.tyPath": "/path/to/ty"
+  "t-linter.typeChecking.checker": "pyright",
+  "t-linter.typeChecking.command": "/path/to/pyright-langserver"
 }
 ```
 
-`t-linter.typeChecking.tyPath` is optional. Leave it empty to let the language server discover `ty` from the active virtual environment, workspace `.venv`/`venv`, uv project, or `PATH`.
+`t-linter.typeChecking.command` is optional. Leave it empty to let the language server discover the selected checker from the active virtual environment, workspace `.venv`/`venv`, uv project, or `PATH`. The deprecated `t-linter.typeChecking.tyPath` setting is still honored when `checker` is `ty`.
 
 For the architecture, shadow document behavior, and implementation details, see
 [Interpolation Type Checking](./interpolation-type-checking.md).

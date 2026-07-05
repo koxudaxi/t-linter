@@ -5,8 +5,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
+use tstring_tdom as backend_tdom;
 
 use crate::backend::TemplateBackend;
+use crate::parser::ModuleContext;
+use crate::tdom::{expected_type_for_component_prop, resolve_component_signature};
 use crate::{InterpolationInfo, Location, TemplatePart, TemplateStringInfo, TemplateStringParser};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +65,8 @@ struct PendingSite {
 pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<ShadowDocument>> {
     let mut template_parser = TemplateStringParser::new()?;
     let templates = template_parser.find_template_strings_in_file(source, path)?;
-    let requirements_by_template = type_requirements_by_template(&templates);
+    let module_context = template_parser.module_context().clone();
+    let requirements_by_template = type_requirements_by_template(&templates, &module_context);
     if requirements_by_template.iter().all(Vec::is_empty) {
         return Ok(None);
     }
@@ -115,7 +119,10 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
             );
             let annotation =
                 shadow_annotation_type(&requirement.expected_python_type, &datetime_alias);
-            let lhs = format!("{name}: \"{annotation}\" = ");
+            let lhs = format!(
+                "{name}: {} = ",
+                crate::python::double_quoted_string_literal(&annotation)
+            );
             debug_assert!(!lhs.contains('\n'));
             debug_assert!(!interpolation.expression.contains('\n'));
 
@@ -193,6 +200,7 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
 
 fn type_requirements_by_template(
     templates: &[TemplateStringInfo],
+    module_context: &ModuleContext,
 ) -> Vec<Vec<tstring_syntax::InterpolationTypeRequirement>> {
     templates
         .iter()
@@ -203,10 +211,19 @@ fn type_requirements_by_template(
             let Some(backend) = TemplateBackend::for_language(language) else {
                 return Vec::new();
             };
-            match backend.interpolation_type_requirements(
-                &template.to_template_input(),
-                template.profile.as_deref(),
-            ) {
+            let requirements = match (backend, template.profile.as_deref()) {
+                (TemplateBackend::Tdom, None) => {
+                    tdom_interpolation_type_requirements(template, module_context)
+                }
+                (TemplateBackend::Tdom, Some(profile)) if profile.eq_ignore_ascii_case("svg") => {
+                    tdom_interpolation_type_requirements(template, module_context)
+                }
+                _ => backend.interpolation_type_requirements(
+                    &template.to_template_input(),
+                    template.profile.as_deref(),
+                ),
+            };
+            match requirements {
                 Ok(requirements) => requirements,
                 Err(error) => {
                     tracing::debug!(
@@ -221,6 +238,29 @@ fn type_requirements_by_template(
             }
         })
         .collect()
+}
+
+fn tdom_interpolation_type_requirements(
+    template: &TemplateStringInfo,
+    module_context: &ModuleContext,
+) -> tstring_syntax::BackendResult<Vec<tstring_syntax::InterpolationTypeRequirement>> {
+    backend_tdom::interpolation_type_requirements_with_component_props(
+        &template.to_template_input(),
+        |context| {
+            if context.prop_name.as_ref() == "children" {
+                return None;
+            }
+            let signature =
+                resolve_component_signature(module_context, context.component_expression)?;
+            if signature.requires_positional {
+                return None;
+            }
+            let parameter = signature.parameters.iter().find(|parameter| {
+                parameter.name == context.prop_name.as_ref() && parameter.allows_keyword
+            })?;
+            expected_type_for_component_prop(parameter, context.value_kind)
+        },
+    )
 }
 
 fn requires_datetime_alias(expected_type: &str) -> bool {
@@ -529,6 +569,51 @@ def handler(created, label):
         assert_eq!(
             &shadow.text[shadow.sites[0].shadow_rhs_byte_range.clone()],
             "created"
+        );
+        assert_python_parses(&shadow.text);
+    }
+
+    #[test]
+    fn tdom_component_prop_requirements_are_synthesized_from_backend() {
+        let source = r#"from string.templatelib import Template
+from typing import Literal
+from tdom import html
+
+class User:
+    name: str
+
+def Card(*, title: str, count: int, owner: User, labels: list[str], label: str, state: Literal["open", "closed"]) -> object: ...
+
+def handler(user: User, age: int, name: str) -> None:
+    payload = html(t'<{Card} title={age} count={name} owner={age} labels={name} label="Hello {age}" state={name} />')
+"#;
+        let shadow = synthesize(source).expect("shadow");
+
+        assert_eq!(line_count(&shadow.text), line_count(source));
+        assert_eq!(shadow.sites.len(), 6);
+        assert!(shadow.text.contains("__tl_0_1: \"str\" = age"));
+        assert!(shadow.text.contains("__tl_0_2: \"int\" = name"));
+        assert!(shadow.text.contains("__tl_0_3: \"User\" = age"));
+        assert!(shadow.text.contains("__tl_0_4: \"list[str]\" = name"));
+        assert!(shadow.text.contains("__tl_0_5: \"str\" = age"));
+        assert!(
+            shadow
+                .text
+                .contains("__tl_0_6: \"Literal[\\\"open\\\", \\\"closed\\\"]\" = name")
+        );
+        assert_eq!(
+            shadow.sites[0].expected_description,
+            "tdom component prop 'title'"
+        );
+        assert_eq!(shadow.sites[2].expected_type, "User");
+        assert_eq!(shadow.sites[3].expected_type, "list[str]");
+        assert_eq!(
+            shadow.sites[4].expected_description,
+            "tdom component prop 'label' string fragment"
+        );
+        assert_eq!(
+            shadow.sites[5].expected_type,
+            "Literal[\"open\", \"closed\"]"
         );
         assert_python_parses(&shadow.text);
     }

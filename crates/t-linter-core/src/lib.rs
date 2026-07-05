@@ -6,7 +6,9 @@ pub mod highlighter;
 pub mod lint;
 pub mod parser;
 pub mod project_config;
+pub(crate) mod python;
 pub mod shadow;
+pub(crate) mod tdom;
 
 pub use formatting::{
     FormatError, FormatOptions, TemplateEdit, apply_template_edits, format_document,

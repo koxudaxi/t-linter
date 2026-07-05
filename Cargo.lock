@@ -1669,9 +1669,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-format-doc"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de4352d579143a4ff28e4c2b673f3d6e339a8791c17226cd152d692016faae2c"
+checksum = "91a74756365268007fbd61a9a75289a4a042744bf89d12a251be79baa8ac675a"
 dependencies = [
  "unicode-width",
 ]
@@ -1707,9 +1707,9 @@ dependencies = [
 
 [[package]]
 name = "tstring-tdom"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4070dab242967736c0bf4670a59030e223070e0364bcdaa9c927e420532719c8"
+checksum = "3c29977e81e3fe4edf83299a7762b4a972315aa9da5fff61b7405e6aabd65059"
 dependencies = [
  "tstring-format-doc",
  "tstring-syntax",

@@ -434,21 +434,25 @@ fn file_uri_round_trips_special_path_characters() {
 fn type_check_input() -> &'static str {
     r#"from typing import Annotated
 from string.templatelib import Template
+from tdom import html
 
 class User:
     name: str
+
+def Card(*, title: str, count: int, owner: User, labels: list[str], label: str) -> object: ...
 
 def run_json(template: Annotated[Template, "json"]) -> None: ...
 def run_yaml(template: Annotated[Template, "yaml"]) -> None: ...
 def run_toml(template: Annotated[Template, "toml"]) -> None: ...
 
-def handler(user: User, age: int) -> None:
+def handler(user: User, age: int, name: str) -> None:
     payload_json = t'{{"name": {user}, "label": "{age}", "age": {age}, "tag": {1 + 2}, "note": {user!s}}}'
     run_json(payload_json)
     payload_yaml = t'{user}: {age}\nlabel: "{age}"\n'
     run_yaml(payload_yaml)
     payload_toml = t'{user} = {age}\nlabel = "{age}"\n'
     run_toml(payload_toml)
+    payload_tdom = html(t'<{Card} title={age} count={name} owner={age} labels={name} label="Hello {age}" />')
 "#
 }
 
@@ -514,7 +518,7 @@ fn lsp_reports_interpolation_type_error_from_real_type_checkers() {
             .collect::<Vec<_>>();
         assert_eq!(
             type_diagnostics.len(),
-            6,
+            11,
             "{} diagnostics: {diagnostics:?}",
             checker.name
         );
@@ -550,6 +554,29 @@ fn lsp_reports_interpolation_type_error_from_real_type_checkers() {
         assert_diagnostic_span(
             diagnostic_with_message(&type_diagnostics, "toml string fragment"),
             expected_payload_span(source, "payload_toml =", "label = \"{age}\""),
+        );
+        assert_diagnostic_span(
+            diagnostic_with_message(&type_diagnostics, "tdom component prop 'title'"),
+            expected_payload_span(source, "payload_tdom =", "title={age}"),
+        );
+        assert_diagnostic_span(
+            diagnostic_with_message(&type_diagnostics, "tdom component prop 'count'"),
+            expected_payload_span(source, "payload_tdom =", "count={name}"),
+        );
+        assert_diagnostic_span(
+            diagnostic_with_message(&type_diagnostics, "tdom component prop 'owner'"),
+            expected_payload_span(source, "payload_tdom =", "owner={age}"),
+        );
+        assert_diagnostic_span(
+            diagnostic_with_message(&type_diagnostics, "tdom component prop 'labels'"),
+            expected_payload_span(source, "payload_tdom =", "labels={name}"),
+        );
+        assert_diagnostic_span(
+            diagnostic_with_message(
+                &type_diagnostics,
+                "tdom component prop 'label' string fragment",
+            ),
+            expected_payload_span(source, "payload_tdom =", "label=\"Hello {age}\""),
         );
 
         client.shutdown();
