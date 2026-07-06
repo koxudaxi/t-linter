@@ -17,7 +17,8 @@ pub use formatting::{
 };
 pub use highlighter::{HighlightedRange, TemplateHighlighter};
 pub use lint::{
-    LintDiagnostic, LintFileResult, LintRunSummary, LintSeverity, file_read_error, lint_source,
+    DiagnosticData, DiagnosticEdit, DiagnosticEditRange, LintDiagnostic, LintFileResult,
+    LintRunSummary, LintSeverity, file_read_error, lint_source,
 };
 pub use parser::{
     Expression, InterpolationInfo, Location, StaticTextSegment, TemplatePart, TemplateStringInfo,

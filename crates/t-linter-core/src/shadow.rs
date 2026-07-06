@@ -36,7 +36,6 @@ pub struct ShadowDocument {
 struct PendingInsertion {
     text: String,
     sites: Vec<PendingSite>,
-    datetime_imported: bool,
     type_imports: BTreeSet<ShadowTypeImport>,
     mode: InsertionMode,
 }
@@ -69,6 +68,36 @@ struct PendingSite {
 struct ShadowTypeImport {
     module: String,
     alias: String,
+}
+
+#[derive(Debug)]
+struct ShadowImportAllocator {
+    prefix: String,
+    aliases: BTreeMap<String, String>,
+}
+
+impl ShadowImportAllocator {
+    fn new(prefix: &str) -> Self {
+        Self {
+            prefix: prefix.to_string(),
+            aliases: BTreeMap::new(),
+        }
+    }
+
+    fn imports_for_modules(&mut self, modules: BTreeSet<String>) -> Vec<ShadowTypeImport> {
+        modules
+            .into_iter()
+            .map(|module| {
+                let next_index = self.aliases.len();
+                let alias = self
+                    .aliases
+                    .entry(module.clone())
+                    .or_insert_with(|| format!("{}m{next_index}", self.prefix))
+                    .clone();
+                ShadowTypeImport { module, alias }
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -105,7 +134,7 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
         .parse(source, None)
         .context("Failed to parse source")?;
     let line_starts = line_start_offsets(source);
-    let datetime_alias = format!("{prefix}datetime");
+    let mut import_allocator = ShadowImportAllocator::new(&prefix);
     let mut insertions = BTreeMap::<usize, PendingInsertion>::new();
 
     for ((template_index, template), template_requirements) in templates
@@ -142,8 +171,14 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
                 "{prefix}{template_index}_{}",
                 interpolation.interpolation_index
             );
+            let required_imports = import_allocator
+                .imports_for_modules(required_import_modules(&requirement.expected_python_type));
+            let annotation_aliases = required_imports
+                .iter()
+                .map(|import| (import.module.as_str(), import.alias.as_str()))
+                .collect::<BTreeMap<_, _>>();
             let annotation =
-                shadow_annotation_type(&requirement.expected_python_type, &datetime_alias);
+                shadow_annotation_type(&requirement.expected_python_type, &annotation_aliases);
             let lhs = format!(
                 "{name}: {} = ",
                 crate::python::double_quoted_string_literal(&annotation)
@@ -158,14 +193,7 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
                         mode: insertion_point.mode,
                         ..PendingInsertion::default()
                     });
-            if requires_datetime_alias(&requirement.expected_python_type)
-                && !insertion.datetime_imported
-            {
-                push_shadow_statement_prefix(&mut insertion.text, insertion.mode);
-                insertion.text.push_str("import datetime as ");
-                insertion.text.push_str(&datetime_alias);
-                insertion.datetime_imported = true;
-            }
+            push_shadow_type_imports(insertion, &required_imports);
             push_shadow_type_imports(insertion, &template_requirements.type_imports);
             push_shadow_statement_prefix(&mut insertion.text, insertion.mode);
             let rhs_start = insertion.text.len() + lhs.len();
@@ -438,6 +466,15 @@ fn push_python_string_literal_token_if_present(
     true
 }
 
+fn skip_python_string_literal_token_if_present(source: &str, index: &mut usize) -> bool {
+    let Some((prefix_end, quote)) = python_string_literal_prefix(source, *index) else {
+        return false;
+    };
+    *index = prefix_end;
+    skip_python_string_literal_token(source, index, quote);
+    true
+}
+
 fn python_string_literal_prefix(source: &str, index: usize) -> Option<(usize, char)> {
     let mut prefix_end = index;
     while prefix_end < source.len() {
@@ -455,6 +492,11 @@ fn python_string_literal_prefix(source: &str, index: usize) -> Option<(usize, ch
     }
     let ch = source[prefix_end..].chars().next()?;
     matches!(ch, '\'' | '"').then_some((prefix_end, ch))
+}
+
+fn skip_python_string_literal_token(source: &str, index: &mut usize, quote: char) {
+    let mut sink = String::new();
+    push_python_string_literal_token(source, index, &mut sink, quote);
 }
 
 fn push_python_string_literal_token(
@@ -524,15 +566,125 @@ fn is_scope_safe_type_name(identifier: &str) -> bool {
     )
 }
 
-fn requires_datetime_alias(expected_type: &str) -> bool {
-    expected_type.contains("datetime.")
+fn required_import_modules(expected_type: &str) -> BTreeSet<String> {
+    let mut modules = BTreeSet::new();
+    let mut index = 0usize;
+
+    while index < expected_type.len() {
+        if skip_python_string_literal_token_if_present(expected_type, &mut index) {
+            continue;
+        }
+        let ch = expected_type[index..]
+            .chars()
+            .next()
+            .expect("valid char boundary");
+        if ch == 'd' && expected_type[index..].starts_with("datetime.") {
+            modules.insert("datetime".to_string());
+            index += "datetime".len();
+        } else {
+            index += ch.len_utf8();
+        }
+    }
+
+    modules
 }
 
-fn shadow_annotation_type<'a>(expected_type: &'a str, datetime_alias: &str) -> Cow<'a, str> {
-    if !requires_datetime_alias(expected_type) {
+fn shadow_annotation_type<'a>(
+    expected_type: &'a str,
+    import_aliases: &BTreeMap<&str, &str>,
+) -> Cow<'a, str> {
+    if import_aliases.is_empty() {
         return Cow::Borrowed(expected_type);
     }
-    Cow::Owned(expected_type.replace("datetime.", &format!("{datetime_alias}.")))
+
+    let mut rewritten = String::with_capacity(expected_type.len());
+    let mut index = 0usize;
+    let mut changed = false;
+
+    while index < expected_type.len() {
+        if push_python_string_literal_token_if_present(expected_type, &mut index, &mut rewritten) {
+            continue;
+        }
+        let ch = expected_type[index..]
+            .chars()
+            .next()
+            .expect("valid char boundary");
+        if is_python_identifier_start(ch) {
+            let start = index;
+            index += ch.len_utf8();
+            while index < expected_type.len() {
+                let ch = expected_type[index..]
+                    .chars()
+                    .next()
+                    .expect("valid char boundary");
+                match ch {
+                    '.' => {
+                        let dot = index;
+                        index += ch.len_utf8();
+                        let Some(next) = expected_type[index..].chars().next() else {
+                            index = dot;
+                            break;
+                        };
+                        if !is_python_identifier_start(next) {
+                            index = dot;
+                            break;
+                        }
+                        index += next.len_utf8();
+                        while index < expected_type.len() {
+                            let ch = expected_type[index..]
+                                .chars()
+                                .next()
+                                .expect("valid char boundary");
+                            if !is_python_identifier_continue(ch) {
+                                break;
+                            }
+                            index += ch.len_utf8();
+                        }
+                    }
+                    _ if is_python_identifier_continue(ch) => index += ch.len_utf8(),
+                    _ => break,
+                }
+            }
+
+            let dotted_name = &expected_type[start..index];
+            match longest_import_alias(dotted_name, import_aliases) {
+                Some((module, alias)) => {
+                    rewritten.push_str(alias);
+                    rewritten.push_str(&dotted_name[module.len()..]);
+                    changed = true;
+                }
+                None => rewritten.push_str(dotted_name),
+            }
+            continue;
+        }
+
+        rewritten.push(ch);
+        index += ch.len_utf8();
+    }
+
+    if changed {
+        Cow::Owned(rewritten)
+    } else {
+        Cow::Borrowed(expected_type)
+    }
+}
+
+fn longest_import_alias<'a>(
+    dotted_name: &str,
+    import_aliases: &'a BTreeMap<&str, &str>,
+) -> Option<(&'a str, &'a str)> {
+    import_aliases
+        .iter()
+        .filter(|(module, _)| {
+            dotted_name == **module
+                || (dotted_name.starts_with(**module)
+                    && dotted_name
+                        .as_bytes()
+                        .get(module.len())
+                        .is_some_and(|byte| *byte == b'.'))
+        })
+        .max_by_key(|(module, _)| module.len())
+        .map(|(module, alias)| (*module, *alias))
 }
 
 fn push_shadow_type_imports(insertion: &mut PendingInsertion, type_imports: &[ShadowTypeImport]) {
@@ -858,7 +1010,7 @@ def handler(created, label):
         let shadow = synthesize(source).expect("shadow");
 
         assert_eq!(line_count(&shadow.text), line_count(source));
-        assert!(shadow.text.contains("; import datetime as __tl_datetime; __tl_0_0: \"str | int | float | bool | __tl_datetime.date | __tl_datetime.time | __tl_datetime.datetime | list[object] | dict[str, object]\" = created"));
+        assert!(shadow.text.contains("; import datetime as __tl_m0; __tl_0_0: \"str | int | float | bool | __tl_m0.date | __tl_m0.time | __tl_m0.datetime | list[object] | dict[str, object]\" = created"));
         assert!(shadow.text.contains("__tl_0_1: \"str\" = label"));
         assert_eq!(shadow.sites[0].expected_description, "toml value");
         assert!(shadow.sites[0].expected_type.contains("datetime.date"));
@@ -867,6 +1019,24 @@ def handler(created, label):
             "created"
         );
         assert_python_parses(&shadow.text);
+    }
+
+    #[test]
+    fn shadow_annotation_import_rewrite_uses_longest_matching_module() {
+        let aliases = BTreeMap::from([
+            ("generated.order", "__tl_m0"),
+            ("generated.order.types", "__tl_m1"),
+        ]);
+
+        let annotation = shadow_annotation_type(
+            r#"generated.order.Order | generated.order.types.OrderDict | Literal["generated.order.types.Value"]"#,
+            &aliases,
+        );
+
+        assert_eq!(
+            annotation,
+            r#"__tl_m0.Order | __tl_m1.OrderDict | Literal["generated.order.types.Value"]"#
+        );
     }
 
     #[test]

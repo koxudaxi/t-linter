@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 use tstring_html::{Attribute, AttributeLike, Node as HtmlNode};
 use tstring_syntax::Diagnostic;
@@ -21,6 +21,10 @@ const RULE_COMPONENT_MISSING_PROP: &str = "component-missing-prop";
 const RULE_COMPONENT_UNEXPECTED_PROP: &str = "component-unexpected-prop";
 const RULE_COMPONENT_PROP_TYPE_ERROR: &str = "component-prop-type-error";
 const RULE_COMPONENT_UNRESOLVED: &str = "component-unresolved";
+const RULE_TEMPLATE_SCHEMA_MISSING_KEY: &str = "template-schema-missing-key";
+const RULE_TEMPLATE_SCHEMA_UNKNOWN_KEY: &str = "template-schema-unknown-key";
+const RULE_TEMPLATE_SCHEMA_TYPE_SHAPE: &str = "template-schema-type-shape";
+const RULE_BINDING_UNRESOLVED: &str = "binding-unresolved";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +44,45 @@ pub struct LintDiagnostic {
     pub start_column: usize,
     pub end_line: usize,
     pub end_column: usize,
+    pub expected_type: Option<String>,
+    pub found_type: Option<String>,
+    pub schema_pointer: Option<String>,
+    pub source_of_truth: Option<String>,
+    pub suggested_edits: Vec<DiagnosticEdit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticEdit {
+    pub range: DiagnosticEditRange,
+    pub new_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticEditRange {
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+impl DiagnosticEditRange {
+    pub fn from_location(location: &crate::Location) -> Self {
+        Self {
+            start_line: location.start_line,
+            start_column: location.start_column,
+            end_line: location.end_line,
+            end_column: location.end_column,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DiagnosticData {
+    pub expected_type: Option<String>,
+    pub found_type: Option<String>,
+    pub schema_pointer: Option<String>,
+    pub source_of_truth: Option<String>,
+    pub suggested_edits: Vec<DiagnosticEdit>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -100,6 +143,42 @@ struct ResolvedSpreadEntry {
     accepts_none: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SchemaModel {
+    fields: std::collections::BTreeMap<String, SchemaField>,
+}
+
+#[derive(Debug, Clone)]
+struct SchemaField {
+    required: bool,
+    scalar: Option<JsonScalarKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonScalarKind {
+    Integer,
+    Number,
+    String,
+    Boolean,
+    Null,
+    Array,
+    Object,
+}
+
+#[derive(Debug, Clone, Default)]
+struct JsonObjectOutline {
+    pointer: String,
+    static_keys: std::collections::BTreeMap<String, JsonKeyOutline>,
+    has_interpolation_key: bool,
+}
+
+#[derive(Debug, Clone)]
+struct JsonKeyOutline {
+    key_location: crate::Location,
+    value_location: crate::Location,
+    value_kind: Option<JsonScalarKind>,
+}
+
 #[derive(Debug, Clone)]
 enum ResolvedPropValue {
     Explicit(Attribute),
@@ -133,6 +212,12 @@ pub fn lint_source(path: &Path, source: &str) -> Result<LintFileResult> {
             &static_spread_analysis,
         )?);
     }
+    diagnostics.extend(lint_json_schema_bindings(
+        path,
+        source,
+        &templates,
+        &module_context,
+    )?);
 
     sort_and_dedup_diagnostics(&mut diagnostics);
 
@@ -157,6 +242,11 @@ pub fn file_read_error(path: &Path) -> LintFileResult {
             start_column: 1,
             end_line: 1,
             end_column: 1,
+            expected_type: None,
+            found_type: None,
+            schema_pointer: None,
+            source_of_truth: None,
+            suggested_edits: Vec::new(),
         }],
     }
 }
@@ -190,6 +280,11 @@ fn lint_python_source(path: &Path, source: &str) -> Result<Option<LintDiagnostic
         start_column: error_node.start_position().column + 1,
         end_line: error_node.end_position().row + 1,
         end_column: error_node.end_position().column + 1,
+        expected_type: None,
+        found_type: None,
+        schema_pointer: None,
+        source_of_truth: None,
+        suggested_edits: Vec::new(),
     }))
 }
 
@@ -259,6 +354,11 @@ fn lint_template(
             start_column,
             end_line,
             end_column,
+            expected_type: None,
+            found_type: None,
+            schema_pointer: None,
+            source_of_truth: None,
+            suggested_edits: Vec::new(),
         });
     }
 
@@ -330,12 +430,756 @@ fn lint_backend_template(
                 start_column: location.start_column,
                 end_line: location.end_line,
                 end_column: location.end_column,
+                expected_type: None,
+                found_type: None,
+                schema_pointer: None,
+                source_of_truth: None,
+                suggested_edits: Vec::new(),
             }
         })
         .collect::<Vec<_>>();
 
     sort_and_dedup_diagnostics(&mut diagnostics);
     Ok(diagnostics)
+}
+
+#[derive(Debug, Clone)]
+struct JsonSchemaBinding {
+    model_name: String,
+    location: crate::Location,
+}
+
+fn lint_json_schema_bindings(
+    path: &Path,
+    source: &str,
+    templates: &[TemplateStringInfo],
+    module_context: &ModuleContext,
+) -> Result<Vec<LintDiagnostic>> {
+    if !source.contains("Json") || !(source.contains("schema") || source.contains("Json[")) {
+        return Ok(Vec::new());
+    }
+
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .context("Failed to initialize Python parser")?;
+    let Some(tree) = parser.parse(source, None) else {
+        return Ok(Vec::new());
+    };
+    let marker_names = json_marker_names(module_context);
+    let mut models = collect_schema_models(source, tree.root_node())?;
+    extend_imported_schema_models(path, module_context, &mut models)?;
+
+    let mut diagnostics = Vec::new();
+    for template in templates {
+        let Some(binding) =
+            json_schema_binding_for_template(source, tree.root_node(), template, &marker_names)?
+        else {
+            continue;
+        };
+        let Some(model) = models.get(&binding.model_name) else {
+            diagnostics.push(binding_unresolved_diagnostic(path, &binding));
+            continue;
+        };
+        let Some(outline) = json_root_outline(template) else {
+            continue;
+        };
+        diagnostics.extend(lint_json_model_against_outline(
+            path,
+            model,
+            &outline,
+            &binding.model_name,
+        ));
+    }
+
+    Ok(diagnostics)
+}
+
+fn json_marker_names(module_context: &ModuleContext) -> BTreeSet<String> {
+    let mut names = BTreeSet::from(["Json".to_string(), "json_tstring.Json".to_string()]);
+    for (local, target) in &module_context.imports {
+        if target == "json_tstring.Json" {
+            names.insert(local.clone());
+        }
+    }
+    names
+}
+
+fn json_schema_binding_for_template(
+    source: &str,
+    root: Node<'_>,
+    template: &TemplateStringInfo,
+    marker_names: &BTreeSet<String>,
+) -> Result<Option<JsonSchemaBinding>> {
+    let Some(template_start) = location_to_byte_offset(
+        source,
+        template.location.start_line,
+        template.location.start_column,
+    ) else {
+        return Ok(None);
+    };
+    let Some(type_node) = type_annotation_for_template_start(root, template_start) else {
+        return Ok(None);
+    };
+    let type_text = type_node.utf8_text(source.as_bytes())?;
+    let Some(model_name) = json_schema_binding_from_type_text(type_text, marker_names) else {
+        return Ok(None);
+    };
+    Ok(Some(JsonSchemaBinding {
+        model_name,
+        location: location_for_node(type_node),
+    }))
+}
+
+fn type_annotation_for_template_start(root: Node<'_>, template_start: usize) -> Option<Node<'_>> {
+    let mut node = root.descendant_for_byte_range(template_start, template_start + 1)?;
+    loop {
+        if node.kind() == "assignment" {
+            let right = node.child_by_field_name("right")?;
+            if right.start_byte() <= template_start && template_start < right.end_byte() {
+                return node.child_by_field_name("type");
+            }
+        }
+        node = node.parent()?;
+    }
+}
+
+fn json_schema_binding_from_type_text(
+    type_text: &str,
+    marker_names: &BTreeSet<String>,
+) -> Option<String> {
+    let markers = {
+        let mut markers = marker_names.iter().map(String::as_str).collect::<Vec<_>>();
+        markers.sort_by_key(|marker| std::cmp::Reverse(marker.len()));
+        markers
+    };
+    for marker in markers {
+        if let Some(model) = generic_binding_arg(type_text, marker) {
+            return Some(model.to_string());
+        }
+        if let Some(model) = marker_call_schema_arg(type_text, marker) {
+            return Some(model.to_string());
+        }
+    }
+    None
+}
+
+fn generic_binding_arg<'a>(type_text: &'a str, marker: &str) -> Option<&'a str> {
+    let start = find_marker_followed_by(type_text, marker, '[')?;
+    let args = bracket_contents_at(&type_text[start + marker.len()..], '[', ']')?;
+    split_top_level_type_tokens(args, ',')
+        .first()
+        .map(|arg| arg.trim())
+        .filter(|arg| !arg.is_empty())
+}
+
+fn marker_call_schema_arg<'a>(type_text: &'a str, marker: &str) -> Option<&'a str> {
+    let start = find_marker_followed_by(type_text, marker, '(')?;
+    let args = bracket_contents_at(&type_text[start + marker.len()..], '(', ')')?;
+    split_top_level_type_tokens(args, ',')
+        .into_iter()
+        .filter_map(|arg| arg.split_once('='))
+        .find_map(|(name, value)| (name.trim() == "schema").then(|| value.trim()))
+        .filter(|arg| !arg.is_empty())
+}
+
+fn find_marker_followed_by(type_text: &str, marker: &str, next: char) -> Option<usize> {
+    let mut search_start = 0usize;
+    while let Some(relative) = type_text[search_start..].find(marker) {
+        let start = search_start + relative;
+        let end = start + marker.len();
+        let before_ok = start == 0
+            || !type_text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_identifier_continue);
+        let after_ok = type_text[end..].starts_with(next);
+        if before_ok && after_ok {
+            return Some(start);
+        }
+        search_start = end;
+    }
+    None
+}
+
+fn bracket_contents_at(text: &str, open: char, close: char) -> Option<&str> {
+    if !text.starts_with(open) {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in text.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                _ if ch == active_quote => quote = None,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            _ if ch == open => depth += 1,
+            _ if ch == close => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(&text[1..index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_type_tokens(input: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in input.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                _ if ch == active_quote => quote = None,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            _ if ch == separator && bracket_depth == 0 && paren_depth == 0 => {
+                parts.push(input[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(input[start..].trim());
+    parts
+}
+
+fn collect_schema_models(
+    source: &str,
+    root: Node<'_>,
+) -> Result<std::collections::BTreeMap<String, SchemaModel>> {
+    let query = Query::new(
+        &tree_sitter_python::LANGUAGE.into(),
+        r#"
+        (class_definition
+            name: (identifier) @name
+            body: (block) @body) @class
+        "#,
+    )
+    .context("Failed to create schema model query")?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, root, source.as_bytes());
+    let mut models = std::collections::BTreeMap::new();
+
+    while let Some(match_) = matches.next() {
+        let mut class_node = None;
+        let mut name_node = None;
+        let mut body_node = None;
+        for capture in match_.captures {
+            match query.capture_names()[capture.index as usize] {
+                "class" => class_node = Some(capture.node),
+                "name" => name_node = Some(capture.node),
+                "body" => body_node = Some(capture.node),
+                _ => {}
+            }
+        }
+        let (Some(class_node), Some(name_node), Some(body_node)) =
+            (class_node, name_node, body_node)
+        else {
+            continue;
+        };
+        let header = &source[class_node.start_byte()..body_node.start_byte()];
+        let decorated_prefix = class_node
+            .parent()
+            .filter(|parent| parent.kind() == "decorated_definition")
+            .map(|parent| &source[parent.start_byte()..class_node.start_byte()])
+            .unwrap_or("");
+        let is_typed_dict = header.contains("TypedDict");
+        let is_dataclass = decorated_prefix.contains("dataclass");
+        if !is_typed_dict && !is_dataclass {
+            continue;
+        }
+        let total = !header.contains("total=False");
+        let name = name_node.utf8_text(source.as_bytes())?.to_string();
+        let body = body_node.utf8_text(source.as_bytes())?;
+        let model = parse_schema_model_body(body, total, is_dataclass);
+        models.insert(name, model);
+    }
+    Ok(models)
+}
+
+fn extend_imported_schema_models(
+    path: &Path,
+    module_context: &ModuleContext,
+    models: &mut std::collections::BTreeMap<String, SchemaModel>,
+) -> Result<()> {
+    let Some(root) = path.parent() else {
+        return Ok(());
+    };
+    for target in module_context.imports.values() {
+        let Some((module, symbol)) = target.rsplit_once('.') else {
+            continue;
+        };
+        if models.contains_key(symbol) {
+            continue;
+        }
+        let Some(module_path) = imported_module_file(root, module) else {
+            continue;
+        };
+        let Ok(source) = std::fs::read_to_string(&module_path) else {
+            continue;
+        };
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .context("Failed to initialize Python parser")?;
+        let Some(tree) = parser.parse(&source, None) else {
+            continue;
+        };
+        let imported = collect_schema_models(&source, tree.root_node())?;
+        if let Some(model) = imported.get(symbol).cloned() {
+            models.insert(symbol.to_string(), model.clone());
+            models.insert(format!("{module}.{symbol}"), model);
+        }
+    }
+    Ok(())
+}
+
+fn imported_module_file(root: &Path, module: &str) -> Option<PathBuf> {
+    let relative = module
+        .split('.')
+        .fold(PathBuf::new(), |path, part| path.join(part));
+    let file = root.join(&relative).with_extension("py");
+    if file.is_file() {
+        return Some(file);
+    }
+    let init = root.join(relative).join("__init__.py");
+    init.is_file().then_some(init)
+}
+
+fn parse_schema_model_body(body: &str, total: bool, is_dataclass: bool) -> SchemaModel {
+    let mut fields = std::collections::BTreeMap::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed == "pass" {
+            continue;
+        }
+        let Some((name, mut type_text)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if !is_identifier_expression(name) {
+            continue;
+        }
+        type_text = type_text.split('#').next().unwrap_or(type_text).trim();
+        let has_default = type_text.contains('=');
+        type_text = type_text.split('=').next().unwrap_or(type_text).trim();
+        let (required_override, inner_type) = requiredness_from_type_text(type_text);
+        fields.insert(
+            name.to_string(),
+            SchemaField {
+                required: required_override.unwrap_or(if is_dataclass {
+                    !has_default
+                } else {
+                    total
+                }),
+                scalar: json_scalar_from_type(inner_type),
+            },
+        );
+    }
+    SchemaModel { fields }
+}
+
+fn requiredness_from_type_text(type_text: &str) -> (Option<bool>, &str) {
+    for (prefix, required) in [("Required[", true), ("typing.Required[", true)] {
+        if let Some(inner) = type_text
+            .strip_prefix(prefix)
+            .and_then(|text| text.strip_suffix(']'))
+        {
+            return (Some(required), inner.trim());
+        }
+    }
+    for (prefix, required) in [("NotRequired[", false), ("typing.NotRequired[", false)] {
+        if let Some(inner) = type_text
+            .strip_prefix(prefix)
+            .and_then(|text| text.strip_suffix(']'))
+        {
+            return (Some(required), inner.trim());
+        }
+    }
+    (None, type_text)
+}
+
+fn json_scalar_from_type(type_text: &str) -> Option<JsonScalarKind> {
+    let text = type_text.trim();
+    match text {
+        "int" | "builtins.int" => Some(JsonScalarKind::Integer),
+        "float" | "builtins.float" => Some(JsonScalarKind::Number),
+        "str" | "builtins.str" => Some(JsonScalarKind::String),
+        "bool" | "builtins.bool" => Some(JsonScalarKind::Boolean),
+        "None" | "NoneType" => Some(JsonScalarKind::Null),
+        _ if text.starts_with("list[") || text.starts_with("typing.List[") => {
+            Some(JsonScalarKind::Array)
+        }
+        _ if text.starts_with("dict[") || text.starts_with("typing.Dict[") => {
+            Some(JsonScalarKind::Object)
+        }
+        _ => None,
+    }
+}
+
+fn json_root_outline(template: &TemplateStringInfo) -> Option<JsonObjectOutline> {
+    let processed = prepare_template_for_lint(template, "json");
+    let tree = parse_embedded("json", &processed.content).ok()?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let root = tree.root_node().named_child(0)?;
+    (root.kind() == "object").then(|| collect_json_object_outline(template, &processed, root, ""))
+}
+
+fn collect_json_object_outline(
+    template: &TemplateStringInfo,
+    processed: &ProcessedTemplate,
+    object: Node<'_>,
+    pointer: &str,
+) -> JsonObjectOutline {
+    let interpolation_ranges = interpolation_content_ranges(template);
+    let mut outline = JsonObjectOutline {
+        pointer: pointer.to_string(),
+        ..JsonObjectOutline::default()
+    };
+    let mut cursor = object.walk();
+    for child in object.named_children(&mut cursor) {
+        if child.kind() != "pair" {
+            continue;
+        }
+        let Some(key_node) = child.child_by_field_name("key") else {
+            continue;
+        };
+        let Some(value_node) = child.child_by_field_name("value") else {
+            continue;
+        };
+        let key_original_range = processed_original_range(processed, key_node);
+        if ranges_overlap_usize(&key_original_range, &interpolation_ranges) {
+            outline.has_interpolation_key = true;
+            continue;
+        }
+        let Ok(key_text) = key_node.utf8_text(processed.content.as_bytes()) else {
+            continue;
+        };
+        let Ok(key) = serde_json::from_str::<String>(key_text) else {
+            continue;
+        };
+        let value_original_range = processed_original_range(processed, value_node);
+        let value_kind = if ranges_overlap_usize(&value_original_range, &interpolation_ranges) {
+            None
+        } else {
+            json_scalar_from_value_node(value_node, &processed.content)
+        };
+        outline.static_keys.insert(
+            key,
+            JsonKeyOutline {
+                key_location: processed_node_location(template, processed, key_node),
+                value_location: processed_node_location(template, processed, value_node),
+                value_kind,
+            },
+        );
+    }
+    outline
+}
+
+fn interpolation_content_ranges(template: &TemplateStringInfo) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut offset = 0usize;
+    for part in &template.parts {
+        match part {
+            TemplatePart::Static(part) => offset += part.text.len(),
+            TemplatePart::Interpolation(interpolation) => {
+                if let Some(debug_prefix) = &interpolation.debug_prefix {
+                    offset += debug_prefix.len();
+                }
+                ranges.push(offset..offset + 2);
+                offset += 2;
+            }
+        }
+    }
+    ranges
+}
+
+fn processed_original_range(
+    processed: &ProcessedTemplate,
+    node: Node<'_>,
+) -> std::ops::Range<usize> {
+    map_processed_offset(&processed.processed_to_original, node.start_byte())
+        ..map_processed_offset(&processed.processed_to_original, node.end_byte())
+}
+
+fn processed_node_location(
+    template: &TemplateStringInfo,
+    processed: &ProcessedTemplate,
+    node: Node<'_>,
+) -> crate::Location {
+    let range = processed_original_range(processed, node);
+    let ((start_line, start_column), (end_line, end_column)) =
+        template.map_content_range_to_document(range.start, range.end);
+    crate::Location {
+        start_line,
+        start_column,
+        end_line,
+        end_column,
+    }
+}
+
+fn ranges_overlap_usize(
+    range: &std::ops::Range<usize>,
+    candidates: &[std::ops::Range<usize>],
+) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| range.start < candidate.end && candidate.start < range.end)
+}
+
+fn json_scalar_from_value_node(node: Node<'_>, source: &str) -> Option<JsonScalarKind> {
+    match node.kind() {
+        "string" => Some(JsonScalarKind::String),
+        "number" => {
+            let text = node.utf8_text(source.as_bytes()).ok()?;
+            if text.contains(['.', 'e', 'E']) {
+                Some(JsonScalarKind::Number)
+            } else {
+                Some(JsonScalarKind::Integer)
+            }
+        }
+        "true" | "false" => Some(JsonScalarKind::Boolean),
+        "null" => Some(JsonScalarKind::Null),
+        "array" => Some(JsonScalarKind::Array),
+        "object" => Some(JsonScalarKind::Object),
+        _ => None,
+    }
+}
+
+fn lint_json_model_against_outline(
+    path: &Path,
+    model: &SchemaModel,
+    outline: &JsonObjectOutline,
+    source_of_truth: &str,
+) -> Vec<LintDiagnostic> {
+    let mut diagnostics = Vec::new();
+    if !outline.has_interpolation_key {
+        for (field_name, field) in &model.fields {
+            if field.required && !outline.static_keys.contains_key(field_name) {
+                diagnostics.push(schema_diagnostic(
+                    path,
+                    RULE_TEMPLATE_SCHEMA_MISSING_KEY,
+                    format!("JSON template is missing required key '{field_name}'."),
+                    None,
+                    None,
+                    Some(json_pointer_child(&outline.pointer, field_name)),
+                    source_of_truth,
+                    outline_location(outline),
+                    Vec::new(),
+                ));
+            }
+        }
+    }
+
+    for (key, key_outline) in &outline.static_keys {
+        let Some(field) = model.fields.get(key) else {
+            let suggestion = closest_key(key, model.fields.keys().map(String::as_str));
+            let edits = suggestion
+                .and_then(|suggestion| serde_json::to_string(suggestion).ok())
+                .map(|new_text| DiagnosticEdit {
+                    range: DiagnosticEditRange::from_location(&key_outline.key_location),
+                    new_text,
+                })
+                .into_iter()
+                .collect();
+            diagnostics.push(schema_diagnostic(
+                path,
+                RULE_TEMPLATE_SCHEMA_UNKNOWN_KEY,
+                format!("JSON template key '{key}' is not present in schema '{source_of_truth}'."),
+                None,
+                None,
+                Some(json_pointer_child(&outline.pointer, key)),
+                source_of_truth,
+                key_outline.key_location.clone(),
+                edits,
+            ));
+            continue;
+        };
+        if let (Some(expected), Some(found)) = (field.scalar, key_outline.value_kind)
+            && json_type_shape_mismatch(expected, found)
+        {
+            diagnostics.push(schema_diagnostic(
+                path,
+                RULE_TEMPLATE_SCHEMA_TYPE_SHAPE,
+                format!(
+                    "JSON template key '{key}' has static {found} value but schema '{source_of_truth}' expects {expected}."
+                ),
+                Some(expected.to_string()),
+                Some(found.to_string()),
+                Some(json_pointer_child(&outline.pointer, key)),
+                source_of_truth,
+                key_outline.value_location.clone(),
+                Vec::new(),
+            ));
+        }
+    }
+    diagnostics
+}
+
+fn outline_location(outline: &JsonObjectOutline) -> crate::Location {
+    outline
+        .static_keys
+        .values()
+        .next()
+        .map(|key| key.key_location.clone())
+        .unwrap_or(crate::Location {
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 1,
+        })
+}
+
+fn binding_unresolved_diagnostic(path: &Path, binding: &JsonSchemaBinding) -> LintDiagnostic {
+    schema_diagnostic(
+        path,
+        RULE_BINDING_UNRESOLVED,
+        format!(
+            "Could not resolve JSON schema binding '{}'.",
+            binding.model_name
+        ),
+        None,
+        None,
+        None,
+        &binding.model_name,
+        binding.location.clone(),
+        Vec::new(),
+    )
+}
+
+fn schema_diagnostic(
+    path: &Path,
+    rule: &str,
+    message: String,
+    expected_type: Option<String>,
+    found_type: Option<String>,
+    schema_pointer: Option<String>,
+    source_of_truth: &str,
+    location: crate::Location,
+    suggested_edits: Vec<DiagnosticEdit>,
+) -> LintDiagnostic {
+    LintDiagnostic {
+        rule: rule.to_string(),
+        severity: LintSeverity::Error,
+        language: Some("json".to_string()),
+        message,
+        file: path.to_path_buf(),
+        start_line: location.start_line,
+        start_column: location.start_column,
+        end_line: location.end_line,
+        end_column: location.end_column,
+        expected_type,
+        found_type,
+        schema_pointer,
+        source_of_truth: Some(source_of_truth.to_string()),
+        suggested_edits,
+    }
+}
+
+fn json_type_shape_mismatch(expected: JsonScalarKind, found: JsonScalarKind) -> bool {
+    !matches!(
+        (expected, found),
+        (
+            JsonScalarKind::Number,
+            JsonScalarKind::Number | JsonScalarKind::Integer
+        ) | (JsonScalarKind::Integer, JsonScalarKind::Integer)
+            | (JsonScalarKind::String, JsonScalarKind::String)
+            | (JsonScalarKind::Boolean, JsonScalarKind::Boolean)
+            | (JsonScalarKind::Null, JsonScalarKind::Null)
+            | (JsonScalarKind::Array, JsonScalarKind::Array)
+            | (JsonScalarKind::Object, JsonScalarKind::Object)
+    )
+}
+
+fn json_pointer_child(parent: &str, key: &str) -> String {
+    let escaped = key.replace('~', "~0").replace('/', "~1");
+    match parent {
+        "" => format!("/{escaped}"),
+        _ => format!("{parent}/{escaped}"),
+    }
+}
+
+fn closest_key<'a>(key: &str, candidates: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    candidates
+        .map(|candidate| (levenshtein(key, candidate), candidate))
+        .min_by_key(|(distance, _)| *distance)
+        .and_then(|(distance, candidate)| (distance <= 3).then_some(candidate))
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let mut previous = (0..=right.chars().count()).collect::<Vec<_>>();
+    let mut current = vec![0; previous.len()];
+    for (left_index, left_ch) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_ch) in right.chars().enumerate() {
+            let replace_cost = usize::from(left_ch != right_ch);
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + replace_cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.chars().count()]
+}
+
+fn location_for_node(node: Node<'_>) -> crate::Location {
+    crate::Location {
+        start_line: node.start_position().row + 1,
+        start_column: node.start_position().column + 1,
+        end_line: node.end_position().row + 1,
+        end_column: node.end_position().column + 1,
+    }
+}
+
+fn is_identifier_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+impl std::fmt::Display for JsonScalarKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Integer => "integer",
+            Self::Number => "number",
+            Self::String => "string",
+            Self::Boolean => "boolean",
+            Self::Null => "null",
+            Self::Array => "array",
+            Self::Object => "object",
+        })
+    }
 }
 
 fn parse_embedded(language: &str, source: &str) -> Result<Tree> {
@@ -1311,6 +2155,11 @@ fn make_component_diagnostic(
         start_column: location.start_column,
         end_line: location.end_line,
         end_column: location.end_column,
+        expected_type: None,
+        found_type: None,
+        schema_pointer: None,
+        source_of_truth: None,
+        suggested_edits: Vec::new(),
     }
 }
 

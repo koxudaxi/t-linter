@@ -141,6 +141,26 @@ template: Annotated[Template, "html"] = rt"<div><"
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(json["summary"]["diagnostics"], 1);
     assert_eq!(json["diagnostics"][0]["language"], "html");
+    assert_eq!(
+        json["diagnostics"][0]["expected_type"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        json["diagnostics"][0]["found_type"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        json["diagnostics"][0]["schema_pointer"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        json["diagnostics"][0]["source_of_truth"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        json["diagnostics"][0]["suggested_edits"],
+        serde_json::json!([])
+    );
 
     let _ = fs::remove_dir_all(dir);
 }
@@ -174,6 +194,180 @@ service:
         json["diagnostics"][0]["message"],
         "Quote YAML plain scalars that mix whitespace and interpolations."
     );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_json_schema_binding_inward_diagnostics() {
+    let dir = test_dir("json-schema-binding");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated, NotRequired, TypedDict
+from string.templatelib import Template
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+    name: str
+    active: bool
+    note: NotRequired[str]
+
+payload: Annotated[Template, Json(schema=Order)] = t'{{"id": "abc", "nme": "Ada"}}'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let rules = json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|diagnostic| diagnostic["rule"].as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(rules.contains(&"template-schema-missing-key"));
+    assert!(rules.contains(&"template-schema-unknown-key"));
+    assert!(rules.contains(&"template-schema-type-shape"));
+    let unknown = json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|diagnostic| diagnostic["rule"] == "template-schema-unknown-key")
+        .unwrap();
+    assert_eq!(unknown["schema_pointer"], "/nme");
+    assert_eq!(unknown["source_of_truth"], "Order");
+    assert_eq!(unknown["suggested_edits"][0]["new_text"], "\"name\"");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_json_generic_binding_and_unresolved_binding() {
+    let dir = test_dir("json-generic-binding");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import TypedDict
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+
+ok: Json[Order] = t'{{"id": 1}}'
+missing: Json[MissingOrder] = t'{{"id": 1}}'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "binding-unresolved");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_resolves_json_schema_binding_across_imports() {
+    let dir = test_dir("json-schema-import");
+    write_file(
+        &dir.join("models.py"),
+        r#"from typing import TypedDict
+
+class Order(TypedDict):
+    id: int
+    name: str
+"#,
+    );
+    write_file(
+        &dir.join("app.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+from json_tstring import Json
+from models import Order
+
+payload: Annotated[Template, Json(schema=Order)] = t'{{"id": 1}}'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "app.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(
+        json["diagnostics"][0]["rule"],
+        "template-schema-missing-key"
+    );
+    assert_eq!(json["diagnostics"][0]["source_of_truth"], "Order");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_uses_dataclass_defaults_for_json_schema_requiredness() {
+    let dir = test_dir("json-schema-dataclass");
+    write_file(
+        &dir.join("app.py"),
+        r#"from dataclasses import dataclass
+from json_tstring import Json
+
+@dataclass
+class Order:
+    id: int
+    note: str = ""
+
+payload: Json[Order] = t'{{"note": "ok"}}'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "app.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(
+        json["diagnostics"][0]["rule"],
+        "template-schema-missing-key"
+    );
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("'id'")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_suppresses_json_schema_missing_key_when_key_is_interpolated() {
+    let dir = test_dir("json-schema-interpolated-key");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typing import Annotated, TypedDict
+from string.templatelib import Template
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+
+payload: Annotated[Template, Json(schema=Order)] = t'{{{key}: 1}}'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
 
     let _ = fs::remove_dir_all(dir);
 }
