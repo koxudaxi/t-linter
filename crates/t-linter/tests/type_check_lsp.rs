@@ -263,14 +263,21 @@ struct LspClient {
 
 impl LspClient {
     fn start(workspace: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_t-linter"))
+        Self::start_with_env(workspace, &[])
+    }
+
+    fn start_with_env(workspace: &Path, envs: &[(&str, &str)]) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_t-linter"));
+        command
             .args(["lsp", "--stdio"])
             .current_dir(workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        for (name, value) in envs {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().unwrap();
 
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -615,7 +622,7 @@ fn sql_catalog_cache_drives_lsp_type_diagnostics_from_real_database() {
     let uri = file_uri(&file);
     for checker in checkers {
         write_type_checker_config_files(&dir, checker.checker);
-        let mut client = LspClient::start(&dir);
+        let mut client = LspClient::start_with_env(&dir, &offline_envs);
         client.initialize(&dir, &checker);
         client.did_open(&uri, &source);
 
