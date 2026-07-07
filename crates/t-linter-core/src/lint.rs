@@ -1044,6 +1044,7 @@ fn split_top_level_type_tokens_with_offsets(input: &str, separator: char) -> Vec
     let mut start = 0usize;
     let mut bracket_depth = 0usize;
     let mut paren_depth = 0usize;
+    let mut brace_depth = 0usize;
     let mut quote = None;
     let mut escaped = false;
     for (index, ch) in input.char_indices() {
@@ -1065,7 +1066,9 @@ fn split_top_level_type_tokens_with_offsets(input: &str, separator: char) -> Vec
             ']' => bracket_depth = bracket_depth.saturating_sub(1),
             '(' => paren_depth += 1,
             ')' => paren_depth = paren_depth.saturating_sub(1),
-            _ if ch == separator && bracket_depth == 0 && paren_depth == 0 => {
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            _ if ch == separator && bracket_depth == 0 && paren_depth == 0 && brace_depth == 0 => {
                 push_type_token(input, start, index, &mut parts);
                 start = index + ch.len_utf8();
             }
@@ -3449,6 +3452,28 @@ value: Annotated[Template, "json"] = t'{{"literal": "{{}}", "value": {value}}}'
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.rule == RULE_PYTHON_PARSE_ERROR)
+        );
+    }
+
+    #[test]
+    fn type_token_splitter_ignores_commas_inside_braces() {
+        let tokens = split_top_level_type_tokens_with_offsets(
+            r#"Template, {"dialect": "json", "strict": True}, "json", Json"#,
+            ',',
+        );
+        let texts = tokens
+            .into_iter()
+            .map(|token| token.text)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            texts,
+            vec![
+                "Template",
+                r#"{"dialect": "json", "strict": True}"#,
+                r#""json""#,
+                "Json"
+            ]
         );
     }
 }
