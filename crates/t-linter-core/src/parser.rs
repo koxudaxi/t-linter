@@ -19,6 +19,7 @@ use wait_timeout::ChildExt;
 pub struct ModuleContext {
     pub type_aliases: HashMap<String, String>,
     pub imports: HashMap<String, String>,
+    pub template_language_markers: HashMap<String, String>,
     pub callable_signatures: HashMap<String, CallableSignature>,
     pub local_callable_signature_names: HashSet<String>,
     imported_module_paths: HashSet<String>,
@@ -418,6 +419,7 @@ impl TemplateStringParser {
         )?;
 
         context.imports = module_type_data.imports.clone();
+        context.template_language_markers = module_type_data.template_language_markers.clone();
         context.callable_signatures = module_type_data.callable_signatures.clone();
         context.local_callable_signature_names =
             module_type_data.local_callable_signature_names.clone();
@@ -558,7 +560,13 @@ impl TemplateStringParser {
                 current_module_name,
                 current_module_is_package,
             )?;
-            self.collect_template_language_markers(tree, source, &mut module_type_data)?;
+            self.collect_template_language_markers(
+                tree,
+                source,
+                &mut module_type_data,
+                module_cache,
+                import_resolution_filter,
+            )?;
             self.collect_type_aliases(tree, source, &mut module_type_data)?;
             self.collect_local_callable_signatures(
                 tree,
@@ -585,6 +593,8 @@ impl TemplateStringParser {
         tree: &Tree,
         source: &str,
         module_type_data: &mut ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        import_resolution_filter: Option<&HashSet<String>>,
     ) -> Result<()> {
         let query = Query::new(
             &tree_sitter_python::LANGUAGE.into(),
@@ -597,6 +607,7 @@ impl TemplateStringParser {
         .context("Failed to create template language marker query")?;
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+        let mut classes = Vec::new();
 
         while let Some(match_) = matches.next() {
             let mut class_node = None;
@@ -622,16 +633,106 @@ impl TemplateStringParser {
             if !is_module_level_statement(statement_node) {
                 continue;
             }
-            let Some(language) = template_language_marker_from_body(body_node, source)? else {
+            classes.push((
+                name_node.utf8_text(source.as_bytes())?.to_string(),
+                class_node,
+                body_node,
+            ));
+        }
+
+        for (name, _, body_node) in &classes {
+            let Some(language) = template_language_marker_from_body(*body_node, source)? else {
                 continue;
             };
-            module_type_data.template_language_markers.insert(
-                name_node.utf8_text(source.as_bytes())?.to_string(),
-                language,
-            );
+            module_type_data
+                .template_language_markers
+                .insert(name.clone(), language);
+        }
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (name, class_node, _) in &classes {
+                if module_type_data
+                    .template_language_markers
+                    .contains_key(name)
+                {
+                    continue;
+                }
+                let Some(language) = self.template_language_marker_from_bases(
+                    *class_node,
+                    source,
+                    module_type_data,
+                    module_cache,
+                )?
+                else {
+                    continue;
+                };
+                module_type_data
+                    .template_language_markers
+                    .insert(name.clone(), language);
+                changed = true;
+            }
+        }
+
+        for (local_name, import_target) in module_type_data.imports.clone() {
+            if import_resolution_filter.is_some_and(|filter| !filter.contains(&local_name)) {
+                continue;
+            }
+            if module_type_data
+                .template_language_markers
+                .contains_key(&local_name)
+                || self.import_path_resolves_to_module(&import_target)
+            {
+                continue;
+            }
+            let mut visited = HashSet::new();
+            let Some(language) = self.resolve_template_marker_import_target(
+                &import_target,
+                module_cache,
+                &mut visited,
+            )?
+            else {
+                continue;
+            };
+            module_type_data
+                .template_language_markers
+                .insert(local_name, language);
         }
 
         Ok(())
+    }
+
+    fn template_language_marker_from_bases(
+        &mut self,
+        class_node: Node,
+        source: &str,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+    ) -> Result<Option<String>> {
+        let Some(superclasses) = class_node.child_by_field_name("superclasses") else {
+            return Ok(None);
+        };
+        let mut cursor = superclasses.walk();
+        for base in superclasses.named_children(&mut cursor) {
+            if matches!(
+                base.kind(),
+                "keyword_argument" | "list_splat" | "dictionary_splat"
+            ) {
+                continue;
+            }
+            let base_expr = parse_type_expr(base.utf8_text(source.as_bytes())?);
+            let mut visited = HashSet::new();
+            if let Some(language) = self.resolve_template_marker_language_expr(
+                &base_expr,
+                module_type_data,
+                module_cache,
+                &mut visited,
+            )? {
+                return Ok(Some(language));
+            }
+        }
+        Ok(None)
     }
 
     fn collect_type_aliases(
@@ -2965,8 +3066,11 @@ impl TemplateStringParser {
         }
 
         let metadata = &args[1..];
-        if let Some(TypeExpr::StringLiteral(language)) = metadata.first() {
-            resolved.template_language = Some(language.clone());
+        if let Some(language) = metadata.iter().find_map(|arg| match arg {
+            TypeExpr::StringLiteral(language) => Some(language.clone()),
+            _ => None,
+        }) {
+            resolved.template_language = Some(language);
         }
         if resolved.template_language.is_none() {
             for arg in metadata {
@@ -3817,9 +3921,7 @@ fn template_language_marker_from_body(body: Node, source: &str) -> Result<Option
         let Some(left) = assignment.child_by_field_name("left") else {
             continue;
         };
-        if left.kind() != "identifier"
-            || left.utf8_text(source.as_bytes())? != "__tstring_language__"
-        {
+        if left.kind() != "identifier" || left.utf8_text(source.as_bytes())? != "tstring_language" {
             continue;
         }
         let Some(right) = assignment.child_by_field_name("right") else {
@@ -7386,6 +7488,30 @@ payload: Annotated[Template, "yaml", Json(schema=Order)] = t'{"id": {order_id}}'
     }
 
     #[test]
+    fn test_annotated_template_marker_metadata_accepts_class_and_instance() {
+        let source = r#"
+from typing import Annotated, TypedDict
+from string.templatelib import Template
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+
+class_marker: Annotated[Template, Json] = t'{"id": {order_id}}'
+instance_marker: Annotated[Template, Json()] = t'{"id": {order_id}}'
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 2);
+        assert!(templates.iter().all(|template| {
+            template.language == Some("json".to_string())
+                && template.language_detection == Some(LanguageDetection::Annotation)
+        }));
+    }
+
+    #[test]
     fn test_annotated_template_marker_metadata_supports_alias_and_dotted_imports() {
         let source = r#"
 from typing import Annotated, TypedDict
@@ -7458,11 +7584,11 @@ payload: Json[Order] = t'{"id": {order_id}}'
         let dir = parser_test_dir("template-language-marker-attribute");
         write_file(
             &dir.join("markers.py"),
-            r#"from typing import final
+            r#"from typing import Final, final
 
 @final
 class DataTemplate:
-    __tstring_language__ = "yaml"
+    tstring_language: Final = "yaml"
 "#,
         );
         let source = r#"
@@ -7490,8 +7616,10 @@ payload: Annotated[Template, DataTemplate()] = t"name: {name}"
         let site_packages = project_site_packages(&dir);
         write_file(
             &site_packages.join("markers.pyi"),
-            r#"class DataTemplate:
-    __tstring_language__ = "yaml"
+            r#"from typing import Final
+
+class DataTemplate:
+    tstring_language: Final = "yaml"
 "#,
         );
         let source = r#"
@@ -7508,6 +7636,47 @@ payload: Annotated[Template, DataTemplate()] = t"name: {name}"
             .unwrap();
 
         let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_dunder_template_language_marker_attribute_is_ignored() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+class DataTemplate:
+    __tstring_language__ = "yaml"
+
+payload: Annotated[Template, DataTemplate()] = t"name: {name}"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, None);
+    }
+
+    #[test]
+    fn test_template_language_marker_inherits_static_base_attribute() {
+        let source = r#"
+from typing import Annotated, Final
+from string.templatelib import Template
+
+class BaseTemplate:
+    tstring_language: Final = "yaml"
+
+class DataTemplate(BaseTemplate):
+    pass
+
+payload: Annotated[Template, DataTemplate()] = t"name: {name}"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("yaml".to_string()));

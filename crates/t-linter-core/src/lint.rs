@@ -26,6 +26,8 @@ const RULE_COMPONENT_UNRESOLVED: &str = "component-unresolved";
 const RULE_TEMPLATE_SCHEMA_MISSING_KEY: &str = "template-schema-missing-key";
 const RULE_TEMPLATE_SCHEMA_UNKNOWN_KEY: &str = "template-schema-unknown-key";
 const RULE_TEMPLATE_SCHEMA_TYPE_SHAPE: &str = "template-schema-type-shape";
+const RULE_TEMPLATE_METADATA_CONFLICT: &str = "template-metadata-conflict";
+const RULE_TEMPLATE_METADATA_REDUNDANT_LANGUAGE: &str = "template-metadata-redundant-language";
 const RULE_BINDING_UNRESOLVED: &str = "binding-unresolved";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -214,6 +216,12 @@ pub fn lint_source_with_config(
     if let Some(diagnostic) = python_diagnostic {
         diagnostics.push(diagnostic);
     }
+    diagnostics.extend(lint_template_metadata_markers(
+        path,
+        source,
+        &templates,
+        &module_context,
+    )?);
 
     for template in &templates {
         diagnostics.extend(lint_template(
@@ -745,6 +753,348 @@ fn json_marker_names(module_context: &ModuleContext) -> BTreeSet<String> {
         }
     }
     names
+}
+
+fn template_marker_languages(module_context: &ModuleContext) -> Vec<(String, String)> {
+    let mut markers = json_marker_names(module_context)
+        .into_iter()
+        .map(|name| (name, "json".to_string()))
+        .collect::<BTreeMap<_, _>>();
+    for (name, language) in &module_context.template_language_markers {
+        markers.insert(name.clone(), language.clone());
+    }
+    let mut markers = markers.into_iter().collect::<Vec<_>>();
+    markers.sort_by_key(|(name, _)| std::cmp::Reverse(name.len()));
+    markers
+}
+
+fn lint_template_metadata_markers(
+    path: &Path,
+    source: &str,
+    templates: &[TemplateStringInfo],
+    module_context: &ModuleContext,
+) -> Result<Vec<LintDiagnostic>> {
+    if !source.contains("Annotated") || templates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .context("Failed to initialize Python parser")?;
+    let Some(tree) = parser.parse(source, None) else {
+        return Ok(Vec::new());
+    };
+    let markers = template_marker_languages(module_context);
+    let mut diagnostics = Vec::new();
+
+    for template in templates {
+        let Some(template_start) = location_to_byte_offset(
+            source,
+            template.location.start_line,
+            template.location.start_column,
+        ) else {
+            continue;
+        };
+        let Some(type_node) = type_annotation_for_template_start(tree.root_node(), template_start)
+        else {
+            continue;
+        };
+        let type_text = type_node.utf8_text(source.as_bytes())?;
+        let Some(metadata) = annotated_metadata_items(type_text) else {
+            continue;
+        };
+
+        let string_languages = metadata
+            .iter()
+            .filter_map(|item| metadata_language_string(item.text).map(|language| (language, item)))
+            .collect::<Vec<_>>();
+        let marker_languages = metadata
+            .iter()
+            .filter_map(|item| marker_metadata_language(item.text, &markers))
+            .collect::<Vec<_>>();
+
+        if marker_languages.len() > 1 {
+            diagnostics.push(metadata_diagnostic(
+                path,
+                type_node,
+                RULE_TEMPLATE_METADATA_CONFLICT,
+                LintSeverity::Error,
+                "Template metadata must contain at most one language marker.".to_string(),
+                Vec::new(),
+            ));
+            continue;
+        }
+        let Some(marker_language) = marker_languages.first() else {
+            continue;
+        };
+
+        let conflicting_language = string_languages
+            .iter()
+            .map(|(language, _)| language)
+            .find(|language| *language != marker_language);
+        if let Some(language) = conflicting_language {
+            diagnostics.push(metadata_diagnostic(
+                path,
+                type_node,
+                RULE_TEMPLATE_METADATA_CONFLICT,
+                LintSeverity::Error,
+                format!(
+                    "Template metadata declares language '{language}' and marker language '{marker_language}'."
+                ),
+                Vec::new(),
+            ));
+        } else if let Some((language, item)) = string_languages
+            .iter()
+            .find(|(language, _)| language == marker_language)
+        {
+            diagnostics.push(metadata_diagnostic(
+                path,
+                type_node,
+                RULE_TEMPLATE_METADATA_REDUNDANT_LANGUAGE,
+                LintSeverity::Warning,
+                format!(
+                    "Template metadata redundantly declares language '{language}' alongside a marker."
+                ),
+                redundant_language_edit(source, type_node, item),
+            ));
+        }
+    }
+
+    Ok(diagnostics)
+}
+
+#[derive(Debug)]
+struct MetadataItem<'a> {
+    text: &'a str,
+    start: usize,
+    end: usize,
+}
+
+fn annotated_metadata_items(type_text: &str) -> Option<Vec<MetadataItem<'_>>> {
+    let start = find_marker_followed_by(type_text, "Annotated", '[')?;
+    let bracket_start = start + "Annotated".len();
+    let contents = bracket_contents_at(&type_text[bracket_start..], '[', ']')?;
+    let args = split_top_level_type_tokens_with_offsets(contents, ',');
+    if args.len() < 2 {
+        return None;
+    }
+    let contents_start = bracket_start + 1;
+    Some(
+        args.into_iter()
+            .skip(1)
+            .map(|item| MetadataItem {
+                text: item.text,
+                start: contents_start + item.start,
+                end: contents_start + item.end,
+            })
+            .collect(),
+    )
+}
+
+fn metadata_language_string(text: &str) -> Option<String> {
+    let language = parse_metadata_string_literal(text.trim())?;
+    if template_profile_text(&language).is_some() {
+        return None;
+    }
+    Some(language)
+}
+
+fn parse_metadata_string_literal(text: &str) -> Option<String> {
+    let mut chars = text.chars();
+    let quote = chars.next()?;
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
+    let suffix = text.strip_prefix(quote)?.strip_suffix(quote)?;
+    Some(suffix.to_string())
+}
+
+fn template_profile_text(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("profile:")
+        .or_else(|| value.strip_prefix("profile="))
+}
+
+fn marker_metadata_language(text: &str, markers: &[(String, String)]) -> Option<String> {
+    let text = text.trim();
+    markers.iter().find_map(|(marker, language)| {
+        if text == marker
+            || find_marker_followed_by(text, marker, '(').is_some_and(|index| index == 0)
+            || find_marker_followed_by(text, marker, '[').is_some_and(|index| index == 0)
+        {
+            return Some(language.clone());
+        }
+        None
+    })
+}
+
+fn metadata_diagnostic(
+    path: &Path,
+    node: Node<'_>,
+    rule: &str,
+    severity: LintSeverity,
+    message: String,
+    suggested_edits: Vec<DiagnosticEdit>,
+) -> LintDiagnostic {
+    let location = location_for_node(node);
+    LintDiagnostic {
+        rule: rule.to_string(),
+        severity,
+        language: None,
+        message,
+        file: path.to_path_buf(),
+        start_line: location.start_line,
+        start_column: location.start_column,
+        end_line: location.end_line,
+        end_column: location.end_column,
+        expected_type: None,
+        found_type: None,
+        schema_pointer: None,
+        source_of_truth: None,
+        suggested_edits,
+    }
+}
+
+fn redundant_language_edit(
+    source: &str,
+    type_node: Node<'_>,
+    item: &MetadataItem<'_>,
+) -> Vec<DiagnosticEdit> {
+    let type_text = type_node.utf8_text(source.as_bytes()).unwrap_or("");
+    let (delete_start, delete_end) = redundant_language_delete_range(type_text, item);
+    let Some(location) = location_for_byte_range(
+        source,
+        type_node.start_byte() + delete_start,
+        type_node.start_byte() + delete_end,
+    ) else {
+        return Vec::new();
+    };
+    vec![DiagnosticEdit {
+        range: DiagnosticEditRange::from_location(&location),
+        new_text: String::new(),
+    }]
+}
+
+fn redundant_language_delete_range(type_text: &str, item: &MetadataItem<'_>) -> (usize, usize) {
+    let bytes = type_text.as_bytes();
+    let mut end = item.end;
+    while end < bytes.len() && bytes[end].is_ascii_whitespace() {
+        end += 1;
+    }
+    if end < bytes.len() && bytes[end] == b',' {
+        end += 1;
+        while end < bytes.len() && bytes[end].is_ascii_whitespace() {
+            end += 1;
+        }
+        return (item.start, end);
+    }
+
+    let mut start = item.start;
+    while start > 0 && bytes[start - 1].is_ascii_whitespace() {
+        start -= 1;
+    }
+    if let Some(comma) = type_text[..start].rfind(',') {
+        return (comma, item.end);
+    }
+    (item.start, item.end)
+}
+
+fn location_for_byte_range(source: &str, start: usize, end: usize) -> Option<crate::Location> {
+    if start > end || end > source.len() {
+        return None;
+    }
+    let (start_line, start_column) = byte_position_to_line_column(source, start)?;
+    let (end_line, end_column) = byte_position_to_line_column(source, end)?;
+    Some(crate::Location {
+        start_line,
+        start_column,
+        end_line,
+        end_column,
+    })
+}
+
+fn byte_position_to_line_column(source: &str, offset: usize) -> Option<(usize, usize)> {
+    if offset > source.len() {
+        return None;
+    }
+    let mut line = 1usize;
+    let mut line_start = 0usize;
+    for (index, ch) in source.char_indices() {
+        if index >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            line_start = index + 1;
+        }
+    }
+    Some((line, offset - line_start + 1))
+}
+
+#[derive(Debug)]
+struct TypeToken<'a> {
+    text: &'a str,
+    start: usize,
+    end: usize,
+}
+
+fn split_top_level_type_tokens_with_offsets(input: &str, separator: char) -> Vec<TypeToken<'_>> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in input.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                _ if ch == active_quote => quote = None,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            _ if ch == separator && bracket_depth == 0 && paren_depth == 0 => {
+                push_type_token(input, start, index, &mut parts);
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    push_type_token(input, start, input.len(), &mut parts);
+    parts
+}
+
+fn push_type_token<'a>(
+    input: &'a str,
+    raw_start: usize,
+    raw_end: usize,
+    parts: &mut Vec<TypeToken<'a>>,
+) {
+    let mut start = raw_start;
+    let mut end = raw_end;
+    while start < end && input.as_bytes()[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && input.as_bytes()[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    parts.push(TypeToken {
+        text: &input[start..end],
+        start,
+        end,
+    });
 }
 
 fn collect_json_schema_type_aliases(

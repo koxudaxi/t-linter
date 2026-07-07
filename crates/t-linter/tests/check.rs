@@ -273,6 +273,100 @@ payload: Annotated[Template, Json(schema=Order)] = t'[1,,2]'
 }
 
 #[test]
+fn check_reports_template_metadata_language_conflict() {
+    let dir = test_dir("template-metadata-conflict");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+from json_tstring import Json
+
+payload: Annotated[Template, "yaml", Json] = t'{{"id": 1}}'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "template-metadata-conflict");
+    assert_eq!(json["diagnostics"][0]["severity"], "error");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("marker language 'json'")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_redundant_template_metadata_language() {
+    let dir = test_dir("template-metadata-redundant");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+from json_tstring import Json
+
+payload: Annotated[Template, "json", Json] = t'{{"id": 1}}'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(
+        json["diagnostics"][0]["rule"],
+        "template-metadata-redundant-language"
+    );
+    assert_eq!(json["diagnostics"][0]["severity"], "warning");
+    assert_eq!(json["diagnostics"][0]["suggested_edits"][0]["new_text"], "");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_multiple_template_metadata_markers() {
+    let dir = test_dir("template-metadata-multiple-markers");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated, Final
+from string.templatelib import Template
+from json_tstring import Json
+
+class YamlTemplate:
+    tstring_language: Final = "yaml"
+
+payload: Annotated[Template, Json, YamlTemplate] = t'{{"id": 1}}'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "template-metadata-conflict");
+    assert_eq!(json["diagnostics"][0]["severity"], "error");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("at most one language marker")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_resolves_json_schema_binding_marker_alias() {
     let dir = test_dir("json-schema-marker-alias");
     write_file(
