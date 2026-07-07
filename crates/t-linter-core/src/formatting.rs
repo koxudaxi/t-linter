@@ -192,6 +192,9 @@ fn format_template_edit(
     let line_length = options.line_length.max(1);
 
     let backend = TemplateBackend::for_language(&language)?;
+    if backend == TemplateBackend::Sql {
+        return None;
+    }
     let formatted = backend.format_template(&input, template.profile.as_deref(), line_length);
 
     Some(

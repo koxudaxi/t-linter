@@ -9,6 +9,7 @@ use tstring_tdom as backend_tdom;
 
 use crate::backend::TemplateBackend;
 use crate::parser::ModuleContext;
+use crate::project_config::{SqlConfig, load_project_config_for_path};
 use crate::tdom::{
     ComponentPropExpectedType, expected_type_for_component_prop, resolve_component_signature,
 };
@@ -104,6 +105,7 @@ impl ShadowImportAllocator {
 struct TemplateTypeRequirements {
     requirements: Vec<tstring_syntax::InterpolationTypeRequirement>,
     type_imports: Vec<ShadowTypeImport>,
+    allow_format_specs: bool,
 }
 
 impl TemplateTypeRequirements {
@@ -117,8 +119,11 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
     let templates = template_parser.find_template_strings_in_file(source, path)?;
     let module_context = template_parser.module_context().clone();
     let prefix = available_shadow_prefix(source);
+    let sql_config = load_project_config_for_path(path)
+        .map(|config| config.sql)
+        .unwrap_or_default();
     let requirements_by_template =
-        type_requirements_by_template(&templates, &module_context, &prefix);
+        type_requirements_by_template(&templates, &module_context, &prefix, &sql_config);
     if requirements_by_template
         .iter()
         .all(TemplateTypeRequirements::is_empty)
@@ -157,13 +162,20 @@ pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<Sha
             continue;
         };
 
+        let allow_format_specs = template_requirements.allow_format_specs;
         for requirement in template_requirements.requirements {
             let Some(interpolation) =
                 interpolation_by_index(template, requirement.interpolation_index)
             else {
                 continue;
             };
-            if should_skip_interpolation(interpolation, source, &line_starts, tree.root_node())? {
+            if should_skip_interpolation(
+                interpolation,
+                source,
+                &line_starts,
+                tree.root_node(),
+                allow_format_specs,
+            )? {
                 continue;
             }
 
@@ -256,7 +268,11 @@ fn type_requirements_by_template(
     templates: &[TemplateStringInfo],
     module_context: &ModuleContext,
     prefix: &str,
+    sql_config: &SqlConfig,
 ) -> Vec<TemplateTypeRequirements> {
+    #[cfg(not(feature = "sql"))]
+    let _ = sql_config;
+
     templates
         .iter()
         .enumerate()
@@ -268,6 +284,22 @@ fn type_requirements_by_template(
                 return TemplateTypeRequirements::default();
             };
             match (backend, template.profile.as_deref()) {
+                #[cfg(feature = "sql")]
+                (TemplateBackend::Sql, _) => {
+                    if crate::sql::psycopg::is_enabled(sql_config, template) {
+                        TemplateTypeRequirements {
+                            requirements: crate::sql::psycopg::interpolation_type_requirements(
+                                template, sql_config,
+                            ),
+                            type_imports: Vec::new(),
+                            allow_format_specs: true,
+                        }
+                    } else {
+                        TemplateTypeRequirements::default()
+                    }
+                }
+                #[cfg(not(feature = "sql"))]
+                (TemplateBackend::Sql, _) => TemplateTypeRequirements::default(),
                 (TemplateBackend::Tdom, profile)
                     if profile.is_none_or(|profile| profile.eq_ignore_ascii_case("svg")) =>
                 {
@@ -289,6 +321,7 @@ fn type_requirements_by_template(
                 .map(|requirements| TemplateTypeRequirements {
                     requirements,
                     type_imports: Vec::new(),
+                    allow_format_specs: false,
                 })
                 .map_or_else(
                     |error| {
@@ -353,6 +386,7 @@ fn tdom_interpolation_type_requirements(
     Ok(TemplateTypeRequirements {
         requirements,
         type_imports: resolver.into_imports(),
+        allow_format_specs: false,
     })
 }
 
@@ -578,15 +612,64 @@ fn required_import_modules(expected_type: &str) -> BTreeSet<String> {
             .chars()
             .next()
             .expect("valid char boundary");
-        if ch == 'd' && expected_type[index..].starts_with("datetime.") {
-            modules.insert("datetime".to_string());
-            index += "datetime".len();
-        } else {
+        if !is_python_identifier_start(ch) {
             index += ch.len_utf8();
+            continue;
+        }
+
+        let start = index;
+        index += ch.len_utf8();
+        while index < expected_type.len() {
+            let ch = expected_type[index..]
+                .chars()
+                .next()
+                .expect("valid char boundary");
+            match ch {
+                '.' => {
+                    let dot = index;
+                    index += ch.len_utf8();
+                    let Some(next) = expected_type[index..].chars().next() else {
+                        index = dot;
+                        break;
+                    };
+                    if !is_python_identifier_start(next) {
+                        index = dot;
+                        break;
+                    }
+                    index += next.len_utf8();
+                    while index < expected_type.len() {
+                        let ch = expected_type[index..]
+                            .chars()
+                            .next()
+                            .expect("valid char boundary");
+                        if !is_python_identifier_continue(ch) {
+                            break;
+                        }
+                        index += ch.len_utf8();
+                    }
+                }
+                _ if is_python_identifier_continue(ch) => index += ch.len_utf8(),
+                _ => break,
+            }
+        }
+
+        if let Some(module) = expected_type[start..index]
+            .rsplit_once('.')
+            .map(|(module, _)| module)
+            .filter(|module| should_import_type_module(module))
+        {
+            modules.insert(module.to_string());
         }
     }
 
     modules
+}
+
+fn should_import_type_module(module: &str) -> bool {
+    let Some(root) = module.split('.').next() else {
+        return false;
+    };
+    !root.is_empty() && !root.starts_with("__tl_")
 }
 
 fn shadow_annotation_type<'a>(
@@ -719,8 +802,11 @@ fn should_skip_interpolation(
     source: &str,
     line_starts: &[usize],
     root: Node<'_>,
+    allow_format_spec: bool,
 ) -> Result<bool> {
-    if interpolation.conversion.is_some() || !interpolation.format_spec.is_empty() {
+    if interpolation.conversion.is_some()
+        || (!allow_format_spec && !interpolation.format_spec.is_empty())
+    {
         return Ok(true);
     }
     if interpolation.expression.contains('\n')
@@ -1194,6 +1280,82 @@ def handler(age: int, name: str) -> None:
             annotation,
             r#"__tl_type_0_0.Literal[r"open", b"closed", u'pending']"#
         );
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn inferred_psycopg_sql_specs_create_shadow_type_checks() {
+        let source = r#"import psycopg
+
+conn = psycopg.connect("dbname=app")
+cur = conn.cursor()
+cur.execute(t"SELECT * FROM {table:i} WHERE fragment = {fragment:q}")
+"#;
+        let shadow = synthesize(source).expect("shadow");
+
+        assert!(shadow.text.contains("import psycopg.sql as __tl_m0"));
+        assert!(shadow.text.contains("import string.templatelib as __tl_m1"));
+        assert!(
+            shadow
+                .text
+                .contains("__tl_0_0: \"str | __tl_m0.Identifier\" = table")
+        );
+        assert!(shadow.text.contains(
+            "__tl_0_1: \"__tl_m1.Template | __tl_m0.SQL | __tl_m0.Composed\" = fragment"
+        ));
+        assert_eq!(
+            shadow.sites[0].expected_description,
+            "psycopg format spec ':i'"
+        );
+        assert_eq!(
+            shadow.sites[1].expected_description,
+            "psycopg format spec ':q'"
+        );
+        assert_python_parses(&shadow.text);
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn config_enabled_psycopg_sql_extends_top_union() {
+        let dir = shadow_test_dir("config-psycopg-extra-param-types");
+        write_file(
+            &dir.join("pyproject.toml"),
+            "[tool.t-linter.sql]\nlibrary = \"psycopg\"\nextra-param-types = [\"myapp.Money\"]\n",
+        );
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+query: Annotated[Template, "sql"] = t"SELECT * FROM invoices WHERE amount = {money}"
+"#;
+        let shadow = synthesize_for_type_check(&dir.join("app.py"), source)
+            .expect("synthesize")
+            .expect("shadow");
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(shadow.text.contains("import myapp as __tl_m2"));
+        assert!(shadow.text.contains("import psycopg.types.json as __tl_m3"));
+        assert!(
+            shadow
+                .text
+                .contains("__tl_m3.Json | __tl_m3.Jsonb | None | __tl_m2.Money")
+        );
+        assert_eq!(
+            shadow.sites[0].expected_description,
+            "psycopg SQL parameter"
+        );
+        assert_python_parses(&shadow.text);
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn plain_sql_without_psycopg_config_has_no_shadow_requirements() {
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
+"#;
+        assert!(synthesize(source).is_none());
     }
 
     #[test]

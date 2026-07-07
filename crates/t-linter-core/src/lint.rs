@@ -317,7 +317,17 @@ fn lint_template(
         return Ok(Vec::new());
     };
 
-    if let Some(backend) = TemplateBackend::for_language(&language) {
+    #[cfg(not(feature = "sql"))]
+    {
+        let _ = sql_config;
+        if language == "sql" {
+            return Ok(Vec::new());
+        }
+    }
+
+    if let Some(backend) = TemplateBackend::for_language(&language)
+        && backend != TemplateBackend::Sql
+    {
         return lint_backend_template(
             path,
             source,
@@ -1217,7 +1227,7 @@ fn parse_embedded(language: &str, source: &str) -> Result<Tree> {
         #[cfg(feature = "sql")]
         "sql" => parser.set_language(&tree_sitter_sequel::LANGUAGE.into())?,
         #[cfg(not(feature = "sql"))]
-        "sql" => return Ok(Parser::new().parse("", None).unwrap()),
+        "sql" => return Err(anyhow::anyhow!("Unsupported language: sql")),
         _ => return Err(anyhow::anyhow!("Unsupported language: {}", language)),
     }
 
@@ -2606,7 +2616,8 @@ value: Annotated[Template, "{language}"] = t"""{python_template}"""
 
     #[test]
     fn valid_templates_do_not_report_diagnostics() {
-        let valid_cases = [
+        #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
+        let mut valid_cases = vec![
             ("html", "<div>{}</div>"),
             ("thtml", "<Card title=\"{}\"><Badge>{}</Badge></Card>"),
             ("tdom", "<{} title={}><span>{}</span></{}>"),
@@ -2615,8 +2626,9 @@ value: Annotated[Template, "{language}"] = t"""{python_template}"""
             ("json", r#"{"name": {}, "enabled": true}"#),
             ("yaml", "name: {}\nenabled: true\n"),
             ("toml", "name = {}\nenabled = true\n"),
-            ("sql", "SELECT * FROM users WHERE id = {}"),
         ];
+        #[cfg(feature = "sql")]
+        valid_cases.push(("sql", "SELECT * FROM users WHERE id = {}"));
 
         for (language, template) in valid_cases {
             let result = lint_embedded(language, template);
@@ -2647,7 +2659,8 @@ value: Annotated[Template, "json"] = t'{{"literal": "{{}}", "value": {value}}}'
 
     #[test]
     fn invalid_templates_report_embedded_parse_errors() {
-        let invalid_cases = [
+        #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
+        let mut invalid_cases = vec![
             ("html", "<div><"),
             ("thtml", "<Card><"),
             ("tdom", "<{}></div>"),
@@ -2656,8 +2669,9 @@ value: Annotated[Template, "json"] = t'{{"literal": "{{}}", "value": {value}}}'
             ("json", "[1,,2]"),
             ("yaml", "name: [1, 2\n"),
             ("toml", "title =\n"),
-            ("sql", "SELECT * FROM"),
         ];
+        #[cfg(feature = "sql")]
+        invalid_cases.push(("sql", "SELECT * FROM"));
 
         for (language, template) in invalid_cases {
             let result = lint_embedded(language, template);

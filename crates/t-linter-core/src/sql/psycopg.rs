@@ -1,6 +1,9 @@
 use std::path::Path;
+use std::sync::OnceLock;
 
+use serde::Deserialize;
 use tree_sitter::{Node, Tree};
+use tstring_syntax::InterpolationTypeRequirement;
 
 use crate::lint::{DiagnosticEdit, DiagnosticEditRange, LintDiagnostic, LintSeverity};
 use crate::parser::ModuleContext;
@@ -16,6 +19,24 @@ const RULE_DICT_NEEDS_JSON_WRAPPER: &str = "sql-dict-needs-json-wrapper";
 const RULE_IN_CLAUSE: &str = "sql-in-clause";
 const RULE_MULTI_STATEMENT: &str = "sql-multi-statement";
 const RULE_TUPLE_PARAMETER: &str = "sql-tuple-parameter";
+const PSYCOPG_TYPE_MAP: &str = include_str!("manifests/psycopg.tmap.toml");
+const TOP_SPEC_KEY: &str = "top";
+
+#[derive(Debug, Deserialize)]
+struct PsycopgTypeMap {
+    #[serde(rename = "param-accepts")]
+    _param_accepts: std::collections::BTreeMap<String, TypeMapEntry>,
+    #[serde(rename = "spec-accepts")]
+    spec_accepts: std::collections::BTreeMap<String, TypeMapEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TypeMapEntry {
+    #[serde(rename = "type")]
+    python_type: String,
+    #[allow(dead_code)]
+    imports: Option<Vec<String>>,
+}
 
 #[derive(Debug, Clone, Copy)]
 enum PartRef<'a> {
@@ -87,6 +108,73 @@ pub fn lint_rules(
     }
 
     diagnostics
+}
+
+pub fn interpolation_type_requirements(
+    template: &TemplateStringInfo,
+    config: &SqlConfig,
+) -> Vec<InterpolationTypeRequirement> {
+    let mut requirements = Vec::new();
+    for part in &template.parts {
+        let TemplatePart::Interpolation(interpolation) = part else {
+            continue;
+        };
+        let spec = interpolation.format_spec.trim();
+        let expected_type = expected_type_for_spec(spec, config);
+        let expected_description = match spec {
+            "i" => "psycopg format spec ':i'",
+            "q" => "psycopg format spec ':q'",
+            "l" => "psycopg format spec ':l'",
+            "s" => "psycopg format spec ':s'",
+            "b" => "psycopg format spec ':b'",
+            "t" => "psycopg format spec ':t'",
+            _ => "psycopg SQL parameter",
+        };
+        requirements.push(InterpolationTypeRequirement::new(
+            interpolation.interpolation_index,
+            expected_type,
+            expected_description.to_string(),
+        ));
+    }
+    requirements
+}
+
+fn expected_type_for_spec(spec: &str, config: &SqlConfig) -> String {
+    let entry_key = match spec {
+        "i" | "q" => spec,
+        "s" | "b" | "t" | "l" => spec,
+        _ => TOP_SPEC_KEY,
+    };
+    let mut expected_type = type_map_entry(entry_key)
+        .or_else(|| type_map_entry(TOP_SPEC_KEY))
+        .map(|entry| entry.python_type.clone())
+        .unwrap_or_else(|| "object".to_string());
+    if entry_key != "i" && entry_key != "q" {
+        extend_union(&mut expected_type, &config.extra_param_types);
+    }
+    expected_type
+}
+
+fn type_map_entry(key: &str) -> Option<&'static TypeMapEntry> {
+    static TYPE_MAP: OnceLock<Option<PsycopgTypeMap>> = OnceLock::new();
+    TYPE_MAP
+        .get_or_init(|| toml::from_str(PSYCOPG_TYPE_MAP).ok())
+        .as_ref()
+        .and_then(|type_map| type_map.spec_accepts.get(key))
+}
+
+fn extend_union(expected_type: &mut String, extra_param_types: &[String]) {
+    for extra_type in extra_param_types.iter().map(|value| value.trim()) {
+        if extra_type.is_empty() || union_contains_type(expected_type, extra_type) {
+            continue;
+        }
+        expected_type.push_str(" | ");
+        expected_type.push_str(extra_type);
+    }
+}
+
+fn union_contains_type(union: &str, needle: &str) -> bool {
+    union.split('|').map(str::trim).any(|part| part == needle)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -598,6 +686,17 @@ fn location_range(location: &crate::parser::Location) -> DiagnosticEditRange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TemplateStringParser;
+
+    fn first_psycopg_template(source: &str) -> TemplateStringInfo {
+        let mut parser = TemplateStringParser::new().expect("parser");
+        parser
+            .find_template_strings_in_file(source, Path::new("example.py"))
+            .expect("templates")
+            .into_iter()
+            .find(|template| template.library.as_deref() == Some("psycopg"))
+            .expect("psycopg template")
+    }
 
     #[test]
     fn detects_in_clause_context() {
@@ -611,5 +710,77 @@ mod tests {
         assert!(is_dict_literal("{'a': 1}"));
         assert!(is_tuple_literal("(1, 2)"));
         assert!(!is_tuple_literal("(value)"));
+    }
+
+    #[test]
+    fn type_requirements_follow_psycopg_format_specs() {
+        let template = first_psycopg_template(
+            r#"import psycopg
+
+conn = psycopg.connect("dbname=app")
+cur = conn.cursor()
+cur.execute(t"SELECT * FROM {table:i} WHERE id = {value} AND extra = {fragment:q} AND literal = {literal:l}")
+"#,
+        );
+
+        let requirements = interpolation_type_requirements(&template, &SqlConfig::default());
+
+        assert_eq!(requirements.len(), 4);
+        assert_eq!(
+            requirements[0].expected_python_type,
+            "str | psycopg.sql.Identifier"
+        );
+        assert_eq!(
+            requirements[0].expected_description,
+            "psycopg format spec ':i'"
+        );
+        assert!(requirements[1].expected_python_type.contains("uuid.UUID"));
+        assert_eq!(
+            requirements[2].expected_python_type,
+            "string.templatelib.Template | psycopg.sql.SQL | psycopg.sql.Composed"
+        );
+        assert_eq!(
+            requirements[3].expected_description,
+            "psycopg format spec ':l'"
+        );
+    }
+
+    #[test]
+    fn extra_param_types_extend_top_union_once() {
+        let template = first_psycopg_template(
+            r#"import psycopg
+
+conn = psycopg.connect("dbname=app")
+cur = conn.cursor()
+cur.execute(t"SELECT * FROM users WHERE money = {money} AND table_name = {table:i}")
+"#,
+        );
+        let config = SqlConfig {
+            extra_param_types: vec![
+                "myapp.Money".to_string(),
+                "myapp.Money".to_string(),
+                "uuid.UUID".to_string(),
+            ],
+            ..SqlConfig::default()
+        };
+
+        let requirements = interpolation_type_requirements(&template, &config);
+
+        assert!(
+            requirements[0]
+                .expected_python_type
+                .ends_with(" | myapp.Money")
+        );
+        assert_eq!(
+            requirements[0]
+                .expected_python_type
+                .matches("myapp.Money")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requirements[1].expected_python_type,
+            "str | psycopg.sql.Identifier"
+        );
     }
 }
