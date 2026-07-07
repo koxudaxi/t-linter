@@ -21,7 +21,7 @@ t-linter validates and formats embedded languages inside Python template strings
 - **Linting** - Detect syntax errors in embedded HTML, JSON, YAML, TOML, CSS, JavaScript, SQL
 - **Formatting** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML templates
 - **Syntax Highlighting** - Smart highlighting via LSP semantic tokens
-- **Type-based Detection** - Understands `Annotated[Template, "html"]`, metadata markers such as `Json(schema=...)`, and type aliases
+- **Type-based Detection** - Supports lightweight string metadata and marker classes with `tstring_language`
 - **Interpolation Type Checking** - Optional LSP diagnostics for JSON, YAML, TOML interpolation values and TDOM component prop interpolations through Ty, Pyright, or Pyrefly
 - **Callee Inference** - Detects backend languages from helpers such as `tdom.html(...)`
 - **Fast** - Single Rust binary with Tree-sitter parsers
@@ -826,8 +826,8 @@ initial fixable rules are selected `sql-*` diagnostics and selected
 ## JSON Schema Bindings
 
 For JSON templates, t-linter can compare static object keys and values against
-`TypedDict` schema annotations. The schema binding is supplied by
-`json_tstring.Json`:
+`TypedDict` schema annotations. The schema binding is carried by
+`json_tstring.Json` marker kwargs:
 
 ```python
 from typing import Annotated, TypedDict
@@ -849,17 +849,23 @@ The supported binding forms are:
 
 ```python
 payload: Annotated[Template, Json(schema=Order)] = t'{"id": 1, "name": "Ada"}'
-explicit: Annotated[Template, "json", Json(schema=Order)] = t'{"id": 1, "name": "Ada"}'
-generic: Json[Order] = t'{"id": 1, "name": "Ada"}'
+default_json: Annotated[Template, Json] = t'{"id": 1, "name": "Ada"}'
 
 type OrderPayload = Annotated[Template, Json(schema=Order)]
 aliased: OrderPayload = t'{"id": 1, "name": "Ada"}'
 ```
 
 `Json(schema=...)` may be imported directly, imported with an alias, or used as
-`json_tstring.Json(...)`. If an explicit string language is present, that string
-controls the template language; use `"json"` with `Json(schema=...)` unless you
-are intentionally documenting a separate marker.
+`json_tstring.Json(...)`. The direct `Json[Order]` annotation is also accepted
+as a shorthand, but `Json(schema=Order)` is the preferred form because marker
+kwargs are where schema, dialect, and future options live.
+
+String language metadata is still supported as the lightweight tier:
+`Annotated[Template, "json"]`. Do not combine it with a marker for new code. If
+`"json"` and `Json(...)` are used together, t-linter reports
+`template-metadata-redundant-language` and suggests removing the string. If the
+string and marker disagree, or if an annotation contains multiple language
+markers, t-linter reports `template-metadata-conflict`.
 
 ## Error on Issues
 
@@ -1438,10 +1444,11 @@ For Tree-sitter-only languages (CSS, JavaScript, SQL), t-linter uses Tree-sitter
 
 ## Template Metadata Markers
 
-String metadata remains the simplest way to declare a template language:
-`Annotated[Template, "json"]`. t-linter also recognizes Python class metadata
-markers, which lets language packages keep options and schema information on
-normal Python objects instead of reserving more bare strings.
+String metadata remains the lightweight way to declare a template language:
+`Annotated[Template, "json"]`. It needs no imports and will not be deprecated.
+t-linter also recognizes Python marker classes, which let language packages
+carry schema, dialect, and option metadata on normal Python objects instead of
+reserving more bare strings.
 
 The built-in `json_tstring.Json` marker declares the JSON language when it is
 used in template metadata or as the template annotation itself:
@@ -1455,27 +1462,36 @@ class Order(TypedDict):
     id: int
 
 payload: Annotated[Template, Json(schema=Order)] = t'{"id": {order_id}}'
-other_payload: Json[Order] = t'{"id": {order_id}}'
+default_payload: Annotated[Template, Json] = t'{"id": {order_id}}'
 
 type OrderPayload = Annotated[Template, Json(schema=Order)]
 aliased_payload: OrderPayload = t'{"id": {order_id}}'
 ```
 
-`Annotated[Template, "json", Json(schema=Order)]` is also valid. If a string
-language and a marker disagree, the explicit string language wins for parsing,
-formatting, and highlighting.
+`Annotated[Template, Json]` uses the marker class with its defaults.
+`Annotated[Template, Json()]` uses a marker instance. Marker kwargs such as
+`schema=Order` or future dialect/options belong to the marker, not to the core
+language protocol.
+
+Do not combine string language metadata and marker language metadata for new
+code. If the string and marker agree, t-linter reports a redundant-language
+warning with a fix to remove the string. If they disagree, or if one
+`Annotated[...]` contains more than one language marker, t-linter reports a
+metadata conflict.
 
 Custom marker classes can declare a language structurally with
-`__tstring_language__`; no t-linter-specific base class is required. The class
-may live in source or in a `.pyi` stub so packages can expose language metadata
-through their normal Python toolchain.
+`tstring_language`; no t-linter-specific base class is required. The class may
+live in source or in a `.pyi` stub so packages can expose language metadata
+through their normal Python toolchain. Static base classes are followed, but
+dynamic decorators, metaclasses, computed values, and reassignment are not part
+of the marker protocol.
 
 ```python
-from typing import Annotated
+from typing import Annotated, Final
 from string.templatelib import Template
 
 class YamlTemplate:
-    __tstring_language__ = "yaml"
+    tstring_language: Final = "yaml"
 
 config: Annotated[Template, YamlTemplate()] = t"name: {name}"
 ```
@@ -1655,7 +1671,7 @@ Source: https://t-linter.koxudaxi.dev/roadmap/
 
 - **Language Server Protocol (LSP)** — Fully implemented
 - **Syntax Highlighting** — Supports HTML, T-HTML, TDOM, SQL, JavaScript, CSS, JSON, YAML, TOML
-- **Type Alias and Marker Support** — Recognizes `type html = Annotated[Template, "html"]` and metadata markers such as `Json(schema=...)`
+- **Type Alias and Marker Support** — Recognizes `type html = Annotated[Template, "html"]` and marker classes with `tstring_language`
 - **Linting (`check` command)** — Validate template strings for syntax errors
 - **Statistics (`stats` command)** — Analyze template string usage across codebases
 

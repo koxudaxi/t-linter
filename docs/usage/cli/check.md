@@ -129,8 +129,8 @@ initial fixable rules are selected `sql-*` diagnostics and selected
 ## JSON Schema Bindings
 
 For JSON templates, t-linter can compare static object keys and values against
-`TypedDict` schema annotations. The schema binding is supplied by
-`json_tstring.Json`:
+`TypedDict` schema annotations. The schema binding is carried by
+`json_tstring.Json` marker kwargs:
 
 ```python
 from typing import Annotated, TypedDict
@@ -152,17 +152,23 @@ The supported binding forms are:
 
 ```python
 payload: Annotated[Template, Json(schema=Order)] = t'{"id": 1, "name": "Ada"}'
-explicit: Annotated[Template, "json", Json(schema=Order)] = t'{"id": 1, "name": "Ada"}'
-generic: Json[Order] = t'{"id": 1, "name": "Ada"}'
+default_json: Annotated[Template, Json] = t'{"id": 1, "name": "Ada"}'
 
 type OrderPayload = Annotated[Template, Json(schema=Order)]
 aliased: OrderPayload = t'{"id": 1, "name": "Ada"}'
 ```
 
 `Json(schema=...)` may be imported directly, imported with an alias, or used as
-`json_tstring.Json(...)`. If an explicit string language is present, that string
-controls the template language; use `"json"` with `Json(schema=...)` unless you
-are intentionally documenting a separate marker.
+`json_tstring.Json(...)`. The direct `Json[Order]` annotation is also accepted
+as a shorthand, but `Json(schema=Order)` is the preferred form because marker
+kwargs are where schema, dialect, and future options live.
+
+String language metadata is still supported as the lightweight tier:
+`Annotated[Template, "json"]`. Do not combine it with a marker for new code. If
+`"json"` and `Json(...)` are used together, t-linter reports
+`template-metadata-redundant-language` and suggests removing the string. If the
+string and marker disagree, or if an annotation contains multiple language
+markers, t-linter reports `template-metadata-conflict`.
 
 ## Error on Issues
 

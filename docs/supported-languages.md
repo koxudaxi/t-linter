@@ -48,10 +48,11 @@ For Tree-sitter-only languages (CSS, JavaScript, SQL), t-linter uses Tree-sitter
 
 ## Template Metadata Markers
 
-String metadata remains the simplest way to declare a template language:
-`Annotated[Template, "json"]`. t-linter also recognizes Python class metadata
-markers, which lets language packages keep options and schema information on
-normal Python objects instead of reserving more bare strings.
+String metadata remains the lightweight way to declare a template language:
+`Annotated[Template, "json"]`. It needs no imports and will not be deprecated.
+t-linter also recognizes Python marker classes, which let language packages
+carry schema, dialect, and option metadata on normal Python objects instead of
+reserving more bare strings.
 
 The built-in `json_tstring.Json` marker declares the JSON language when it is
 used in template metadata or as the template annotation itself:
@@ -65,27 +66,36 @@ class Order(TypedDict):
     id: int
 
 payload: Annotated[Template, Json(schema=Order)] = t'{"id": {order_id}}'
-other_payload: Json[Order] = t'{"id": {order_id}}'
+default_payload: Annotated[Template, Json] = t'{"id": {order_id}}'
 
 type OrderPayload = Annotated[Template, Json(schema=Order)]
 aliased_payload: OrderPayload = t'{"id": {order_id}}'
 ```
 
-`Annotated[Template, "json", Json(schema=Order)]` is also valid. If a string
-language and a marker disagree, the explicit string language wins for parsing,
-formatting, and highlighting.
+`Annotated[Template, Json]` uses the marker class with its defaults.
+`Annotated[Template, Json()]` uses a marker instance. Marker kwargs such as
+`schema=Order` or future dialect/options belong to the marker, not to the core
+language protocol.
+
+Do not combine string language metadata and marker language metadata for new
+code. If the string and marker agree, t-linter reports a redundant-language
+warning with a fix to remove the string. If they disagree, or if one
+`Annotated[...]` contains more than one language marker, t-linter reports a
+metadata conflict.
 
 Custom marker classes can declare a language structurally with
-`__tstring_language__`; no t-linter-specific base class is required. The class
-may live in source or in a `.pyi` stub so packages can expose language metadata
-through their normal Python toolchain.
+`tstring_language`; no t-linter-specific base class is required. The class may
+live in source or in a `.pyi` stub so packages can expose language metadata
+through their normal Python toolchain. Static base classes are followed, but
+dynamic decorators, metaclasses, computed values, and reassignment are not part
+of the marker protocol.
 
 ```python
-from typing import Annotated
+from typing import Annotated, Final
 from string.templatelib import Template
 
 class YamlTemplate:
-    __tstring_language__ = "yaml"
+    tstring_language: Final = "yaml"
 
 config: Annotated[Template, YamlTemplate()] = t"name: {name}"
 ```
