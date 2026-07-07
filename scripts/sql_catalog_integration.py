@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 
 import psycopg
@@ -60,6 +61,7 @@ def main() -> None:
         root = pathlib.Path(tmp)
         app = write_project(root)
         env = os.environ.copy()
+        env["T_LINTER_SQL_PYTHON"] = sys.executable
 
         prepared = run([binary, "sql", "prepare", str(app)], root, env)
         assert prepared.returncode == 0, prepared.returncode
