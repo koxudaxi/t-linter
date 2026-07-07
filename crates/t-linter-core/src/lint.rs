@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -703,13 +703,19 @@ fn lint_json_schema_bindings(
         return Ok(Vec::new());
     };
     let marker_names = json_marker_names(module_context);
+    let type_aliases = collect_json_schema_type_aliases(source, tree.root_node(), module_context)?;
     let mut models = collect_schema_models(source, tree.root_node())?;
     extend_imported_schema_models(path, module_context, &mut models)?;
 
     let mut diagnostics = Vec::new();
     for template in templates {
-        let Some(binding) =
-            json_schema_binding_for_template(source, tree.root_node(), template, &marker_names)?
+        let Some(binding) = json_schema_binding_for_template(
+            source,
+            tree.root_node(),
+            template,
+            &marker_names,
+            &type_aliases,
+        )?
         else {
             continue;
         };
@@ -741,11 +747,151 @@ fn json_marker_names(module_context: &ModuleContext) -> BTreeSet<String> {
     names
 }
 
+fn collect_json_schema_type_aliases(
+    source: &str,
+    root: Node<'_>,
+    module_context: &ModuleContext,
+) -> Result<BTreeMap<String, String>> {
+    let mut aliases = BTreeMap::new();
+    collect_pep695_json_schema_type_aliases(source, root, &mut aliases)?;
+    collect_typing_json_schema_type_aliases(source, root, module_context, &mut aliases)?;
+    Ok(aliases)
+}
+
+fn collect_pep695_json_schema_type_aliases(
+    source: &str,
+    root: Node<'_>,
+    aliases: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let query = Query::new(
+        &tree_sitter_python::LANGUAGE.into(),
+        r#"
+        (type_alias_statement) @type_alias
+        "#,
+    )
+    .context("Failed to create JSON schema type alias query")?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, root, source.as_bytes());
+
+    while let Some(match_) = matches.next() {
+        for capture in match_.captures {
+            let type_alias_node = capture.node;
+            if !is_lint_module_level_statement(type_alias_node) {
+                continue;
+            }
+            let mut cursor = type_alias_node.walk();
+            let mut name_node = None;
+            let mut value_node = None;
+
+            for child in type_alias_node.children(&mut cursor) {
+                if child.kind() == "type" && name_node.is_none() {
+                    if child.utf8_text(source.as_bytes()).unwrap_or("") != "type" {
+                        name_node = Some(child);
+                    }
+                } else if child.kind() == "type" && name_node.is_some() {
+                    value_node = Some(child);
+                }
+            }
+
+            let (Some(name), Some(value)) = (name_node, value_node) else {
+                continue;
+            };
+            aliases.insert(
+                name.utf8_text(source.as_bytes())?.to_string(),
+                value.utf8_text(source.as_bytes())?.to_string(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_typing_json_schema_type_aliases(
+    source: &str,
+    root: Node<'_>,
+    module_context: &ModuleContext,
+    aliases: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let query = Query::new(
+        &tree_sitter_python::LANGUAGE.into(),
+        r#"
+        (assignment
+            left: (identifier) @alias_name
+            type: (_) @type_annotation
+            right: (_) @alias_value)
+        "#,
+    )
+    .context("Failed to create JSON schema typed alias query")?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, root, source.as_bytes());
+
+    while let Some(match_) = matches.next() {
+        let mut alias_name = None;
+        let mut alias_value = None;
+        let mut type_annotation = None;
+        for capture in match_.captures {
+            match query.capture_names()[capture.index as usize] {
+                "alias_name" => alias_name = Some(capture.node),
+                "alias_value" => alias_value = Some(capture.node),
+                "type_annotation" => type_annotation = Some(capture.node),
+                _ => {}
+            }
+        }
+        let (Some(name), Some(value), Some(annotation)) =
+            (alias_name, alias_value, type_annotation)
+        else {
+            continue;
+        };
+        if !is_lint_module_level_statement(name.parent().unwrap_or(name)) {
+            continue;
+        }
+        if !json_schema_type_annotation_is_type_alias(annotation, source, module_context)? {
+            continue;
+        }
+        aliases.insert(
+            name.utf8_text(source.as_bytes())?.to_string(),
+            value.utf8_text(source.as_bytes())?.to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+fn json_schema_type_annotation_is_type_alias(
+    annotation: Node<'_>,
+    source: &str,
+    module_context: &ModuleContext,
+) -> Result<bool> {
+    let raw = annotation.utf8_text(source.as_bytes())?.trim();
+    let resolved = expand_lint_imported_name(raw, &module_context.imports);
+    Ok(matches!(
+        resolved.as_str(),
+        "TypeAlias" | "typing.TypeAlias" | "typing_extensions.TypeAlias"
+    ))
+}
+
+fn expand_lint_imported_name(
+    name: &str,
+    imports: &std::collections::HashMap<String, String>,
+) -> String {
+    let Some((first, rest)) = name.split_once('.') else {
+        return imports
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
+    };
+    imports
+        .get(first)
+        .map(|target| format!("{target}.{rest}"))
+        .unwrap_or_else(|| name.to_string())
+}
+
 fn json_schema_binding_for_template(
     source: &str,
     root: Node<'_>,
     template: &TemplateStringInfo,
     marker_names: &BTreeSet<String>,
+    type_aliases: &BTreeMap<String, String>,
 ) -> Result<Option<JsonSchemaBinding>> {
     let Some(template_start) = location_to_byte_offset(
         source,
@@ -758,7 +904,9 @@ fn json_schema_binding_for_template(
         return Ok(None);
     };
     let type_text = type_node.utf8_text(source.as_bytes())?;
-    let Some(model_name) = json_schema_binding_from_type_text(type_text, marker_names) else {
+    let Some(model_name) =
+        json_schema_binding_from_type_text(type_text, marker_names, type_aliases)
+    else {
         return Ok(None);
     };
     Ok(Some(JsonSchemaBinding {
@@ -780,9 +928,36 @@ fn type_annotation_for_template_start(root: Node<'_>, template_start: usize) -> 
     }
 }
 
+fn is_lint_module_level_statement(node: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "module" => return true,
+            "expression_statement" => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn json_schema_binding_from_type_text(
     type_text: &str,
     marker_names: &BTreeSet<String>,
+    type_aliases: &BTreeMap<String, String>,
+) -> Option<String> {
+    json_schema_binding_from_type_text_inner(
+        type_text,
+        marker_names,
+        type_aliases,
+        &mut BTreeSet::new(),
+    )
+}
+
+fn json_schema_binding_from_type_text_inner(
+    type_text: &str,
+    marker_names: &BTreeSet<String>,
+    type_aliases: &BTreeMap<String, String>,
+    seen_aliases: &mut BTreeSet<String>,
 ) -> Option<String> {
     let markers = {
         let mut markers = marker_names.iter().map(String::as_str).collect::<Vec<_>>();
@@ -796,6 +971,17 @@ fn json_schema_binding_from_type_text(
         if let Some(model) = marker_call_schema_arg(type_text, marker) {
             return Some(model.to_string());
         }
+    }
+    let alias_name = type_text.trim();
+    if seen_aliases.insert(alias_name.to_string())
+        && let Some(alias_text) = type_aliases.get(alias_name)
+    {
+        return json_schema_binding_from_type_text_inner(
+            alias_text,
+            marker_names,
+            type_aliases,
+            seen_aliases,
+        );
     }
     None
 }
