@@ -121,6 +121,7 @@ Examples of backend decisions:
 | TOML string fragment | `str` |
 | TOML value | `str \| int \| float \| bool \| datetime.date \| datetime.time \| datetime.datetime \| list[object] \| dict[str, object]` |
 | psycopg SQL parameter `{value}` or `{value:l}` | `bool \| int \| float \| decimal.Decimal \| str \| bytes \| datetime.date \| datetime.datetime \| datetime.time \| datetime.timedelta \| uuid.UUID \| list \| psycopg.types.json.Json \| psycopg.types.json.Jsonb \| None` |
+| psycopg SQL parameter with catalog cache, such as `{id}` in `WHERE id = {id}` where `id` is `int4` | `int` |
 | psycopg identifier `{value:i}` | `str \| psycopg.sql.Identifier` |
 | psycopg SQL fragment `{value:q}` | `string.templatelib.Template \| psycopg.sql.SQL \| psycopg.sql.Composed` |
 | TDOM component prop `title={value}` where `title: str` | `str` |
@@ -133,6 +134,10 @@ signature can be resolved by t-linter. SQL returns requirements only for
 psycopg templates resolved from supported call chains or enabled with
 `[tool.t-linter.sql] library = "psycopg"`. Tree-sitter-only languages such as
 CSS and JavaScript are not part of this mechanism.
+
+Run `t-linter sql prepare .` to populate `.t-linter/sql-cache/` from a configured
+PostgreSQL database. `t-linter sql prepare --check .` compares the committed
+cache with the current schema and exits with status 2 if it is stale.
 
 ## Runtime Behavior
 

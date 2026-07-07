@@ -9,7 +9,7 @@ use t_linter_core::{
     DiagnosticData, DiagnosticEdit, FormatOptions as CoreFormatOptions, LintDiagnostic,
     LintSeverity, ShadowDocument, SqlConfig, TemplateHighlighter, TemplateStringInfo,
     TemplateStringParser, format_document_range_with_options, format_document_with_options,
-    lint_source_with_config, load_project_config_for_path, synthesize_for_type_check,
+    lint_source_with_config, load_project_config_for_path, synthesize_for_type_check_with_config,
 };
 use tower_lsp::jsonrpc::Result as JsonRpcResult;
 use tower_lsp::lsp_types::*;
@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 
 mod lsp_helpers;
 mod ruff;
+mod sql_catalog;
 mod type_checker;
 
 use ruff::RuffPipelineClient;
@@ -944,7 +945,7 @@ impl TLinterLanguageServer {
                 state.config.enabled && !state.disabled
             };
             if type_checking_enabled {
-                match synthesize_for_type_check(&path, &text) {
+                match synthesize_for_type_check_with_config(&path, &text, &project_config) {
                     Ok(Some(shadow)) => {
                         if let Some(checker) =
                             ensure_type_checker(&type_checker_state, &client).await
@@ -2880,9 +2881,10 @@ from string.templatelib import Template
 age = 1
 payload: Annotated[Template, "json"] = t'{{"name": {名前}, "age": {age}}}'
 "#;
-        let shadow = synthesize_for_type_check(PathBuf::from("example.py").as_path(), source)
-            .expect("shadow synthesis")
-            .expect("shadow document");
+        let shadow =
+            t_linter_core::synthesize_for_type_check(PathBuf::from("example.py").as_path(), source)
+                .expect("shadow synthesis")
+                .expect("shadow document");
         let site = shadow
             .sites
             .iter()

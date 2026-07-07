@@ -29,7 +29,17 @@ pub use parser::{
 pub use project_config::{
     ProjectConfig, SqlConfig, find_config_root, load_project_config, load_project_config_for_path,
 };
-pub use shadow::{ShadowCheckSite, ShadowDocument, synthesize_for_type_check};
+pub use shadow::{
+    ShadowCheckSite, ShadowDocument, synthesize_for_type_check,
+    synthesize_for_type_check_with_config,
+};
+#[cfg(feature = "sql")]
+pub use sql::catalog::{
+    CachedSqlCatalog, DescribeResponse, SchemaProvider, SqlCatalogColumn, SqlCatalogError,
+    SqlCatalogParam, SqlCatalogQuery, cache_path_for_query, cached_catalog_for_template,
+    catalog_entry_from_response, catalog_query_for_template, read_cached_catalog,
+    resolve_database_url, write_cached_catalog,
+};
 
 pub fn init() -> Result<()> {
     tracing::info!("t-linter-core initialized");

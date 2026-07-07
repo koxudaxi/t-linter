@@ -65,3 +65,42 @@ jobs:
         uv venv --python 3.14 .psycopg-venv
         uv pip install --python .psycopg-venv/bin/python "psycopg[binary]>=3.3"
         T_LINTER_BIN="$PWD/target/debug/t-linter" .psycopg-venv/bin/python scripts/psycopg_conformance.py
+
+  sql-catalog:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: tlinter
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tlinter"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        python-version: "3.14"
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@1.94.0
+
+    - name: Build t-linter
+      run: cargo build --bin t-linter
+
+    - name: Run SQL catalog integration
+      env:
+        T_LINTER_BIN: ${{ github.workspace }}/target/debug/t-linter
+        T_LINTER_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/tlinter
+      run: |
+        uv venv --python 3.14 .sql-catalog-venv
+        uv pip install --python .sql-catalog-venv/bin/python "psycopg[binary]>=3.3"
+        .sql-catalog-venv/bin/python scripts/sql_catalog_integration.py

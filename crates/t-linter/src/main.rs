@@ -101,6 +101,18 @@ async fn main() {
                 }
             }
         }
+        Some(t_linter_cli::Commands::Sql {
+            command: t_linter_cli::SqlCommands::Prepare { paths, check },
+        }) => {
+            init_logging("off");
+            match t_linter_cli::sql_prepare(paths, check) {
+                Ok(code) => code,
+                Err(error) => {
+                    eprintln!("{error}");
+                    2
+                }
+            }
+        }
         Some(t_linter_cli::Commands::Stats { path }) => {
             init_logging("off");
             match t_linter_cli::stats(path) {
