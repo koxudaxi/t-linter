@@ -507,6 +507,113 @@ cur.execute(t"SELECT * FROM users WHERE id = {user_id!r}")
 }
 
 #[test]
+fn check_fix_applies_suggested_edits_and_reports_remaining_diagnostics() {
+    let dir = test_dir("check-fix");
+    write_file(
+        &dir.join("pyproject.toml"),
+        "[tool.t-linter.sql]\nlibrary = \"psycopg\"\n",
+    );
+    let path = dir.join("query.py");
+    write_file(
+        &path,
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+user_id = 1
+query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id!r}"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "query.py", "--fix", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let fixed = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+    assert!(fixed.contains("{user_id}"));
+    assert!(!fixed.contains("{user_id!r}"));
+    assert!(stderr.contains("Fixed 1 issues in 1 files"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_diff_prints_unified_diff_without_writing() {
+    let dir = test_dir("check-diff");
+    write_file(
+        &dir.join("pyproject.toml"),
+        "[tool.t-linter.sql]\nlibrary = \"psycopg\"\n",
+    );
+    let path = dir.join("query.py");
+    let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+user_id = 1
+query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id!r}"
+"#;
+    write_file(&path, source);
+
+    let output = run_check(&dir, &["check", "query.py", "--diff"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let current = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(current, source);
+    assert!(stdout.contains("--- a/query.py"));
+    assert!(stdout.contains("+++ b/query.py"));
+    assert!(stdout.contains("-query: Annotated"));
+    assert!(stdout.contains("+query: Annotated"));
+    assert!(stdout.contains("{user_id!r}"));
+    assert!(stdout.contains("{user_id}"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_fix_and_diff_are_mutually_exclusive() {
+    let dir = test_dir("check-fix-diff-conflict");
+    write_file(&dir.join("query.py"), "print('hello')\n");
+
+    let output = run_check(&dir, &["check", "query.py", "--fix", "--diff"]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr.contains("cannot be used with"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_fix_skips_suppressed_diagnostics() {
+    let dir = test_dir("check-fix-suppressed");
+    write_file(
+        &dir.join("pyproject.toml"),
+        "[tool.t-linter.sql]\nlibrary = \"psycopg\"\n",
+    );
+    let path = dir.join("query.py");
+    let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+user_id = 1
+query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id!r}"  # t-linter: ignore[sql-conversion-unsupported]
+"#;
+    write_file(&path, source);
+
+    let output = run_check(&dir, &["check", "query.py", "--fix", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let current = fs::read_to_string(&path).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+    assert_eq!(current, source);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_psycopg_sql_static_rules_report_expected_diagnostics() {
     let dir = test_dir("psycopg-static-rules");
     write_file(
@@ -2005,6 +2112,169 @@ template: Annotated[Template, "thtml"] = t"<Button label='Save' tone='info' />"
 }
 
 #[test]
+fn check_rule_config_ignore_removes_matching_diagnostics() {
+    let dir = test_dir("rule-ignore");
+    write_file(
+        &dir.join("pyproject.toml"),
+        r#"[tool.t-linter]
+ignore = ["component-unexpected-prop"]
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str) -> object:
+    return None
+
+template: Annotated[Template, "thtml"] = t"<Button label='Save' tone='info' />"
+"#,
+    );
+
+    let output = run_check(
+        &dir,
+        &[
+            "check",
+            "broken.py",
+            "--format",
+            "json",
+            "--error-on-issues",
+        ],
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_rule_config_severity_rewrites_diagnostic_level() {
+    let dir = test_dir("rule-severity");
+    write_file(
+        &dir.join("pyproject.toml"),
+        r#"[tool.t-linter.severity]
+component-missing-prop = "warning"
+"#,
+    );
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str) -> object:
+    return None
+
+template: Annotated[Template, "thtml"] = t"<Button />"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout.contains("warning[component-missing-prop]"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_rule_config_per_file_ignores_only_matching_paths() {
+    let dir = test_dir("rule-per-file-ignore");
+    write_file(
+        &dir.join("pyproject.toml"),
+        r#"[tool.t-linter.per-file-ignores]
+"tests/**" = ["component-unexpected-prop"]
+"#,
+    );
+    let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+def Button(*, label: str) -> object:
+    return None
+
+template: Annotated[Template, "thtml"] = t"<Button label='Save' tone='info' />"
+"#;
+    write_file(&dir.join("tests/broken.py"), source);
+    write_file(&dir.join("src/broken.py"), source);
+
+    let output = run_check(&dir, &["check", ".", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["file"], "./src/broken.py");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_inline_suppression_ignores_template_diagnostics() {
+    let dir = test_dir("inline-ignore");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "html"] = t"<div><"  # t-linter: ignore
+"#,
+    );
+
+    let output = run_check(
+        &dir,
+        &[
+            "check",
+            "broken.py",
+            "--format",
+            "json",
+            "--error-on-issues",
+        ],
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_inline_suppression_honors_rule_lists_and_ignores_string_literals() {
+    let dir = test_dir("inline-ignore-rule-list");
+    write_file(
+        &dir.join("broken.py"),
+        r##"from typing import Annotated
+from string.templatelib import Template
+
+note = "# t-linter: ignore"
+
+def Button(*, label: str) -> object:
+    return None
+
+# t-linter: ignore[component-unexpected-prop]
+template: Annotated[Template, "thtml"] = t"<Button label='Save' tone='info' />"
+
+other: Annotated[Template, "html"] = t"<div><"
+"##,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "embedded-parse-error");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_reports_thtml_component_prop_type_errors() {
     let dir = test_dir("thtml-prop-type");
     write_file(
@@ -3093,6 +3363,69 @@ template: Annotated[Template, "toml"] = t"title ="
     assert_eq!(output.status.code(), Some(1));
     assert!(stdout.contains("::error file=broken.py"));
     assert!(stderr.contains("1 files scanned"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_sarif_outputs_valid_results() {
+    let dir = test_dir("sarif");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "toml"] = t"title ="
+"#,
+    );
+
+    let output = run_check(
+        &dir,
+        &[
+            "check",
+            "broken.py",
+            "--format",
+            "sarif",
+            "--error-on-issues",
+        ],
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(json["version"], "2.1.0");
+    assert_eq!(json["runs"][0]["tool"]["driver"]["name"], "t-linter");
+    assert_eq!(
+        json["runs"][0]["results"][0]["ruleId"],
+        "embedded-parse-error"
+    );
+    assert_eq!(json["runs"][0]["results"][0]["level"], "error");
+    assert_eq!(
+        json["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]["startLine"],
+        4
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_sarif_outputs_empty_results_for_clean_files() {
+    let dir = test_dir("sarif-empty");
+    write_file(
+        &dir.join("ok.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+template: Annotated[Template, "yaml"] = t"name: {value}"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "ok.py", "--format", "sarif"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["runs"][0]["results"], serde_json::json!([]));
 
     let _ = fs::remove_dir_all(dir);
 }

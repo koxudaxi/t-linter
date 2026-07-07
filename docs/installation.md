@@ -38,6 +38,26 @@ This provides the `t-linter` command-line tool and LSP server.
 
 **[View on PyPI](https://pypi.org/project/t-linter/)**
 
+## pre-commit
+
+Use the published hooks from this repository:
+
+```yaml
+repos:
+  - repo: https://github.com/koxudaxi/t-linter
+    rev: 0.9.1
+    hooks:
+      - id: t-linter
+      - id: t-linter-format
+```
+
+For CI-only formatting checks, override the format hook args:
+
+```yaml
+      - id: t-linter-format
+        args: [--check]
+```
+
 ## Option 2: VSCode Extension
 
 If you use VSCode, install the extension for seamless editor integration:

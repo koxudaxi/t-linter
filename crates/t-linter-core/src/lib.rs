@@ -13,9 +13,9 @@ pub(crate) mod sql;
 pub(crate) mod tdom;
 
 pub use formatting::{
-    FormatError, FormatOptions, TemplateEdit, apply_template_edits, format_document,
-    format_document_in_file, format_document_in_file_with_options, format_document_range,
-    format_document_range_with_options, format_document_with_options,
+    FormatError, FormatOptions, TemplateEdit, apply_diagnostic_edits, apply_template_edits,
+    format_document, format_document_in_file, format_document_in_file_with_options,
+    format_document_range, format_document_range_with_options, format_document_with_options,
 };
 pub use highlighter::{HighlightedRange, TemplateHighlighter};
 pub use lint::{
@@ -23,11 +23,12 @@ pub use lint::{
     LintRunSummary, LintSeverity, file_read_error, lint_source, lint_source_with_config,
 };
 pub use parser::{
-    Expression, InterpolationInfo, Location, StaticTextSegment, TemplatePart, TemplateStringInfo,
-    TemplateStringParser,
+    Expression, InterpolationInfo, LanguageDetection, Location, StaticTextSegment, TemplatePart,
+    TemplateStringInfo, TemplateStringParser,
 };
 pub use project_config::{
-    ProjectConfig, SqlConfig, find_config_root, load_project_config, load_project_config_for_path,
+    ProjectConfig, RuleSeverity, SqlConfig, find_config_root, load_project_config,
+    load_project_config_for_path,
 };
 pub use shadow::{
     ShadowCheckSite, ShadowDocument, synthesize_for_type_check,

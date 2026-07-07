@@ -76,9 +76,11 @@ async fn main() {
             paths,
             format,
             error_on_issues,
+            fix,
+            diff,
         }) => {
             init_logging("off");
-            match t_linter_cli::check(paths, format, error_on_issues) {
+            match t_linter_cli::check(paths, format, error_on_issues, fix, diff) {
                 Ok(code) => code,
                 Err(error) => {
                     eprintln!("{error}");
@@ -113,13 +115,13 @@ async fn main() {
                 }
             }
         }
-        Some(t_linter_cli::Commands::Stats { path }) => {
+        Some(t_linter_cli::Commands::Stats { paths, format }) => {
             init_logging("off");
-            match t_linter_cli::stats(path) {
-                Ok(_) => 0,
+            match t_linter_cli::stats(paths, format) {
+                Ok(code) => code,
                 Err(error) => {
                     eprintln!("{error}");
-                    1
+                    2
                 }
             }
         }

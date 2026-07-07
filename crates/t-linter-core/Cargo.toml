@@ -22,6 +22,7 @@ tree-sitter-yaml = "0.7.2"
 tree-sitter-toml-ng = "0.7.0"
 tracing.workspace = true
 regex = "1.12.3"
+globset = "0.4.18"
 wait-timeout.workspace = true
 unicode_names2.workspace = true
 tstring-json.workspace = true

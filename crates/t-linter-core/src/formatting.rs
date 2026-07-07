@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use tstring_syntax::BackendError;
 
 use crate::backend::TemplateBackend;
+use crate::lint::DiagnosticEdit;
 use crate::{Location, TemplateStringInfo, TemplateStringParser};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +151,27 @@ pub fn apply_template_edits(source: &str, edits: &[TemplateEdit]) -> Result<Stri
     }
 
     String::from_utf8(output).context("Formatted output is not valid UTF-8")
+}
+
+pub fn apply_diagnostic_edits(source: &str, edits: &[DiagnosticEdit]) -> Result<String> {
+    if edits.is_empty() {
+        return Ok(source.to_string());
+    }
+
+    let template_edits = edits
+        .iter()
+        .map(|edit| TemplateEdit {
+            location: Location {
+                start_line: edit.range.start_line,
+                start_column: edit.range.start_column,
+                end_line: edit.range.end_line,
+                end_column: edit.range.end_column,
+            },
+            replacement: edit.new_text.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    apply_template_edits(source, &template_edits)
 }
 
 pub fn format_document_range(source: &str, range: &Location) -> Result<Vec<TemplateEdit>> {
@@ -395,6 +417,53 @@ config: Annotated[Template, "json"] = t'{"name": {name}}'
             output,
             "title = \"こんにちは\"\r\npayload = t'{\"a\": 1, \"b\": 2}'\r\n"
         );
+    }
+
+    #[test]
+    fn apply_diagnostic_edits_reuses_template_edit_offsets() {
+        let source = "query = t\"SELECT {value!r}\"\n";
+        let edits = vec![DiagnosticEdit {
+            range: crate::lint::DiagnosticEditRange {
+                start_line: 1,
+                start_column: 24,
+                end_line: 1,
+                end_column: 26,
+            },
+            new_text: String::new(),
+        }];
+
+        let output = apply_diagnostic_edits(source, &edits).expect("expected apply success");
+
+        assert_eq!(output, "query = t\"SELECT {value}\"\n");
+    }
+
+    #[test]
+    fn apply_diagnostic_edits_rejects_overlaps() {
+        let source = "value = t\"abcdef\"\n";
+        let edits = vec![
+            DiagnosticEdit {
+                range: crate::lint::DiagnosticEditRange {
+                    start_line: 1,
+                    start_column: 11,
+                    end_line: 1,
+                    end_column: 14,
+                },
+                new_text: "x".to_string(),
+            },
+            DiagnosticEdit {
+                range: crate::lint::DiagnosticEditRange {
+                    start_line: 1,
+                    start_column: 13,
+                    end_line: 1,
+                    end_column: 16,
+                },
+                new_text: "y".to_string(),
+            },
+        ];
+
+        let error = apply_diagnostic_edits(source, &edits).expect_err("overlapping edits");
+
+        assert!(error.to_string().contains("Overlapping template edits"));
     }
 
     #[test]

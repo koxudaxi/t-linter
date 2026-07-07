@@ -719,10 +719,15 @@ fn interpolation_raw_subrange(
     start: usize,
     end: usize,
 ) -> DiagnosticEditRange {
+    let raw_start_column = if interpolation.raw_source.starts_with('{') {
+        interpolation.location.start_column.saturating_sub(1)
+    } else {
+        interpolation.location.start_column
+    };
     same_line_range(
         interpolation.location.start_line,
-        interpolation.location.start_column + start,
-        interpolation.location.start_column + end,
+        raw_start_column + start,
+        raw_start_column + end,
     )
 }
 

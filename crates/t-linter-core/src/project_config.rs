@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectConfig {
@@ -11,7 +12,33 @@ pub struct ProjectConfig {
     pub extend_exclude: Vec<String>,
     pub ignore_file: Option<String>,
     pub line_length: Option<usize>,
+    pub ignore: Vec<String>,
+    pub severity: HashMap<String, RuleSeverity>,
+    pub per_file_ignores: HashMap<String, Vec<String>>,
     pub sql: SqlConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuleSeverity {
+    Error,
+    Warning,
+}
+
+impl<'de> Deserialize<'de> for RuleSeverity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "error" => Ok(Self::Error),
+            "warning" => Ok(Self::Warning),
+            _ => Err(serde::de::Error::custom(format!(
+                "invalid severity `{value}`; expected `error` or `warning`"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -50,6 +77,10 @@ struct TLinterConfig {
         deserialize_with = "deserialize_optional_line_length"
     )]
     line_length: Option<usize>,
+    ignore: Option<Vec<String>>,
+    severity: Option<HashMap<String, RuleSeverity>>,
+    #[serde(rename = "per-file-ignores")]
+    per_file_ignores: Option<HashMap<String, Vec<String>>>,
     sql: Option<SqlConfig>,
 }
 
@@ -85,6 +116,9 @@ pub fn load_project_config(root: &Path) -> Result<ProjectConfig> {
         extend_exclude: config.extend_exclude.unwrap_or_default(),
         ignore_file: config.ignore_file,
         line_length: config.line_length,
+        ignore: config.ignore.unwrap_or_default(),
+        severity: config.severity.unwrap_or_default(),
+        per_file_ignores: config.per_file_ignores.unwrap_or_default(),
         sql: config.sql.unwrap_or_default(),
     })
 }
@@ -144,6 +178,42 @@ mod tests {
         assert_eq!(config.sql.database_url.as_deref(), Some("env:DATABASE_URL"));
         assert_eq!(config.sql.search_path.as_deref(), Some("public"));
         assert_eq!(config.sql.extra_param_types, vec!["myapp.Money"]);
+    }
+
+    #[test]
+    fn load_project_config_reads_rule_filter_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("pyproject.toml"),
+            "[tool.t-linter]\nignore = [\"component-unexpected-prop\"]\n\n[tool.t-linter.severity]\ncomponent-missing-prop = \"warning\"\n\n[tool.t-linter.per-file-ignores]\n\"tests/**\" = [\"embedded-parse-error\"]\n",
+        )
+        .expect("write pyproject");
+
+        let config = load_project_config(temp.path()).expect("load config");
+
+        assert_eq!(config.ignore, vec!["component-unexpected-prop".to_string()]);
+        assert_eq!(
+            config.severity.get("component-missing-prop"),
+            Some(&RuleSeverity::Warning)
+        );
+        assert_eq!(
+            config.per_file_ignores.get("tests/**"),
+            Some(&vec!["embedded-parse-error".to_string()])
+        );
+    }
+
+    #[test]
+    fn load_project_config_rejects_invalid_rule_severity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("pyproject.toml"),
+            "[tool.t-linter.severity]\ncomponent-missing-prop = \"info\"\n",
+        )
+        .expect("write pyproject");
+
+        let error = load_project_config(temp.path()).expect_err("invalid severity");
+
+        assert!(error.to_string().contains("Failed to parse"));
     }
 
     #[test]
