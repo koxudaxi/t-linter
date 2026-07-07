@@ -204,6 +204,26 @@ This provides the `t-linter` command-line tool and LSP server.
 
 **[View on PyPI](https://pypi.org/project/t-linter/)**
 
+## pre-commit
+
+Use the published hooks from this repository:
+
+```yaml
+repos:
+  - repo: https://github.com/koxudaxi/t-linter
+    rev: 0.9.1
+    hooks:
+      - id: t-linter
+      - id: t-linter-format
+```
+
+For CI-only formatting checks, override the format hook args:
+
+```yaml
+      - id: t-linter-format
+        args: [--check]
+```
+
 ## Option 2: VSCode Extension
 
 If you use VSCode, install the extension for seamless editor integration:
@@ -766,6 +786,43 @@ t-linter check file.py --format github
 ::error file=example.py,line=4,col=47,title=t-linter(embedded-parse-error)::Expected a JSON value. (language=json)
 ```
 
+### SARIF
+
+```bash
+t-linter check file.py --format sarif
+```
+
+Use SARIF output with GitHub code scanning:
+
+```yaml
+- name: Run t-linter
+  run: t-linter check . --format sarif > t-linter.sarif
+
+- name: Upload SARIF
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: t-linter.sarif
+```
+
+## Fixes
+
+Some diagnostics include suggested edits. Apply them in place with `--fix`:
+
+```bash
+t-linter check file.py --fix
+```
+
+Preview the same edits without writing files with `--diff`:
+
+```bash
+t-linter check file.py --diff
+```
+
+`--fix` and `--diff` are mutually exclusive. Fixes are taken from the filtered
+diagnostic list, so ignored or suppressed diagnostics are not rewritten. The
+initial fixable rules are selected `sql-*` diagnostics and selected
+`template-schema-*` diagnostics.
+
 ## Error on Issues
 
 Use `--error-on-issues` to exit with a non-zero code when issues are found:
@@ -879,6 +936,68 @@ formatters ignore `line-length`.
 - `format` respects `pyproject.toml` excludes and `.t-linterignore`
 - explicit file operands must use the `.py` extension
 - formatting is atomic per file: on failure, the original file is left untouched
+
+---
+
+# Stats Command
+
+Source: https://t-linter.koxudaxi.dev/usage/cli/stats/
+
+The `stats` command counts Python template strings without running lint
+diagnostics.
+
+## Basic Usage
+
+```bash
+# Analyze a directory
+t-linter stats src/
+
+# Analyze multiple paths
+t-linter stats src/ tests/
+```
+
+## Output Formats
+
+### Human (default)
+
+```bash
+t-linter stats .
+```
+
+```text
+Files scanned:        12
+Template strings:     34
+  typed:              30 (88.2%)
+  untyped:            4
+
+By language:
+  html              18
+  sql               8
+  json              4
+
+By detection method:
+  annotation        20
+  callee-inference  10
+
+Top files by template count:
+  src/views.py      12
+```
+
+### JSON
+
+```bash
+t-linter stats . --format json
+```
+
+The JSON report includes totals, language counts, detection-method counts, and
+per-file template counts.
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Run completed successfully |
+| `2` | One or more inputs could not be read or parsed |
 
 ---
 
@@ -1140,6 +1259,13 @@ Add a `[tool.t-linter]` section to your `pyproject.toml`:
 line-length = 80
 extend-exclude = ["generated", "vendor"]
 ignore-file = ".t-linterignore"
+ignore = ["component-unexpected-prop"]
+
+[tool.t-linter.severity]
+component-missing-prop = "warning"
+
+[tool.t-linter.per-file-ignores]
+"tests/**" = ["component-unexpected-prop"]
 ```
 
 ### Supported Keys
@@ -1150,6 +1276,57 @@ ignore-file = ".t-linterignore"
 | `exclude` | Override the built-in default excludes |
 | `extend-exclude` | Add more exclude patterns on top of the defaults |
 | `ignore-file` | Path to a gitignore-style ignore file, relative to the project root |
+| `ignore` | Disable lint rules globally |
+| `severity` | Override rule severity with `error` or `warning` |
+| `per-file-ignores` | Disable lint rules for paths matching project-root-relative globs |
+
+Unknown rule names are accepted so projects can share configuration across
+different t-linter versions. `python-parse-error` and `file-read-error` are not
+disabled by rule ignore settings.
+
+Changing a rule to `warning` changes the printed severity only. `check
+--error-on-issues` still exits with code `1` when any diagnostics remain.
+
+## Inline Suppression
+
+Use `# t-linter: ignore` to suppress all lint diagnostics for a line, or
+`# t-linter: ignore[rule-a, rule-b]` for specific rules:
+
+```python
+payload: Annotated[Template, "html"] = t"<div><"  # t-linter: ignore
+
+# t-linter: ignore[component-unexpected-prop]
+template: Annotated[Template, "thtml"] = t"<Button label='Save' tone='info' />"
+```
+
+Line-end comments suppress diagnostics that start on the same line. Standalone
+comments suppress diagnostics that start on the following line. When the comment
+is placed on the template string start line, or immediately before it, it also
+suppresses diagnostics that start inside that template string.
+
+Inline suppression applies to t-linter lint diagnostics. LSP diagnostics from
+external type checkers are not suppressed by these comments.
+
+## Rule Names
+
+- `embedded-parse-error`
+- `file-read-error`
+- `python-parse-error`
+- `component-missing-prop`
+- `component-unexpected-prop`
+- `component-prop-type-error`
+- `component-unresolved`
+- `template-schema-missing-key`
+- `template-schema-unknown-key`
+- `template-schema-type-shape`
+- `binding-unresolved`
+- `sql-conversion-unsupported`
+- `sql-format-spec-unknown`
+- `sql-composable-spec-mismatch`
+- `sql-dict-needs-json-wrapper`
+- `sql-in-clause`
+- `sql-multi-statement`
+- `sql-tuple-parameter`
 
 ## Ignore File
 
@@ -1398,9 +1575,6 @@ Source: https://t-linter.koxudaxi.dev/roadmap/
 - **Syntax Highlighting** — Supports HTML, T-HTML, TDOM, SQL, JavaScript, CSS, JSON, YAML, TOML
 - **Type Alias Support** — Recognizes `type html = Annotated[Template, "html"]`
 - **Linting (`check` command)** — Validate template strings for syntax errors
-
-## In Progress
-
 - **Statistics (`stats` command)** — Analyze template string usage across codebases
 
 ## Planned
