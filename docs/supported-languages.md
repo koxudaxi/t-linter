@@ -46,6 +46,50 @@ For backend-powered languages (HTML, T-HTML, TDOM, JSON, YAML, TOML), t-linter s
 
 For Tree-sitter-only languages (CSS, JavaScript, SQL), t-linter uses Tree-sitter for both highlighting and validation. Formatting is not yet available for these languages.
 
+## Template Metadata Markers
+
+String metadata remains the simplest way to declare a template language:
+`Annotated[Template, "json"]`. t-linter also recognizes Python class metadata
+markers, which lets language packages keep options and schema information on
+normal Python objects instead of reserving more bare strings.
+
+The built-in `json_tstring.Json` marker declares the JSON language when it is
+used in template metadata or as the template annotation itself:
+
+```python
+from typing import Annotated, TypedDict
+from string.templatelib import Template
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+
+payload: Annotated[Template, Json(schema=Order)] = t'{"id": {order_id}}'
+other_payload: Json[Order] = t'{"id": {order_id}}'
+
+type OrderPayload = Annotated[Template, Json(schema=Order)]
+aliased_payload: OrderPayload = t'{"id": {order_id}}'
+```
+
+`Annotated[Template, "json", Json(schema=Order)]` is also valid. If a string
+language and a marker disagree, the explicit string language wins for parsing,
+formatting, and highlighting.
+
+Custom marker classes can declare a language structurally with
+`__tstring_language__`; no t-linter-specific base class is required. The class
+may live in source or in a `.pyi` stub so packages can expose language metadata
+through their normal Python toolchain.
+
+```python
+from typing import Annotated
+from string.templatelib import Template
+
+class YamlTemplate:
+    __tstring_language__ = "yaml"
+
+config: Annotated[Template, YamlTemplate()] = t"name: {name}"
+```
+
 ## SQL Notes
 
 SQL templates always receive Tree-sitter syntax validation when they are annotated as `"sql"`.

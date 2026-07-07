@@ -126,6 +126,44 @@ diagnostic list, so ignored or suppressed diagnostics are not rewritten. The
 initial fixable rules are selected `sql-*` diagnostics and selected
 `template-schema-*` diagnostics.
 
+## JSON Schema Bindings
+
+For JSON templates, t-linter can compare static object keys and values against
+`TypedDict` schema annotations. The schema binding is supplied by
+`json_tstring.Json`:
+
+```python
+from typing import Annotated, TypedDict
+from string.templatelib import Template
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+    name: str
+
+payload: Annotated[Template, Json(schema=Order)] = t'{"id": "abc"}'
+```
+
+This template is parsed as JSON and checked against `Order`. t-linter reports
+`template-schema-type-shape` for `"id": "abc"` and
+`template-schema-missing-key` for the missing `name` key.
+
+The supported binding forms are:
+
+```python
+payload: Annotated[Template, Json(schema=Order)] = t'{"id": 1, "name": "Ada"}'
+explicit: Annotated[Template, "json", Json(schema=Order)] = t'{"id": 1, "name": "Ada"}'
+generic: Json[Order] = t'{"id": 1, "name": "Ada"}'
+
+type OrderPayload = Annotated[Template, Json(schema=Order)]
+aliased: OrderPayload = t'{"id": 1, "name": "Ada"}'
+```
+
+`Json(schema=...)` may be imported directly, imported with an alias, or used as
+`json_tstring.Json(...)`. If an explicit string language is present, that string
+controls the template language; use `"json"` with `Json(schema=...)` unless you
+are intentionally documenting a separate marker.
+
 ## Error on Issues
 
 Use `--error-on-issues` to exit with a non-zero code when issues are found:

@@ -34,7 +34,7 @@ t-linter validates and formats embedded languages inside Python template strings
 - 🔍 **Linting** - Detect syntax errors in embedded HTML, JSON, YAML, TOML, CSS, JavaScript, SQL
 - 🧹 **Formatting** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML templates
 - 🎨 **Syntax Highlighting** - Smart highlighting via LSP semantic tokens
-- 🔧 **Type-based Detection** - Understands `Annotated[Template, "html"]` and type aliases
+- 🔧 **Type-based Detection** - Understands `Annotated[Template, "html"]`, metadata markers such as `Json(schema=...)`, and type aliases
 - 🧪 **Interpolation Type Checking** - Optional LSP diagnostics for JSON, YAML, TOML interpolation values and TDOM component prop interpolations through Ty, Pyright, or Pyrefly
 - 🧩 **Callee Inference** - Detects backend languages from helpers such as `tdom.html(...)`
 - 🚀 **Fast** - Single Rust binary with Tree-sitter parsers
@@ -403,7 +403,7 @@ For `html`, `<title>{value}</title>` is allowed and treated as escaped text.
 ### Planned Features
 - ✅ **Language Server Protocol (LSP)** - Fully implemented
 - ✅ **Syntax Highlighting** - Supports HTML, T-HTML, TDOM, SQL, JavaScript, CSS, JSON, YAML, TOML
-- ✅ **Type Alias Support** - Recognizes `type html = Annotated[Template, "html"]`
+- ✅ **Type Alias and Marker Support** - Recognizes `type html = Annotated[Template, "html"]` and metadata markers such as `Json(schema=...)`
 - ✅ **Linting (`check` command)** - Validate template strings for syntax errors
 - ✅ **Formatting (`format` command)** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML
 - ✅ **Statistics (`stats` command)** - Analyze template string usage across codebases
