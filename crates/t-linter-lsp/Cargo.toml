@@ -14,6 +14,7 @@ tower-lsp.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 dashmap = "6.1.0"
+wait-timeout.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

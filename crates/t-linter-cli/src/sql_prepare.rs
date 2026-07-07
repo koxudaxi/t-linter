@@ -1,15 +1,18 @@
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use t_linter_core::{
-    CachedSqlCatalog, DescribeResponse, SchemaProvider, SqlCatalogError, SqlCatalogQuery,
-    TemplateStringParser, cache_path_for_query, catalog_entry_from_response,
+    CachedSqlCatalog, DescribeEnvelope, DescribeRequest, DescribeResponse, SchemaProvider,
+    SqlCatalogQuery, TemplateStringParser, cache_path_for_query, catalog_entry_from_response,
     catalog_query_for_template, load_project_config_for_path, read_cached_catalog,
-    resolve_database_url, write_cached_catalog,
+    resolve_database_url, response_from_describe_envelope, sql_describe_timeout,
+    write_cached_catalog,
 };
 
 use crate::discovery::{DiscoveryMode, collect_python_files};
@@ -31,30 +34,17 @@ struct PythonDescribeProvider {
     python: String,
     database_url: String,
     search_path: Option<String>,
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    stdout: Option<Receiver<std::result::Result<String, String>>>,
+    reader: Option<JoinHandle<()>>,
+    next_id: u64,
 }
 
-#[derive(Debug, Serialize)]
-struct DescribeRequest<'a> {
-    id: u64,
-    op: &'static str,
-    database_url: &'a str,
-    sql: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    search_path: Option<&'a str>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DescribeEnvelope {
-    #[allow(dead_code)]
-    id: Option<u64>,
-    #[serde(default)]
-    params: Vec<t_linter_core::SqlCatalogParam>,
-    #[serde(default)]
-    columns: Vec<t_linter_core::SqlCatalogColumn>,
-    #[serde(default)]
-    psycopg_version: Option<String>,
-    #[serde(default)]
-    error: Option<SqlCatalogError>,
+enum DescribeAttemptError {
+    Helper(anyhow::Error),
+    Response(anyhow::Error),
+    Timeout(anyhow::Error),
 }
 
 impl PythonDescribeProvider {
@@ -63,20 +53,28 @@ impl PythonDescribeProvider {
             python: sql_python_command(),
             database_url,
             search_path,
+            child: None,
+            stdin: None,
+            stdout: None,
+            reader: None,
+            next_id: 1,
         }
     }
-}
 
-impl SchemaProvider for PythonDescribeProvider {
-    fn describe(&mut self, query: &SqlCatalogQuery) -> Result<DescribeResponse> {
-        let request = DescribeRequest {
-            id: 1,
-            op: "describe",
-            database_url: &self.database_url,
-            sql: &query.sql,
-            search_path: self.search_path.as_deref(),
-        };
-        let payload = serde_json::to_string(&request).context("Failed to serialize SQL request")?;
+    fn ensure_helper(&mut self) -> Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            if child
+                .try_wait()
+                .context("Failed to inspect SQL describe helper")?
+                .is_none()
+                && self.stdin.is_some()
+                && self.stdout.is_some()
+            {
+                return Ok(());
+            }
+            self.stop_helper();
+        }
+
         let mut child = Command::new(&self.python)
             .arg("-c")
             .arg(SQL_DESCRIBE_HELPER)
@@ -85,45 +83,174 @@ impl SchemaProvider for PythonDescribeProvider {
             .stderr(Stdio::inherit())
             .spawn()
             .with_context(|| format!("Failed to start {}", self.python))?;
-
-        {
-            let stdin = child
+        self.stdin = Some(
+            child
                 .stdin
-                .as_mut()
-                .context("SQL describe helper stdin is not available")?;
-            stdin
-                .write_all(payload.as_bytes())
-                .context("Failed to write SQL describe request")?;
-            stdin
-                .write_all(b"\n")
-                .context("Failed to finish SQL describe request")?;
-        }
+                .take()
+                .context("SQL describe helper stdin is not available")?,
+        );
+        let stdout = child
+            .stdout
+            .take()
+            .context("SQL describe helper stdout is not available")?;
+        let (stdout, reader) = start_stdout_reader(stdout);
+        self.stdout = Some(stdout);
+        self.reader = Some(reader);
+        self.child = Some(child);
+        Ok(())
+    }
 
-        let output = child
-            .wait_with_output()
-            .context("Failed to read SQL describe response")?;
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(
-                "SQL describe helper exited with {}",
-                output.status
-            ));
+    fn describe_once(
+        &mut self,
+        query: &SqlCatalogQuery,
+    ) -> std::result::Result<DescribeResponse, DescribeAttemptError> {
+        self.ensure_helper().map_err(DescribeAttemptError::Helper)?;
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        let request = DescribeRequest {
+            id,
+            op: "describe",
+            database_url: &self.database_url,
+            sql: &query.sql,
+            search_path: self.search_path.as_deref(),
+        };
+        let payload = serde_json::to_string(&request)
+            .context("Failed to serialize SQL request")
+            .map_err(DescribeAttemptError::Helper)?;
+        let stdin = self
+            .stdin
+            .as_mut()
+            .context("SQL describe helper stdin is not available")
+            .map_err(DescribeAttemptError::Helper)?;
+        stdin
+            .write_all(payload.as_bytes())
+            .context("Failed to write SQL describe request")
+            .map_err(DescribeAttemptError::Helper)?;
+        stdin
+            .write_all(b"\n")
+            .context("Failed to finish SQL describe request")
+            .map_err(DescribeAttemptError::Helper)?;
+        stdin
+            .flush()
+            .context("Failed to flush SQL describe request")
+            .map_err(DescribeAttemptError::Helper)?;
+
+        let stdout = self
+            .stdout
+            .as_mut()
+            .context("SQL describe helper stdout is not available")
+            .map_err(DescribeAttemptError::Helper)?;
+        let timeout = sql_describe_timeout();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| {
+                    DescribeAttemptError::Timeout(anyhow::anyhow!(
+                        "SQL describe timed out after {:.3}s",
+                        timeout.as_secs_f64()
+                    ))
+                })?;
+            let line = match stdout.recv_timeout(remaining) {
+                Ok(Ok(line)) => line,
+                Ok(Err(error)) => {
+                    return Err(DescribeAttemptError::Helper(anyhow::anyhow!(
+                        "Failed to read SQL describe response: {error}"
+                    )));
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(DescribeAttemptError::Timeout(anyhow::anyhow!(
+                        "SQL describe timed out after {:.3}s",
+                        timeout.as_secs_f64()
+                    )));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(DescribeAttemptError::Helper(anyhow::anyhow!(
+                        "SQL describe helper exited without response"
+                    )));
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let envelope: DescribeEnvelope = serde_json::from_str(&line)
+                .context("Failed to parse SQL describe response")
+                .map_err(DescribeAttemptError::Helper)?;
+            if envelope.id == Some(id) {
+                return response_from_describe_envelope(envelope)
+                    .map_err(DescribeAttemptError::Response);
+            }
         }
-        let stdout = String::from_utf8(output.stdout)
-            .context("SQL describe helper emitted non-UTF-8 output")?;
-        let line = stdout
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .context("SQL describe helper emitted no response")?;
-        let envelope: DescribeEnvelope =
-            serde_json::from_str(line).context("Failed to parse SQL describe response")?;
-        if let Some(error) = envelope.error {
-            return Err(anyhow::anyhow!(error.message));
+    }
+
+    fn stop_helper(&mut self) {
+        drop(self.stdin.take());
+        drop(self.stdout.take());
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        Ok(DescribeResponse {
-            params: envelope.params,
-            columns: envelope.columns,
-            psycopg_version: envelope.psycopg_version,
-        })
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn start_stdout_reader(
+    stdout: ChildStdout,
+) -> (
+    Receiver<std::result::Result<String, String>>,
+    JoinHandle<()>,
+) {
+    let (sender, receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match stdout.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if sender.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error.to_string()));
+                    break;
+                }
+            }
+        }
+    });
+    (receiver, reader)
+}
+
+impl Drop for PythonDescribeProvider {
+    fn drop(&mut self) {
+        self.stop_helper();
+    }
+}
+
+impl SchemaProvider for PythonDescribeProvider {
+    fn describe(&mut self, query: &SqlCatalogQuery) -> Result<DescribeResponse> {
+        let mut last_error = None;
+        for attempt in 0..2 {
+            match self.describe_once(query) {
+                Ok(response) => return Ok(response),
+                Err(DescribeAttemptError::Response(error)) => return Err(error),
+                Err(DescribeAttemptError::Timeout(error)) => {
+                    self.stop_helper();
+                    return Err(error);
+                }
+                Err(DescribeAttemptError::Helper(error)) => {
+                    last_error = Some(error);
+                    if attempt == 0 {
+                        self.stop_helper();
+                        continue;
+                    }
+                }
+            }
+        }
+        Err(last_error.expect("describe error"))
     }
 }
 
@@ -171,7 +298,7 @@ fn prepare_file(path: &Path, check: bool, summary: &mut PrepareSummary) -> Resul
     let mut provider = database_provider(
         &project_config.sql.database_url,
         &project_config.sql.search_path,
-    );
+    )?;
 
     for template in templates {
         let Some(query) = catalog_query_for_template(&template, &project_config.sql) else {
@@ -252,17 +379,20 @@ fn check_cache_entry(
 fn database_provider(
     database_url: &Option<String>,
     search_path: &Option<String>,
-) -> Option<PythonDescribeProvider> {
-    let database_url = database_url
-        .as_deref()
-        .and_then(|value| resolve_database_url(value).ok())?;
-    Some(PythonDescribeProvider::new(
+) -> Result<Option<PythonDescribeProvider>> {
+    let Some(database_url) = database_url.as_deref() else {
+        return Ok(None);
+    };
+    let database_url = resolve_database_url(database_url)?;
+    Ok(Some(PythonDescribeProvider::new(
         database_url,
         search_path.clone(),
-    ))
+    )))
 }
 
 fn sql_python_command() -> String {
+    // CLI prepare runs in shell/CI contexts: use the explicit helper interpreter
+    // when provided, otherwise rely on the active PATH.
     std::env::var("T_LINTER_SQL_PYTHON")
         .ok()
         .filter(|value| !value.trim().is_empty())

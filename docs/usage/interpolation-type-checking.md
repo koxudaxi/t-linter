@@ -137,7 +137,12 @@ CSS and JavaScript are not part of this mechanism.
 
 Run `t-linter sql prepare .` to populate `.t-linter/sql-cache/` from a configured
 PostgreSQL database. `t-linter sql prepare --check .` compares the committed
-cache with the current schema and exits with status 2 if it is stale.
+cache with the current schema and exits with status 2 if it is stale. If the
+live describe call cannot reach PostgreSQL, `--check` falls back to the existing
+committed cache and exits successfully.
+For CLI usage, set `T_LINTER_SQL_PYTHON` to a Python interpreter with `psycopg`
+installed, or run `t-linter sql prepare` from an environment whose `PATH`
+already resolves such a Python.
 
 ## Runtime Behavior
 

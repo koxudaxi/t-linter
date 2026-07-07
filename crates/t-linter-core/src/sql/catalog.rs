@@ -1,14 +1,21 @@
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::project_config::SqlConfig;
 use crate::{TemplatePart, TemplateStringInfo};
 
 const CACHE_DIR: &str = ".t-linter/sql-cache";
+pub const SQL_DESCRIBE_TIMEOUT_ENV: &str = "T_LINTER_SQL_DESCRIBE_TIMEOUT_SECONDS";
+pub const DEFAULT_SQL_DESCRIBE_TIMEOUT_SECONDS: f64 = 10.0;
+static CACHE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlCatalogQuery {
@@ -38,6 +45,29 @@ pub struct DescribeResponse {
     pub columns: Vec<SqlCatalogColumn>,
     #[serde(default)]
     pub psycopg_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DescribeRequest<'a> {
+    pub id: u64,
+    pub op: &'static str,
+    pub database_url: &'a str,
+    pub sql: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_path: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DescribeEnvelope {
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub params: Vec<SqlCatalogParam>,
+    #[serde(default)]
+    pub columns: Vec<SqlCatalogColumn>,
+    #[serde(default)]
+    pub psycopg_version: Option<String>,
+    #[serde(default)]
+    pub error: Option<SqlCatalogError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,8 +175,49 @@ pub fn write_cached_catalog(path: &Path, entry: &CachedSqlCatalog) -> Result<()>
     }
     let content = serde_json::to_string_pretty(entry)
         .context("Failed to serialize SQL catalog cache entry")?;
-    fs::write(path, format!("{content}\n"))
-        .with_context(|| format!("Failed to write {}", path.display()))
+    let tmp = temp_cache_path(path);
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)
+            .with_context(|| format!("Failed to create {}", tmp.display()))?;
+        file.write_all(content.as_bytes())
+            .with_context(|| format!("Failed to write {}", tmp.display()))?;
+        file.write_all(b"\n")
+            .with_context(|| format!("Failed to write {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to sync {}", tmp.display()))?;
+        drop(file);
+        fs::rename(&tmp, path).with_context(|| {
+            format!("Failed to persist {} as {}", tmp.display(), path.display())
+        })?;
+        sync_parent_dir(path);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn temp_cache_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "cache.json".into());
+    let counter = CACHE_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(".{file_name}.{}.{counter}.tmp", std::process::id()))
+}
+
+fn sync_parent_dir(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
 }
 
 pub fn cached_catalog_for_template(
@@ -180,6 +251,31 @@ pub fn resolve_database_url(value: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+pub fn response_from_describe_envelope(envelope: DescribeEnvelope) -> Result<DescribeResponse> {
+    if let Some(error) = envelope.error {
+        return Err(anyhow::anyhow!(error.message));
+    }
+    Ok(DescribeResponse {
+        params: envelope.params,
+        columns: envelope.columns,
+        psycopg_version: envelope.psycopg_version,
+    })
+}
+
+pub fn sql_describe_timeout() -> Duration {
+    let Ok(raw) = std::env::var(SQL_DESCRIBE_TIMEOUT_ENV) else {
+        return Duration::from_secs_f64(DEFAULT_SQL_DESCRIBE_TIMEOUT_SECONDS);
+    };
+    let Ok(seconds) = raw.trim().parse::<f64>() else {
+        return Duration::from_secs_f64(DEFAULT_SQL_DESCRIBE_TIMEOUT_SECONDS);
+    };
+    if seconds.is_finite() {
+        Duration::from_secs_f64(seconds.max(1.0))
+    } else {
+        Duration::from_secs_f64(DEFAULT_SQL_DESCRIBE_TIMEOUT_SECONDS)
+    }
+}
+
 fn normalize_sql(sql: &str) -> String {
     sql.replace("\r\n", "\n")
         .replace('\r', "\n")
@@ -188,104 +284,13 @@ fn normalize_sql(sql: &str) -> String {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = sha256(bytes);
+    let digest = Sha256::digest(bytes);
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
         use std::fmt::Write as _;
         let _ = write!(&mut hex, "{byte:02x}");
     }
     hex
-}
-
-fn sha256(input: &[u8]) -> [u8; 32] {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let mut state = [
-        0x6a09e667u32,
-        0xbb67ae85,
-        0x3c6ef372,
-        0xa54ff53a,
-        0x510e527f,
-        0x9b05688c,
-        0x1f83d9ab,
-        0x5be0cd19,
-    ];
-
-    let bit_len = (input.len() as u64) * 8;
-    let mut message = Vec::with_capacity(input.len() + 72);
-    message.extend_from_slice(input);
-    message.push(0x80);
-    while (message.len() % 64) != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&bit_len.to_be_bytes());
-
-    let mut words = [0u32; 64];
-    for chunk in message.chunks_exact(64) {
-        for (index, word) in words.iter_mut().take(16).enumerate() {
-            let offset = index * 4;
-            *word = u32::from_be_bytes([
-                chunk[offset],
-                chunk[offset + 1],
-                chunk[offset + 2],
-                chunk[offset + 3],
-            ]);
-        }
-        for index in 16..64 {
-            let s0 = words[index - 15].rotate_right(7)
-                ^ words[index - 15].rotate_right(18)
-                ^ (words[index - 15] >> 3);
-            let s1 = words[index - 2].rotate_right(17)
-                ^ words[index - 2].rotate_right(19)
-                ^ (words[index - 2] >> 10);
-            words[index] = words[index - 16]
-                .wrapping_add(s0)
-                .wrapping_add(words[index - 7])
-                .wrapping_add(s1);
-        }
-
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
-        for index in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[index])
-                .wrapping_add(words[index]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-
-        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
-            *slot = slot.wrapping_add(value);
-        }
-    }
-
-    let mut digest = [0u8; 32];
-    for (index, value) in state.into_iter().enumerate() {
-        digest[index * 4..index * 4 + 4].copy_from_slice(&value.to_be_bytes());
-    }
-    digest
 }
 
 #[cfg(test)]

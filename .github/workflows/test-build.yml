@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Set up uv
       uses: astral-sh/setup-uv@v7
@@ -48,6 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Set up uv
       uses: astral-sh/setup-uv@v7
@@ -84,6 +88,8 @@ jobs:
           --health-retries 12
     steps:
     - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Set up uv
       uses: astral-sh/setup-uv@v7

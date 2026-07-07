@@ -75,9 +75,11 @@ t-linter sql prepare .
 t-linter sql prepare --check .
 ```
 
-The cache is written to `.t-linter/sql-cache/`. When the cache is present,
-interpolation type checking can narrow plain psycopg parameters from PostgreSQL
-types even if the database is unavailable.
+The cache is written to `.t-linter/sql-cache/`. `t-linter sql prepare --check`
+reports stale cache entries when PostgreSQL is reachable; if the database is
+unavailable, it trusts the existing committed cache and exits successfully.
+When the cache is present, interpolation type checking can narrow plain psycopg
+parameters from PostgreSQL types even if the database is unavailable.
 
 ## HTML Notes
 

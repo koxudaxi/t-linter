@@ -35,10 +35,12 @@ pub use shadow::{
 };
 #[cfg(feature = "sql")]
 pub use sql::catalog::{
-    CachedSqlCatalog, DescribeResponse, SchemaProvider, SqlCatalogColumn, SqlCatalogError,
+    CachedSqlCatalog, DEFAULT_SQL_DESCRIBE_TIMEOUT_SECONDS, DescribeEnvelope, DescribeRequest,
+    DescribeResponse, SQL_DESCRIBE_TIMEOUT_ENV, SchemaProvider, SqlCatalogColumn, SqlCatalogError,
     SqlCatalogParam, SqlCatalogQuery, cache_path_for_query, cached_catalog_for_template,
     catalog_entry_from_response, catalog_query_for_template, read_cached_catalog,
-    resolve_database_url, write_cached_catalog,
+    resolve_database_url, response_from_describe_envelope, sql_describe_timeout,
+    write_cached_catalog,
 };
 
 pub fn init() -> Result<()> {

@@ -1,19 +1,21 @@
 #![allow(dead_code)]
 
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use t_linter_core::{
-    DescribeResponse, SchemaProvider, SqlCatalogColumn, SqlCatalogError, SqlCatalogParam,
-    SqlCatalogQuery,
+    DescribeEnvelope, DescribeRequest, DescribeResponse, SchemaProvider, SqlCatalogQuery,
+    response_from_describe_envelope, sql_describe_timeout,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+use tokio::time::{Instant, timeout};
+use wait_timeout::ChildExt;
 
 use crate::type_checker::python_inline_script_launch_candidates;
 
@@ -39,6 +41,7 @@ pub struct SqlCatalogClient {
     child: Mutex<Child>,
     stdin: Mutex<ChildStdin>,
     stdout: Mutex<BufReader<ChildStdout>>,
+    request: Mutex<()>,
     next_id: AtomicU64,
 }
 
@@ -47,30 +50,6 @@ pub struct SqlCatalogProvider {
     launch: SqlCatalogLaunchConfig,
     database_url: String,
     search_path: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct DescribeRequest<'a> {
-    id: u64,
-    op: &'static str,
-    database_url: &'a str,
-    sql: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    search_path: Option<&'a str>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DescribeEnvelope {
-    #[allow(dead_code)]
-    id: Option<u64>,
-    #[serde(default)]
-    params: Vec<SqlCatalogParam>,
-    #[serde(default)]
-    columns: Vec<SqlCatalogColumn>,
-    #[serde(default)]
-    psycopg_version: Option<String>,
-    #[serde(default)]
-    error: Option<SqlCatalogError>,
 }
 
 impl SqlCatalogClient {
@@ -95,6 +74,7 @@ impl SqlCatalogClient {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(BufReader::new(stdout)),
+            request: Mutex::new(()),
             next_id: AtomicU64::new(1),
         })
     }
@@ -114,6 +94,7 @@ impl SqlCatalogClient {
             search_path,
         };
         let payload = serde_json::to_string(&request).context("Failed to serialize SQL request")?;
+        let _request = self.request.lock().await;
         {
             let mut stdin = self.stdin.lock().await;
             stdin
@@ -127,21 +108,42 @@ impl SqlCatalogClient {
             stdin.flush().await.context("Failed to flush SQL request")?;
         }
 
-        let mut line = String::new();
-        self.stdout
-            .lock()
-            .await
-            .read_line(&mut line)
-            .await
-            .context("Failed to read SQL response")?;
-        if line.trim().is_empty() {
-            return Err(anyhow::anyhow!(
-                "SQL catalog helper exited without response"
-            ));
+        let timeout_duration = sql_describe_timeout();
+        let deadline = Instant::now() + timeout_duration;
+        let mut stdout = self.stdout.lock().await;
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                self.shutdown().await;
+                return Err(anyhow::anyhow!(
+                    "SQL describe timed out after {:.3}s",
+                    timeout_duration.as_secs_f64()
+                ));
+            };
+            let mut line = String::new();
+            let bytes = match timeout(remaining, stdout.read_line(&mut line)).await {
+                Ok(result) => result.context("Failed to read SQL response")?,
+                Err(_) => {
+                    self.shutdown().await;
+                    return Err(anyhow::anyhow!(
+                        "SQL describe timed out after {:.3}s",
+                        timeout_duration.as_secs_f64()
+                    ));
+                }
+            };
+            if bytes == 0 {
+                return Err(anyhow::anyhow!(
+                    "SQL catalog helper exited without response"
+                ));
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            let envelope: DescribeEnvelope =
+                serde_json::from_str(&line).context("Failed to parse SQL response")?;
+            if envelope.id == Some(id) {
+                return response_from_describe_envelope(envelope);
+            }
         }
-        let envelope: DescribeEnvelope =
-            serde_json::from_str(&line).context("Failed to parse SQL response")?;
-        response_from_envelope(envelope)
     }
 
     pub async fn shutdown(&self) {
@@ -197,23 +199,41 @@ impl SchemaProvider for SqlCatalogProvider {
         }
 
         let output = child
-            .wait_with_output()
-            .context("Failed to read SQL response")?;
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(
-                "SQL catalog helper exited with {}",
-                output.status
-            ));
+            .stdout
+            .take()
+            .context("SQL catalog helper stdout is not available")?;
+        drop(child.stdin.take());
+        let timeout_duration = sql_describe_timeout();
+        let status = match child
+            .wait_timeout(timeout_duration)
+            .context("Failed to wait for SQL response")?
+        {
+            Some(status) => status,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::anyhow!(
+                    "SQL describe timed out after {:.3}s",
+                    timeout_duration.as_secs_f64()
+                ));
+            }
+        };
+        if !status.success() {
+            return Err(anyhow::anyhow!("SQL catalog helper exited with {}", status));
         }
-        let stdout = String::from_utf8(output.stdout)
-            .context("SQL catalog helper emitted non-UTF-8 output")?;
+        let mut stdout = output;
+        let mut stdout_text = String::new();
+        stdout
+            .read_to_string(&mut stdout_text)
+            .context("Failed to read SQL response")?;
+        let stdout = stdout_text;
         let line = stdout
             .lines()
             .find(|line| !line.trim().is_empty())
             .context("SQL catalog helper emitted no response")?;
         let envelope: DescribeEnvelope =
             serde_json::from_str(line).context("Failed to parse SQL response")?;
-        response_from_envelope(envelope)
+        response_from_describe_envelope(envelope)
     }
 }
 
@@ -230,17 +250,6 @@ pub fn sql_catalog_launch_candidates(
     .into_iter()
     .map(|candidate| SqlCatalogLaunchConfig::new(candidate.command, candidate.args))
     .collect()
-}
-
-fn response_from_envelope(envelope: DescribeEnvelope) -> Result<DescribeResponse> {
-    if let Some(error) = envelope.error {
-        return Err(anyhow::anyhow!(error.message));
-    }
-    Ok(DescribeResponse {
-        params: envelope.params,
-        columns: envelope.columns,
-        psycopg_version: envelope.psycopg_version,
-    })
 }
 
 #[cfg(test)]

@@ -1,6 +1,9 @@
 import json
 import os
+import signal
 import sys
+
+DEFAULT_TIMEOUT_SECONDS = 10.0
 
 
 def _error_payload(message, position=None):
@@ -86,21 +89,63 @@ def _describe_with_prepare(conn, sql_text):
     return params, []
 
 
+class _DescribeTimeout:
+    def __init__(self, seconds):
+        self.seconds = seconds
+        self._previous_handler = None
+
+    def _raise_timeout(self, _signum, _frame):
+        raise TimeoutError(f"SQL describe timed out after {self.seconds:g}s")
+
+    def __enter__(self):
+        if hasattr(signal, "SIGALRM"):
+            self._previous_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, self._raise_timeout)
+            signal.setitimer(signal.ITIMER_REAL, self.seconds)
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        if self._previous_handler is not None:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, self._previous_handler)
+
+
+def _timeout_seconds():
+    if raw := os.environ.get("T_LINTER_SQL_DESCRIBE_TIMEOUT_SECONDS"):
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            return DEFAULT_TIMEOUT_SECONDS
+    return DEFAULT_TIMEOUT_SECONDS
+
+
 def _describe(database_url, sql_text, search_path):
     import psycopg
 
-    with psycopg.connect(database_url, autocommit=True) as conn:
-        if search_path:
-            conn.execute("SELECT set_config('search_path', %s, false)", (search_path,))
-        try:
-            params, columns = _describe_with_pq(conn, sql_text)
-        except Exception:
-            params, columns = _describe_with_prepare(conn, sql_text)
-        return {
-            "params": params,
-            "columns": columns,
-            "psycopg_version": psycopg.__version__,
-        }
+    timeout = _timeout_seconds()
+    with _DescribeTimeout(timeout):
+        with psycopg.connect(
+            database_url,
+            autocommit=True,
+            connect_timeout=max(1, int(timeout)),
+        ) as conn:
+            conn.execute(
+                "SELECT set_config('statement_timeout', %s, false)",
+                (f"{int(timeout * 1000)}ms",),
+            )
+            if search_path:
+                conn.execute("SELECT set_config('search_path', %s, false)", (search_path,))
+            try:
+                params, columns = _describe_with_pq(conn, sql_text)
+            except TimeoutError:
+                raise
+            except Exception:
+                params, columns = _describe_with_prepare(conn, sql_text)
+            return {
+                "params": params,
+                "columns": columns,
+                "psycopg_version": psycopg.__version__,
+            }
 
 
 def _handle(request):
