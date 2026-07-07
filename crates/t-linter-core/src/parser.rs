@@ -73,6 +73,7 @@ pub enum CallableValueType {
 struct TemplateHint {
     language: String,
     profile: Option<String>,
+    library: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1557,7 +1558,8 @@ impl TemplateStringParser {
             variable_name: var_name.map(String::from),
             function_name: func_name.map(String::from),
             language: hint.as_ref().map(|hint| hint.language.clone()),
-            profile: hint.and_then(|hint| hint.profile),
+            profile: hint.as_ref().and_then(|hint| hint.profile.clone()),
+            library: hint.and_then(|hint| hint.library),
             string_start: start_text.to_string(),
             string_end: end_text.to_string(),
             location: Location {
@@ -1683,7 +1685,8 @@ impl TemplateStringParser {
             variable_name: var_name.map(String::from),
             function_name: func_name.map(String::from),
             language: hint.as_ref().map(|hint| hint.language.clone()),
-            profile: hint.and_then(|hint| hint.profile),
+            profile: hint.as_ref().and_then(|hint| hint.profile.clone()),
+            library: hint.and_then(|hint| hint.library),
             string_start: start_text.to_string(),
             string_end: end_text.to_string(),
             location: Location {
@@ -2917,6 +2920,7 @@ fn template_hint_from_type_info(info: ResolvedTypeInfo) -> Option<TemplateHint> 
     info.template_language.map(|language| TemplateHint {
         language,
         profile: info.template_profile,
+        library: None,
     })
 }
 
@@ -2927,6 +2931,7 @@ fn parameter_template_hint(parameter: &CallableParameter) -> Option<TemplateHint
         .map(|language| TemplateHint {
             language: language.clone(),
             profile: parameter.template_profile.clone(),
+            library: None,
         })
 }
 
@@ -4841,10 +4846,12 @@ fn tdom_template_processor_hint(target: &str) -> Option<TemplateHint> {
         "tdom.html" | "tdom.processor.html" => Some(TemplateHint {
             language: "tdom".to_string(),
             profile: None,
+            library: None,
         }),
         "tdom.svg" | "tdom.processor.svg" => Some(TemplateHint {
             language: "tdom".to_string(),
             profile: Some("svg".to_string()),
+            library: None,
         }),
         _ => None,
     }
@@ -4866,6 +4873,7 @@ pub struct TemplateStringInfo {
     pub function_name: Option<String>,
     pub language: Option<String>,
     pub profile: Option<String>,
+    pub library: Option<String>,
     pub string_start: String,
     pub string_end: String,
     pub location: Location,
@@ -6054,6 +6062,7 @@ html = t"""
             function_name: None,
             language: Some("html".to_string()),
             profile: None,
+            library: None,
             string_start: "t\"".to_string(),
             string_end: "\"".to_string(),
             location: Location {
@@ -6119,6 +6128,7 @@ html = t"""
             function_name: None,
             language: Some("yaml".to_string()),
             profile: None,
+            library: None,
             string_start: "t\"".to_string(),
             string_end: "\"".to_string(),
             location: Location {

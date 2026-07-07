@@ -459,6 +459,96 @@ render_yaml_data(template=yaml_template)
 }
 
 #[test]
+fn check_psycopg_sql_rules_are_silent_without_sql_config() {
+    let dir = test_dir("psycopg-silent-without-config");
+    write_file(
+        &dir.join("query.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+user_id = 1
+query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id!r}"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "query.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_psycopg_sql_static_rules_report_expected_diagnostics() {
+    let dir = test_dir("psycopg-static-rules");
+    write_file(
+        &dir.join("pyproject.toml"),
+        "[tool.t-linter.sql]\nlibrary = \"psycopg\"\n",
+    );
+    write_file(
+        &dir.join("query.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+from psycopg import sql
+
+user_id = 1
+ids = [1, 2]
+
+conversion: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id!r}"
+unknown_spec: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id:x}"
+identifier: Annotated[Template, "sql"] = t"SELECT * FROM {sql.Identifier('users')}"
+dict_param: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE data = { {'a': 1} }"
+tuple_param: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {(1, 2)}"
+in_clause: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id IN ({ids})"
+multi_statement: Annotated[Template, "sql"] = t"SELECT 1; SELECT 2"
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "query.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let rules = json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|diagnostic| diagnostic["rule"].as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(rules.contains(&"sql-conversion-unsupported"));
+    assert!(rules.contains(&"sql-format-spec-unknown"));
+    assert!(rules.contains(&"sql-composable-spec-mismatch"));
+    assert!(rules.contains(&"sql-dict-needs-json-wrapper"));
+    assert!(rules.contains(&"sql-tuple-parameter"));
+    assert!(rules.contains(&"sql-in-clause"));
+    assert!(rules.contains(&"sql-multi-statement"));
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| {
+                diagnostic["severity"] == "warning" && diagnostic["rule"] == "sql-in-clause"
+            })
+    );
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| {
+                diagnostic["rule"] == "sql-conversion-unsupported"
+                    && !diagnostic["suggested_edits"].as_array().unwrap().is_empty()
+            })
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_reports_yaml_plain_scalars_via_imported_class_annotation() {
     let dir = test_dir("yaml-imported-class");
     write_file(

@@ -1206,6 +1206,20 @@ For backend-powered languages (HTML, T-HTML, TDOM, JSON, YAML, TOML), t-linter s
 
 For Tree-sitter-only languages (CSS, JavaScript, SQL), t-linter uses Tree-sitter for both highlighting and validation. Formatting is not yet available for these languages.
 
+## SQL Notes
+
+SQL templates always receive Tree-sitter syntax validation when they are annotated as `"sql"`.
+psycopg-specific t-string checks are opt-in because the rules describe psycopg semantics, not SQL in general.
+
+Enable them with:
+
+```toml
+[tool.t-linter.sql]
+library = "psycopg"
+```
+
+When enabled, t-linter reports psycopg t-string errors for unsupported conversions, unknown format specs, composable/spec mismatches, direct `dict` parameters that need `Json` or `Jsonb`, tuple parameters, `IN ({ids})` list-parameter patterns, and multiple SQL statements in a single template.
+
 ## HTML Notes
 
 For `html`, `<title>{value}</title>` is allowed and rendered as escaped text.

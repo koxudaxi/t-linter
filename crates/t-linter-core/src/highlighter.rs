@@ -691,6 +691,7 @@ mod tests {
             function_name: None,
             language: Some(language.to_string()),
             profile: None,
+            library: None,
             string_start,
             string_end,
             location,
@@ -1610,6 +1611,7 @@ B<span>{value}</span>
             function_name: None,
             language: Some("html".to_string()),
             profile: None,
+            library: None,
             string_start: "t\"".to_string(),
             string_end: "\"".to_string(),
             location: Location {
