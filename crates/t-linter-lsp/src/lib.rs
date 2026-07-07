@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use t_linter_core::{
-    FormatOptions as CoreFormatOptions, LintDiagnostic, ShadowDocument, TemplateHighlighter,
-    TemplateStringInfo, TemplateStringParser, format_document_range_with_options,
-    format_document_with_options, lint_source, load_project_config_for_path,
-    synthesize_for_type_check,
+    DiagnosticData, DiagnosticEdit, FormatOptions as CoreFormatOptions, LintDiagnostic,
+    ShadowDocument, TemplateHighlighter, TemplateStringInfo, TemplateStringParser,
+    format_document_range_with_options, format_document_with_options, lint_source,
+    load_project_config_for_path, synthesize_for_type_check,
 };
 use tower_lsp::jsonrpc::Result as JsonRpcResult;
 use tower_lsp::lsp_types::*;
@@ -535,7 +535,24 @@ impl LanguageServer for TLinterLanguageServer {
         let requested_kinds = params.context.only.as_deref();
         let source_fix_all_kind = Self::source_fix_all_kind();
         let rewrite_kind = Self::refactor_rewrite_kind();
+        let quickfix_kind = CodeActionKind::QUICKFIX;
         let defer_edits = self.client_support.read().await.resolve_code_action_edits;
+
+        if requested_code_action_kinds_include(requested_kinds, &quickfix_kind) {
+            let source = self
+                .document_cache
+                .get(&params.text_document.uri)
+                .map(|entry| entry.text.clone())
+                .ok_or_else(|| tower_lsp::jsonrpc::Error::invalid_params("Document not found"))?;
+            actions.extend(
+                suggested_edit_code_actions(
+                    &params.text_document.uri,
+                    &source,
+                    &params.context.diagnostics,
+                )
+                .map_err(internal_error)?,
+            );
+        }
 
         if requested_code_action_kinds_include(requested_kinds, &source_fix_all_kind) {
             if defer_edits {
@@ -1455,8 +1472,19 @@ fn lint_diagnostic_to_lsp(diagnostic: &LintDiagnostic, source: &str) -> Result<D
         code: Some(NumberOrString::String(diagnostic.rule.clone())),
         source: Some("t-linter".to_string()),
         message: diagnostic.message.clone(),
+        data: Some(serde_json::to_value(lint_diagnostic_data(diagnostic))?),
         ..Default::default()
     })
+}
+
+fn lint_diagnostic_data(diagnostic: &LintDiagnostic) -> DiagnosticData {
+    DiagnosticData {
+        expected_type: diagnostic.expected_type.clone(),
+        found_type: diagnostic.found_type.clone(),
+        schema_pointer: diagnostic.schema_pointer.clone(),
+        source_of_truth: diagnostic.source_of_truth.clone(),
+        suggested_edits: diagnostic.suggested_edits.clone(),
+    }
 }
 
 fn location_to_lsp_range(location: &t_linter_core::Location, source: &str) -> Result<Range> {
@@ -1505,6 +1533,56 @@ fn template_edits_to_lsp(
             Ok(TextEdit {
                 range: location_to_lsp_range(&edit.location, source)?,
                 new_text: edit.replacement,
+            })
+        })
+        .collect()
+}
+
+fn suggested_edit_code_actions(
+    uri: &Url,
+    source: &str,
+    diagnostics: &[Diagnostic],
+) -> Result<Vec<CodeActionOrCommand>> {
+    diagnostics
+        .iter()
+        .filter_map(|diagnostic| {
+            let data = diagnostic
+                .data
+                .clone()
+                .and_then(|data| serde_json::from_value::<DiagnosticData>(data).ok())?;
+            if data.suggested_edits.is_empty() {
+                return None;
+            }
+            Some((diagnostic, data.suggested_edits))
+        })
+        .map(|(diagnostic, edits)| {
+            let edits = diagnostic_edits_to_lsp(edits, source)?;
+            Ok(CodeAction {
+                title: "Apply t-linter suggested edit".to_string(),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![diagnostic.clone()]),
+                edit: Some(workspace_edit_for_uri(uri, edits)),
+                is_preferred: Some(true),
+                ..Default::default()
+            }
+            .into())
+        })
+        .collect()
+}
+
+fn diagnostic_edits_to_lsp(edits: Vec<DiagnosticEdit>, source: &str) -> Result<Vec<TextEdit>> {
+    edits
+        .into_iter()
+        .map(|edit| {
+            let location = t_linter_core::Location {
+                start_line: edit.range.start_line,
+                start_column: edit.range.start_column,
+                end_line: edit.range.end_line,
+                end_column: edit.range.end_column,
+            };
+            Ok(TextEdit {
+                range: location_to_lsp_range(&location, source)?,
+                new_text: edit.new_text,
             })
         })
         .collect()
@@ -1589,12 +1667,22 @@ fn remap_interpolation_type_diagnostics(
         else {
             continue;
         };
+        let found_type = found_type_from_message(&diagnostic.message, backend)
+            .unwrap_or("unknown")
+            .to_string();
         remapped.push(Diagnostic {
             range: location_to_lsp_range(&site.original_location, source)?,
             severity: Some(DiagnosticSeverity::WARNING),
             code: Some(NumberOrString::String(INTERPOLATION_TYPE_RULE.to_string())),
             source: Some(format!("t-linter ({})", backend.as_str())),
-            message: interpolation_type_message(diagnostic, site, backend),
+            message: interpolation_type_message(diagnostic, site, &found_type),
+            data: Some(serde_json::to_value(DiagnosticData {
+                expected_type: Some(site.expected_type.clone()),
+                found_type: Some(found_type),
+                schema_pointer: None,
+                source_of_truth: Some(site.expected_description.clone()),
+                suggested_edits: Vec::new(),
+            })?),
             ..Default::default()
         });
     }
@@ -1619,9 +1707,9 @@ fn diagnostic_rule_code(diagnostic: &Diagnostic) -> Option<&str> {
 fn interpolation_type_message(
     diagnostic: &Diagnostic,
     site: &t_linter_core::ShadowCheckSite,
-    backend: TypeCheckerBackend,
+    found: &str,
 ) -> String {
-    if let Some(found) = found_type_from_message(&diagnostic.message, backend) {
+    if found != "unknown" {
         return format!(
             "Interpolation value of type `{found}` is not assignable to {} (expected: {})",
             site.expected_description,
@@ -2650,6 +2738,19 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
             start_column: 3,
             end_line: 2,
             end_column: 6,
+            expected_type: Some("str".to_string()),
+            found_type: Some("int".to_string()),
+            schema_pointer: None,
+            source_of_truth: Some("demo schema".to_string()),
+            suggested_edits: vec![DiagnosticEdit {
+                range: t_linter_core::DiagnosticEditRange {
+                    start_line: 2,
+                    start_column: 3,
+                    end_line: 2,
+                    end_column: 6,
+                },
+                new_text: "cat".to_string(),
+            }],
         };
         let lsp_diagnostic = lint_diagnostic_to_lsp(&diagnostic, source).expect("diagnostic");
         assert_eq!(lsp_diagnostic.range.start.line, 1);
@@ -2657,6 +2758,13 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
         assert_eq!(
             lsp_diagnostic.code,
             Some(NumberOrString::String("demo-rule".to_string()))
+        );
+        assert_eq!(
+            lsp_diagnostic
+                .data
+                .as_ref()
+                .and_then(|data| data.get("expected_type")),
+            Some(&serde_json::json!("str"))
         );
 
         let location = t_linter_core::Location {
@@ -2678,6 +2786,21 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
         let lsp_edits = template_edits_to_lsp(vec![edit], source).expect("lsp edits");
         assert_eq!(lsp_edits.len(), 1);
         let uri = Url::from_file_path(std::env::temp_dir().join("example.py")).expect("uri");
+        let quickfixes =
+            suggested_edit_code_actions(&uri, source, std::slice::from_ref(&lsp_diagnostic))
+                .expect("quickfixes");
+        assert_eq!(quickfixes.len(), 1);
+        let CodeActionOrCommand::CodeAction(quickfix) = &quickfixes[0] else {
+            panic!("expected code action");
+        };
+        let fixed = apply_workspace_edit_for_uri(
+            &uri,
+            source,
+            quickfix.edit.as_ref().expect("quickfix edit"),
+        )
+        .expect("apply quickfix");
+        assert_eq!(fixed, "alpha\n  cata\nthird\n line four\nabcdefghi\n");
+
         let workspace_edit = workspace_edit_for_uri(&uri, lsp_edits.clone());
         assert_eq!(
             workspace_edit
@@ -2783,6 +2906,20 @@ payload: Annotated[Template, "json"] = t'{{"name": {名前}, "age": {age}}}'
         assert_eq!(
             remapped[0].range.end.character - remapped[0].range.start.character,
             2
+        );
+        assert_eq!(
+            remapped[0]
+                .data
+                .as_ref()
+                .and_then(|data| data.get("expected_type")),
+            Some(&serde_json::json!(site.expected_type))
+        );
+        assert_eq!(
+            remapped[0]
+                .data
+                .as_ref()
+                .and_then(|data| data.get("found_type")),
+            Some(&serde_json::json!("User"))
         );
 
         let pyright_matching = Diagnostic {
