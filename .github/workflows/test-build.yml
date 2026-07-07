@@ -93,14 +93,14 @@ jobs:
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@1.94.0
 
-    - name: Build t-linter
-      run: cargo build --bin t-linter
-
     - name: Run SQL catalog integration
       env:
-        T_LINTER_BIN: ${{ github.workspace }}/target/debug/t-linter
         T_LINTER_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/tlinter
       run: |
+        uv tool install ty==0.0.56
+        export PATH="$HOME/.local/bin:$PATH"
         uv venv --python 3.14 .sql-catalog-venv
         uv pip install --python .sql-catalog-venv/bin/python "psycopg[binary]>=3.3"
-        .sql-catalog-venv/bin/python scripts/sql_catalog_integration.py
+        T_LINTER_SQL_PYTHON="$PWD/.sql-catalog-venv/bin/python" \
+          cargo test -p t-linter --test type_check_lsp \
+          sql_catalog_cache_drives_lsp_type_diagnostics_from_real_database -- --nocapture
