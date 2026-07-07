@@ -99,6 +99,35 @@ fn check_command_reports_invalid_config_errors() {
 }
 
 #[test]
+fn sql_prepare_requires_database_url_without_cache() {
+    let dir = test_dir("sql-prepare-no-database-url");
+    write_file(
+        &dir.join("pyproject.toml"),
+        "[tool.t-linter.sql]\nlibrary = \"psycopg\"\n",
+    );
+    write_file(
+        &dir.join("app.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
+"#,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_t-linter"))
+        .args(["sql", "prepare", "app.py"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("SQL database-url is required"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn lsp_subcommand_exits_cleanly_with_closed_stdio() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_t-linter"))
         .args(["lsp", "--stdio"])

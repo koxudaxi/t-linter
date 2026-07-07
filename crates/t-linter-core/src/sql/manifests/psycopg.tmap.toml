@@ -7,20 +7,20 @@ library-versions = ">=3.3"
 
 [param-accepts]
 bool = { type = "bool" }
-int = { type = "int" }
-float = { type = "float" }
-decimal = { type = "decimal.Decimal", imports = ["decimal"] }
-str = { type = "str" }
-bytes = { type = "bytes" }
+"int2|int4|int8" = { type = "int" }
+"float4|float8" = { type = "float | int" }
+numeric = { type = "decimal.Decimal | int | float", imports = ["decimal"] }
+"text|varchar|bpchar" = { type = "str" }
+bytea = { type = "bytes | bytearray | memoryview" }
 date = { type = "datetime.date", imports = ["datetime"] }
-datetime = { type = "datetime.datetime", imports = ["datetime"] }
-time = { type = "datetime.time", imports = ["datetime"] }
-timedelta = { type = "datetime.timedelta", imports = ["datetime"] }
+"timestamp|timestamptz" = { type = "datetime.datetime", imports = ["datetime"] }
+"time|timetz" = { type = "datetime.time", imports = ["datetime"] }
+interval = { type = "datetime.timedelta", imports = ["datetime"] }
 uuid = { type = "uuid.UUID", imports = ["uuid"] }
-list = { type = "list" }
-json = { type = "psycopg.types.json.Json", imports = ["psycopg.types.json"] }
-jsonb = { type = "psycopg.types.json.Jsonb", imports = ["psycopg.types.json"] }
-none = { type = "None" }
+"json|jsonb" = { type = "psycopg.types.json.Json | psycopg.types.json.Jsonb", imports = ["psycopg.types.json"] }
+inet = { type = "ipaddress.IPv4Address | ipaddress.IPv6Address | ipaddress.IPv4Interface | ipaddress.IPv6Interface | str", imports = ["ipaddress"] }
+"_*" = { type = "list" }
+default = { type = "object" }
 
 [spec-accepts]
 top = { type = "bool | int | float | decimal.Decimal | str | bytes | datetime.date | datetime.datetime | datetime.time | datetime.timedelta | uuid.UUID | list | psycopg.types.json.Json | psycopg.types.json.Jsonb | None", imports = ["decimal", "datetime", "uuid", "psycopg.types.json"] }

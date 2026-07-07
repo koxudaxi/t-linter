@@ -5,6 +5,7 @@ use serde::Deserialize;
 use tree_sitter::{Node, Tree};
 use tstring_syntax::InterpolationTypeRequirement;
 
+use super::catalog::{CachedSqlCatalog, SqlCatalogQuery};
 use crate::lint::{DiagnosticEdit, DiagnosticEditRange, LintDiagnostic, LintSeverity};
 use crate::parser::ModuleContext;
 use crate::project_config::SqlConfig;
@@ -25,7 +26,7 @@ const TOP_SPEC_KEY: &str = "top";
 #[derive(Debug, Deserialize)]
 struct PsycopgTypeMap {
     #[serde(rename = "param-accepts")]
-    _param_accepts: std::collections::BTreeMap<String, TypeMapEntry>,
+    param_accepts: std::collections::BTreeMap<String, TypeMapEntry>,
     #[serde(rename = "spec-accepts")]
     spec_accepts: std::collections::BTreeMap<String, TypeMapEntry>,
 }
@@ -110,30 +111,64 @@ pub fn lint_rules(
     diagnostics
 }
 
+#[allow(dead_code)]
 pub fn interpolation_type_requirements(
     template: &TemplateStringInfo,
     config: &SqlConfig,
 ) -> Vec<InterpolationTypeRequirement> {
+    interpolation_type_requirements_with_catalog(template, config, None)
+}
+
+pub fn interpolation_type_requirements_with_catalog(
+    template: &TemplateStringInfo,
+    config: &SqlConfig,
+    catalog: Option<(&SqlCatalogQuery, &CachedSqlCatalog)>,
+) -> Vec<InterpolationTypeRequirement> {
     let mut requirements = Vec::new();
+    let mut server_param_index = 0;
     for part in &template.parts {
         let TemplatePart::Interpolation(interpolation) = part else {
             continue;
         };
         let spec = interpolation.format_spec.trim();
-        let expected_type = expected_type_for_spec(spec, config);
-        let expected_description = match spec {
-            "i" => "psycopg format spec ':i'",
-            "q" => "psycopg format spec ':q'",
-            "l" => "psycopg format spec ':l'",
-            "s" => "psycopg format spec ':s'",
-            "b" => "psycopg format spec ':b'",
-            "t" => "psycopg format spec ':t'",
-            _ => "psycopg SQL parameter",
+        let catalog_type = if is_catalog_parameter_spec(spec) {
+            let current_index = server_param_index;
+            server_param_index += 1;
+            catalog
+                .and_then(|(query, entry)| {
+                    query
+                        .parameter_interpolation_indices
+                        .get(current_index)
+                        .filter(|interpolation_index| {
+                            **interpolation_index == interpolation.interpolation_index
+                        })
+                        .and_then(|_| entry.params.get(current_index))
+                })
+                .map(|param| (current_index + 1, param.type_name.as_str()))
+        } else {
+            None
+        };
+        let expected_type = catalog_type
+            .map(|(_, type_name)| expected_type_for_pg_type(type_name))
+            .unwrap_or_else(|| expected_type_for_spec(spec, config));
+        let expected_description = if let Some((index, type_name)) = catalog_type {
+            format!("PostgreSQL parameter {index} ({type_name})")
+        } else {
+            match spec {
+                "i" => "psycopg format spec ':i'",
+                "q" => "psycopg format spec ':q'",
+                "l" => "psycopg format spec ':l'",
+                "s" => "psycopg format spec ':s'",
+                "b" => "psycopg format spec ':b'",
+                "t" => "psycopg format spec ':t'",
+                _ => "psycopg SQL parameter",
+            }
+            .to_string()
         };
         requirements.push(InterpolationTypeRequirement::new(
             interpolation.interpolation_index,
             expected_type,
-            expected_description.to_string(),
+            expected_description,
         ));
     }
     requirements
@@ -156,11 +191,56 @@ fn expected_type_for_spec(spec: &str, config: &SqlConfig) -> String {
 }
 
 fn type_map_entry(key: &str) -> Option<&'static TypeMapEntry> {
+    type_map().and_then(|type_map| type_map.spec_accepts.get(key))
+}
+
+fn param_type_map_entry(type_name: &str) -> Option<&'static TypeMapEntry> {
+    let normalized = normalize_pg_type_name(type_name);
+    type_map().and_then(|type_map| {
+        type_map
+            .param_accepts
+            .iter()
+            .find(|(key, _)| param_key_matches(key, &normalized))
+            .map(|(_, entry)| entry)
+            .or_else(|| type_map.param_accepts.get("default"))
+    })
+}
+
+fn type_map() -> Option<&'static PsycopgTypeMap> {
     static TYPE_MAP: OnceLock<Option<PsycopgTypeMap>> = OnceLock::new();
     TYPE_MAP
         .get_or_init(|| toml::from_str(PSYCOPG_TYPE_MAP).ok())
         .as_ref()
-        .and_then(|type_map| type_map.spec_accepts.get(key))
+}
+
+fn expected_type_for_pg_type(type_name: &str) -> String {
+    param_type_map_entry(type_name)
+        .map(|entry| entry.python_type.clone())
+        .unwrap_or_else(|| "object".to_string())
+}
+
+fn normalize_pg_type_name(type_name: &str) -> String {
+    type_name
+        .trim()
+        .trim_matches('"')
+        .rsplit('.')
+        .next()
+        .unwrap_or(type_name)
+        .to_ascii_lowercase()
+}
+
+fn param_key_matches(key: &str, type_name: &str) -> bool {
+    if key == "default" {
+        return false;
+    }
+    if key == "_*" {
+        return type_name.starts_with('_');
+    }
+    key.split('|').any(|part| part.trim() == type_name)
+}
+
+fn is_catalog_parameter_spec(spec: &str) -> bool {
+    matches!(spec, "" | "s" | "b" | "t")
 }
 
 fn extend_union(expected_type: &mut String, extra_param_types: &[String]) {

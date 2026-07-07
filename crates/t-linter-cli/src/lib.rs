@@ -1,4 +1,5 @@
 mod discovery;
+mod sql_prepare;
 
 use std::fs;
 use std::io::{Read, Write};
@@ -54,9 +55,23 @@ pub enum Commands {
         #[arg(long)]
         line_length: Option<usize>,
     },
+    Sql {
+        #[command(subcommand)]
+        command: SqlCommands,
+    },
     Stats {
         #[arg(default_value = ".")]
         path: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SqlCommands {
+    Prepare {
+        paths: Vec<String>,
+
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -183,6 +198,10 @@ pub fn format(
 pub fn stats(path: String) -> Result<()> {
     println!("Analyzing statistics for: {}", path);
     Ok(())
+}
+
+pub fn sql_prepare(paths: Vec<String>, check: bool) -> Result<i32> {
+    sql_prepare::prepare(paths, check)
 }
 
 fn check_failure_to_result(failure: &DiscoveryFailure) -> LintFileResult {

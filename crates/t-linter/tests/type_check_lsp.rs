@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -188,6 +188,71 @@ class Jsonb: ...
     );
 }
 
+fn write_sql_catalog_fixture_files(workspace: &Path) -> String {
+    write_sql_type_fixture_files(workspace);
+    write_file(
+        &workspace.join("pyproject.toml"),
+        "[tool.t-linter.sql]\nlibrary = \"psycopg\"\ndatabase-url = \"env:T_LINTER_TEST_DATABASE_URL\"\nsearch-path = \"public\"\n",
+    );
+    r#"from typing import Annotated
+from string.templatelib import Template
+
+def find_user(user_id: str) -> None:
+    query: Annotated[Template, "sql"] = t"SELECT name FROM users WHERE id = {user_id}"
+"#
+    .to_string()
+}
+
+fn reset_sql_catalog_schema(database_url: &str, id_type: &str) -> Output {
+    let python = std::env::var("T_LINTER_SQL_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    Command::new(&python)
+        .arg("-c")
+        .arg(
+            r#"
+import sys
+import psycopg
+
+database_url, id_type = sys.argv[1], sys.argv[2]
+with psycopg.connect(database_url, autocommit=True) as conn:
+    conn.execute("DROP TABLE IF EXISTS users")
+    conn.execute(f"CREATE TABLE users (id {id_type} PRIMARY KEY, name text NOT NULL)")
+"#,
+        )
+        .arg(database_url)
+        .arg(id_type)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {python}: {error}"))
+}
+
+fn run_t_linter(workspace: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_t-linter"));
+    command.args(args).current_dir(workspace);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    command.output().unwrap()
+}
+
+fn sql_catalog_cache_entries(workspace: &Path) -> Vec<Value> {
+    let cache_dir = workspace.join(".t-linter").join("sql-cache");
+    let mut cache_files = fs::read_dir(&cache_dir)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", cache_dir.display()))
+        .map(|entry| entry.expect("cache entry").path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("query-"))
+        })
+        .collect::<Vec<_>>();
+    cache_files.sort();
+    cache_files
+        .iter()
+        .map(|path| {
+            let content = fs::read_to_string(path).expect("cache json");
+            serde_json::from_str(&content).expect("cache json parses")
+        })
+        .collect()
+}
+
 struct LspClient {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -198,14 +263,21 @@ struct LspClient {
 
 impl LspClient {
     fn start(workspace: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_t-linter"))
+        Self::start_with_env(workspace, &[])
+    }
+
+    fn start_with_env(workspace: &Path, envs: &[(&str, &str)]) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_t-linter"));
+        command
             .args(["lsp", "--stdio"])
             .current_dir(workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        for (name, value) in envs {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().unwrap();
 
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
@@ -463,6 +535,135 @@ fn wait_for_child_with_timeout(child: &mut Child, timeout: Duration) -> ExitStat
 
 fn file_uri(path: &Path) -> String {
     Url::from_file_path(path).expect("file URI").to_string()
+}
+
+#[test]
+fn sql_catalog_cache_drives_lsp_type_diagnostics_from_real_database() {
+    let Ok(database_url) = std::env::var("T_LINTER_TEST_DATABASE_URL") else {
+        eprintln!("skipped SQL catalog e2e: T_LINTER_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let checkers = available_type_checkers();
+    if checkers.is_empty() {
+        eprintln!("skipped SQL catalog e2e: no supported type checker found");
+        return;
+    }
+
+    let output_summary = |output: &Output| {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+
+    let reset = reset_sql_catalog_schema(&database_url, "integer");
+    assert_eq!(
+        reset.status.code(),
+        Some(0),
+        "reset SQL catalog schema: {}",
+        output_summary(&reset)
+    );
+
+    let dir = test_dir("sql-catalog-cache");
+    let file = dir.join("app.py");
+    let source = write_sql_catalog_fixture_files(&dir);
+    write_file(&file, &source);
+
+    let app_path = file.to_string_lossy().into_owned();
+    let envs = [("T_LINTER_TEST_DATABASE_URL", database_url.as_str())];
+    let prepared = run_t_linter(&dir, &["sql", "prepare", app_path.as_str()], &envs);
+    assert_eq!(
+        prepared.status.code(),
+        Some(0),
+        "t-linter sql prepare: {}",
+        output_summary(&prepared)
+    );
+
+    let cache_entries = sql_catalog_cache_entries(&dir);
+    assert_eq!(cache_entries.len(), 1, "cache entries: {cache_entries:?}");
+    let cache = &cache_entries[0];
+    assert_eq!(cache["params"][0]["type_name"], "int4");
+    assert!(
+        cache["schema_fingerprint"]
+            .as_str()
+            .is_some_and(|fingerprint| fingerprint.starts_with("sha256:")),
+        "cache entry: {cache}"
+    );
+
+    let checked = run_t_linter(
+        &dir,
+        &["sql", "prepare", "--check", app_path.as_str()],
+        &envs,
+    );
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "t-linter sql prepare --check: {}",
+        output_summary(&checked)
+    );
+
+    let offline_envs = [(
+        "T_LINTER_TEST_DATABASE_URL",
+        "postgresql://postgres:postgres@127.0.0.1:1/tlinter",
+    )];
+    let offline = run_t_linter(
+        &dir,
+        &["sql", "prepare", "--check", app_path.as_str()],
+        &offline_envs,
+    );
+    assert_eq!(
+        offline.status.code(),
+        Some(0),
+        "t-linter sql prepare --check with cached DB failure: {}",
+        output_summary(&offline)
+    );
+
+    let uri = file_uri(&file);
+    for checker in checkers {
+        write_type_checker_config_files(&dir, checker.checker);
+        let mut client = LspClient::start_with_env(&dir, &offline_envs);
+        client.initialize(&dir, &checker);
+        client.did_open(&uri, &source);
+
+        let diagnostics = client.wait_for_type_diagnostics(&uri);
+        let type_diagnostics = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic["code"] == TYPE_DIAGNOSTIC_RULE)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            type_diagnostics.len(),
+            1,
+            "{} diagnostics: {diagnostics:?}",
+            checker.name
+        );
+        assert_diagnostic_span(
+            diagnostic_with_message(&type_diagnostics, "PostgreSQL parameter 1 (int4)"),
+            expected_payload_span(&source, "query:", "{user_id}"),
+        );
+        client.shutdown();
+    }
+
+    let reset = reset_sql_catalog_schema(&database_url, "bigint");
+    assert_eq!(
+        reset.status.code(),
+        Some(0),
+        "reset stale SQL catalog schema: {}",
+        output_summary(&reset)
+    );
+    let stale = run_t_linter(
+        &dir,
+        &["sql", "prepare", "--check", app_path.as_str()],
+        &envs,
+    );
+    assert_eq!(
+        stale.status.code(),
+        Some(2),
+        "stale t-linter sql prepare --check: {}",
+        output_summary(&stale)
+    );
+
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]

@@ -60,6 +60,27 @@ library = "psycopg"
 
 When enabled, t-linter reports psycopg t-string errors for unsupported conversions, unknown format specs, composable/spec mismatches, direct `dict` parameters that need `Json` or `Jsonb`, tuple parameters, `IN ({ids})` list-parameter patterns, and multiple SQL statements in a single template.
 
+For catalog-backed parameter narrowing, configure a PostgreSQL connection and
+prepare the offline cache:
+
+```toml
+[tool.t-linter.sql]
+library = "psycopg"
+database-url = "env:DATABASE_URL"
+search-path = "public"
+```
+
+```bash
+t-linter sql prepare .
+t-linter sql prepare --check .
+```
+
+The cache is written to `.t-linter/sql-cache/`. `t-linter sql prepare --check`
+reports stale cache entries when PostgreSQL is reachable; if the database is
+unavailable, it trusts the existing committed cache and exits successfully.
+When the cache is present, interpolation type checking can narrow plain psycopg
+parameters from PostgreSQL types even if the database is unavailable.
+
 ## HTML Notes
 
 For `html`, `<title>{value}</title>` is allowed and rendered as escaped text.

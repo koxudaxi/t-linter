@@ -9,7 +9,7 @@ use tstring_tdom as backend_tdom;
 
 use crate::backend::TemplateBackend;
 use crate::parser::ModuleContext;
-use crate::project_config::{SqlConfig, load_project_config_for_path};
+use crate::project_config::{ProjectConfig, load_project_config_for_path};
 use crate::tdom::{
     ComponentPropExpectedType, expected_type_for_component_prop, resolve_component_signature,
 };
@@ -115,15 +115,21 @@ impl TemplateTypeRequirements {
 }
 
 pub fn synthesize_for_type_check(path: &Path, source: &str) -> Result<Option<ShadowDocument>> {
+    let project_config = load_project_config_for_path(path).unwrap_or_default();
+    synthesize_for_type_check_with_config(path, source, &project_config)
+}
+
+pub fn synthesize_for_type_check_with_config(
+    path: &Path,
+    source: &str,
+    project_config: &ProjectConfig,
+) -> Result<Option<ShadowDocument>> {
     let mut template_parser = TemplateStringParser::new()?;
     let templates = template_parser.find_template_strings_in_file(source, path)?;
     let module_context = template_parser.module_context().clone();
     let prefix = available_shadow_prefix(source);
-    let sql_config = load_project_config_for_path(path)
-        .map(|config| config.sql)
-        .unwrap_or_default();
     let requirements_by_template =
-        type_requirements_by_template(&templates, &module_context, &prefix, &sql_config);
+        type_requirements_by_template(&templates, &module_context, &prefix, project_config);
     if requirements_by_template
         .iter()
         .all(TemplateTypeRequirements::is_empty)
@@ -268,10 +274,12 @@ fn type_requirements_by_template(
     templates: &[TemplateStringInfo],
     module_context: &ModuleContext,
     prefix: &str,
-    sql_config: &SqlConfig,
+    project_config: &ProjectConfig,
 ) -> Vec<TemplateTypeRequirements> {
     #[cfg(not(feature = "sql"))]
-    let _ = sql_config;
+    let _ = project_config;
+    #[cfg(feature = "sql")]
+    let sql_config = &project_config.sql;
 
     templates
         .iter()
@@ -287,10 +295,22 @@ fn type_requirements_by_template(
                 #[cfg(feature = "sql")]
                 (TemplateBackend::Sql, _) => {
                     if crate::sql::psycopg::is_enabled(sql_config, template) {
+                        let catalog = crate::sql::catalog::cached_catalog_for_template(
+                            &project_config.root,
+                            template,
+                            sql_config,
+                        )
+                        .ok()
+                        .flatten();
                         TemplateTypeRequirements {
-                            requirements: crate::sql::psycopg::interpolation_type_requirements(
-                                template, sql_config,
-                            ),
+                            requirements:
+                                crate::sql::psycopg::interpolation_type_requirements_with_catalog(
+                                    template,
+                                    sql_config,
+                                    catalog
+                                        .as_ref()
+                                        .map(|(query, entry)| (query, entry)),
+                                ),
                             type_imports: Vec::new(),
                             allow_format_specs: true,
                         }
@@ -1343,6 +1363,65 @@ query: Annotated[Template, "sql"] = t"SELECT * FROM invoices WHERE amount = {mon
         assert_eq!(
             shadow.sites[0].expected_description,
             "psycopg SQL parameter"
+        );
+        assert_python_parses(&shadow.text);
+    }
+
+    #[cfg(feature = "sql")]
+    #[test]
+    fn cached_psycopg_catalog_narrows_plain_sql_parameters() {
+        let dir = shadow_test_dir("cached-psycopg-catalog");
+        write_file(
+            &dir.join("pyproject.toml"),
+            "[tool.t-linter.sql]\nlibrary = \"psycopg\"\n",
+        );
+        let source = r#"from typing import Annotated
+from string.templatelib import Template
+
+query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id}"
+"#;
+        let mut parser = TemplateStringParser::new().expect("parser");
+        let template = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .expect("templates")
+            .into_iter()
+            .next()
+            .expect("template");
+        let config = crate::project_config::SqlConfig {
+            library: Some("psycopg".to_string()),
+            ..crate::project_config::SqlConfig::default()
+        };
+        let query = crate::sql::catalog::catalog_query_for_template(&template, &config)
+            .expect("catalog query");
+        let entry = crate::sql::catalog::catalog_entry_from_response(
+            &query,
+            crate::sql::catalog::DescribeResponse {
+                params: vec![crate::sql::catalog::SqlCatalogParam {
+                    oid: 23,
+                    type_name: "int4".to_string(),
+                }],
+                columns: Vec::new(),
+                psycopg_version: Some("3.3.1".to_string()),
+            },
+            None,
+        )
+        .expect("catalog entry");
+        crate::sql::catalog::write_cached_catalog(
+            &crate::sql::catalog::cache_path_for_query(&dir, &query),
+            &entry,
+        )
+        .expect("write catalog cache");
+
+        let shadow = synthesize_for_type_check(&dir.join("app.py"), source)
+            .expect("synthesize")
+            .expect("shadow");
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(shadow.text.contains("__tl_0_0: \"int\" = user_id"));
+        assert_eq!(
+            shadow.sites[0].expected_description,
+            "PostgreSQL parameter 1 (int4)"
         );
         assert_python_parses(&shadow.text);
     }

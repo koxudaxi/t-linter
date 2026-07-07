@@ -14,12 +14,20 @@ import argparse
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).parent.parent
 DOCS_DIR = ROOT_DIR / "docs"
 README_FILE = ROOT_DIR / "README.md"
 PATTERN = re.compile(r"(koxudaxi/t-linter@)(\d+\.\d+\.\d+)")
+
+
+def get_project_version() -> str:
+    """Get the local project version."""
+    with (ROOT_DIR / "pyproject.toml").open("rb") as f:
+        project = tomllib.load(f)["project"]
+    return project["version"]
 
 
 def get_latest_release_version() -> str:
@@ -30,7 +38,9 @@ def get_latest_release_version() -> str:
         text=True,
         check=True,
     )
-    return result.stdout.strip()
+    if version := result.stdout.strip():
+        return version
+    raise RuntimeError("No published GitHub release found")
 
 
 def update_file(file_path: Path, version: str, *, check: bool = False) -> bool:
@@ -59,9 +69,9 @@ def main() -> int:
 
     try:
         version = get_latest_release_version()
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"Error getting latest release: {e}", file=sys.stderr)
-        return 1
+    except (subprocess.CalledProcessError, FileNotFoundError, RuntimeError) as e:
+        version = get_project_version()
+        print(f"Falling back to local project version {version}: {e}", file=sys.stderr)
 
     # Update docs directory and README.md
     target_files = list(DOCS_DIR.rglob("*.md"))

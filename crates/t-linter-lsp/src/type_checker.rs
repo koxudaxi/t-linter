@@ -139,6 +139,21 @@ impl TypeCheckerLaunchConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PythonLaunchConfig {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+impl PythonLaunchConfig {
+    fn new(command: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            command: command.into(),
+            args,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TypeCheckerClient {
     inner: Arc<TypeCheckerClientInner>,
@@ -953,6 +968,64 @@ pub fn type_checker_launch_candidates(
     dedupe_launch_candidates(candidates)
 }
 
+pub(crate) fn python_inline_script_launch_candidates(
+    workspace_roots: &[PathBuf],
+    explicit_command: Option<&str>,
+    env_command_name: &str,
+    script: &str,
+) -> Vec<PythonLaunchConfig> {
+    let helper_args = || vec!["-c".to_string(), script.to_string()];
+    if let Some(command) = explicit_command
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    {
+        return vec![PythonLaunchConfig::new(command, helper_args())];
+    }
+    if let Ok(command) = std::env::var(env_command_name)
+        && !command.trim().is_empty()
+    {
+        return vec![PythonLaunchConfig::new(command, helper_args())];
+    }
+
+    let mut candidates = Vec::new();
+    for env_name in ["VIRTUAL_ENV", "CONDA_PREFIX"] {
+        if let Some(path) = std::env::var_os(env_name)
+            .map(PathBuf::from)
+            .and_then(|prefix| first_existing_python(&environment_python_paths(&prefix)))
+        {
+            candidates.push(PythonLaunchConfig::new(path_string(path), helper_args()));
+        }
+    }
+    for root in workspace_roots {
+        for relative in workspace_python_relative_paths() {
+            let path = root.join(relative);
+            if is_executable_file(&path) {
+                candidates.push(PythonLaunchConfig::new(path_string(path), helper_args()));
+            }
+        }
+    }
+    for root in workspace_roots {
+        if is_uv_project(root) {
+            candidates.push(PythonLaunchConfig::new(
+                "uv",
+                vec![
+                    "run".to_string(),
+                    "--project".to_string(),
+                    path_string(root.clone()),
+                    "--frozen".to_string(),
+                    "--no-progress".to_string(),
+                    "python".to_string(),
+                    "-c".to_string(),
+                    script.to_string(),
+                ],
+            ));
+        }
+    }
+    candidates.push(PythonLaunchConfig::new("python3", helper_args()));
+    candidates.push(PythonLaunchConfig::new("python", helper_args()));
+    dedupe_python_launch_candidates(candidates)
+}
+
 fn initialize_params(config: &TypeCheckerConfig, workspace_roots: &[PathBuf]) -> Result<Value> {
     let root_uri = workspace_roots
         .first()
@@ -1085,6 +1158,59 @@ fn workspace_checker_relative_paths(backend: TypeCheckerBackend) -> Vec<PathBuf>
     workspace_checker_relative_paths_for_platform(backend, cfg!(windows))
 }
 
+fn environment_python_paths(prefix: &Path) -> Vec<PathBuf> {
+    environment_python_paths_for_platform(prefix, cfg!(windows))
+}
+
+fn environment_python_paths_for_platform(prefix: &Path, windows: bool) -> Vec<PathBuf> {
+    let executable_names = python_executable_names(windows);
+    if windows {
+        executable_names
+            .iter()
+            .flat_map(|name| {
+                [
+                    prefix.join("Scripts").join(name),
+                    prefix.join("bin").join(name),
+                ]
+            })
+            .collect()
+    } else {
+        executable_names
+            .iter()
+            .map(|name| prefix.join("bin").join(name))
+            .collect()
+    }
+}
+
+fn workspace_python_relative_paths() -> Vec<PathBuf> {
+    workspace_python_relative_paths_for_platform(cfg!(windows))
+}
+
+fn workspace_python_relative_paths_for_platform(windows: bool) -> Vec<PathBuf> {
+    let executable_names = python_executable_names(windows);
+    let envs = [".venv", "venv"];
+    if windows {
+        envs.iter()
+            .flat_map(|env| {
+                executable_names.iter().flat_map(move |name| {
+                    [
+                        PathBuf::from(env).join("Scripts").join(name),
+                        PathBuf::from(env).join("bin").join(name),
+                    ]
+                })
+            })
+            .collect()
+    } else {
+        envs.iter()
+            .flat_map(|env| {
+                executable_names
+                    .iter()
+                    .map(move |name| PathBuf::from(env).join("bin").join(name))
+            })
+            .collect()
+    }
+}
+
 fn workspace_checker_relative_paths_for_platform(
     backend: TypeCheckerBackend,
     windows: bool,
@@ -1130,7 +1256,19 @@ fn checker_executable_names(backend: TypeCheckerBackend, windows: bool) -> Vec<&
     }
 }
 
+fn python_executable_names(windows: bool) -> Vec<&'static str> {
+    if windows {
+        vec!["python.exe", "python"]
+    } else {
+        vec!["python"]
+    }
+}
+
 fn first_existing_checker(paths: &[PathBuf]) -> Option<PathBuf> {
+    paths.iter().find(|path| is_executable_file(path)).cloned()
+}
+
+fn first_existing_python(paths: &[PathBuf]) -> Option<PathBuf> {
     paths.iter().find(|path| is_executable_file(path)).cloned()
 }
 
@@ -1308,6 +1446,18 @@ fn pyrefly_workspace_settings(python: Option<&str>) -> Value {
 fn dedupe_launch_candidates(
     candidates: Vec<TypeCheckerLaunchConfig>,
 ) -> Vec<TypeCheckerLaunchConfig> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for candidate in candidates {
+        let key = (candidate.command.clone(), candidate.args.clone());
+        if seen.insert(key) {
+            deduped.push(candidate);
+        }
+    }
+    deduped
+}
+
+fn dedupe_python_launch_candidates(candidates: Vec<PythonLaunchConfig>) -> Vec<PythonLaunchConfig> {
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
     for candidate in candidates {
