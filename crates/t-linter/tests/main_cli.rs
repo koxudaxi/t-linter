@@ -41,7 +41,15 @@ fn wait_for_child_with_timeout(child: &mut Child, timeout: Duration) -> ExitStat
 #[test]
 fn stats_command_succeeds() {
     let dir = test_dir("stats");
-    write_file(&dir.join("example.py"), "print('hello')\n");
+    write_file(
+        &dir.join("example.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+page: Annotated[Template, "html"] = t"<h1>{title}</h1>"
+plain = t"{title}"
+"#,
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_t-linter"))
         .args(["stats", "."])
@@ -50,11 +58,48 @@ fn stats_command_succeeds() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .contains("Analyzing statistics for: .")
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Files scanned:"));
+    assert!(stdout.contains("Template strings:"));
+    assert!(stdout.contains("html"));
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn stats_command_outputs_json_counts() {
+    let dir = test_dir("stats-json");
+    write_file(
+        &dir.join("example.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+
+def render_yaml(template: Annotated[Template, "yaml"]) -> None:
+    pass
+
+page: Annotated[Template, "html"] = t"<h1>{title}</h1>"
+render_yaml(t"name: {name}")
+plain = t"{title}"
+"#,
     );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_t-linter"))
+        .args(["stats", ".", "--format", "json"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["files_scanned"], 1);
+    assert_eq!(json["templates_total"], 3);
+    assert_eq!(json["typed"], 2);
+    assert_eq!(json["untyped"], 1);
+    assert_eq!(json["by_language"]["html"], 1);
+    assert_eq!(json["by_language"]["yaml"], 1);
+    assert_eq!(json["by_detection"]["annotation"], 1);
+    assert_eq!(json["by_detection"]["callee-inference"], 1);
+
     let _ = fs::remove_dir_all(dir);
 }
 

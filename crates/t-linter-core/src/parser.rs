@@ -74,6 +74,23 @@ struct TemplateHint {
     language: String,
     profile: Option<String>,
     library: Option<String>,
+    detection: LanguageDetection,
+}
+
+impl TemplateHint {
+    fn with_detection(mut self, detection: LanguageDetection) -> Self {
+        self.detection = detection;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LanguageDetection {
+    Annotation,
+    CalleeInference,
+    ReturnAnnotation,
+    VariableHint,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1612,6 +1629,7 @@ impl TemplateStringParser {
                 None
             } else {
                 self.resolve_template_hint_from_type_node(type_node, source)?
+                    .map(|hint| hint.with_detection(LanguageDetection::Annotation))
             }
         } else if let Some(func) = func_name {
             self.infer_template_hint_from_function_call(
@@ -1626,16 +1644,19 @@ impl TemplateStringParser {
             )?
         } else if let Some(return_type_node) = return_type_for_string_node(node) {
             self.resolve_template_hint_from_type_node(return_type_node, source)?
+                .map(|hint| hint.with_detection(LanguageDetection::ReturnAnnotation))
         } else {
             None
         };
-        if hint.is_none() {
-            if let Some(var_node) = var_name_node
-                && let Some(binding) =
-                    assignment_key_for_node_with_directives(var_node, source, scope_directives)
-            {
-                hint = variable_language_hints.get(&binding).cloned();
-            }
+        if hint.is_none()
+            && let Some(var_node) = var_name_node
+            && let Some(binding) =
+                assignment_key_for_node_with_directives(var_node, source, scope_directives)
+        {
+            hint = variable_language_hints
+                .get(&binding)
+                .cloned()
+                .map(|hint| hint.with_detection(LanguageDetection::VariableHint));
         }
 
         info!(
@@ -1659,6 +1680,7 @@ impl TemplateStringParser {
             variable_name: var_name.map(String::from),
             function_name: func_name.map(String::from),
             language: hint.as_ref().map(|hint| hint.language.clone()),
+            language_detection: hint.as_ref().map(|hint| hint.detection),
             profile: hint.as_ref().and_then(|hint| hint.profile.clone()),
             library: hint.and_then(|hint| hint.library),
             string_start: start_text.to_string(),
@@ -1753,6 +1775,7 @@ impl TemplateStringParser {
                 None
             } else {
                 self.resolve_template_hint_from_type_node(type_node, source)?
+                    .map(|hint| hint.with_detection(LanguageDetection::Annotation))
             }
         } else if let Some(func) = func_name {
             self.infer_template_hint_from_function_call(
@@ -1767,16 +1790,19 @@ impl TemplateStringParser {
             )?
         } else if let Some(return_type_node) = return_type_for_string_node(node) {
             self.resolve_template_hint_from_type_node(return_type_node, source)?
+                .map(|hint| hint.with_detection(LanguageDetection::ReturnAnnotation))
         } else {
             None
         };
-        if hint.is_none() {
-            if let Some(var_node) = var_name_node
-                && let Some(binding) =
-                    assignment_key_for_node_with_directives(var_node, source, scope_directives)
-            {
-                hint = variable_language_hints.get(&binding).cloned();
-            }
+        if hint.is_none()
+            && let Some(var_node) = var_name_node
+            && let Some(binding) =
+                assignment_key_for_node_with_directives(var_node, source, scope_directives)
+        {
+            hint = variable_language_hints
+                .get(&binding)
+                .cloned()
+                .map(|hint| hint.with_detection(LanguageDetection::VariableHint));
         }
 
         let start_position = node.start_position();
@@ -1788,6 +1814,7 @@ impl TemplateStringParser {
             variable_name: var_name.map(String::from),
             function_name: func_name.map(String::from),
             language: hint.as_ref().map(|hint| hint.language.clone()),
+            language_detection: hint.as_ref().map(|hint| hint.detection),
             profile: hint.as_ref().and_then(|hint| hint.profile.clone()),
             library: hint.and_then(|hint| hint.library),
             string_start: start_text.to_string(),
@@ -3209,6 +3236,7 @@ fn template_hint_from_type_info(info: ResolvedTypeInfo) -> Option<TemplateHint> 
         language,
         profile: info.template_profile,
         library: None,
+        detection: LanguageDetection::Annotation,
     })
 }
 
@@ -3220,6 +3248,7 @@ fn parameter_template_hint(parameter: &CallableParameter) -> Option<TemplateHint
             language: language.clone(),
             profile: parameter.template_profile.clone(),
             library: None,
+            detection: LanguageDetection::CalleeInference,
         })
 }
 
@@ -3997,6 +4026,7 @@ fn psycopg_sql_template_hint() -> TemplateHint {
         language: "sql".to_string(),
         profile: None,
         library: Some("psycopg".to_string()),
+        detection: LanguageDetection::CalleeInference,
     }
 }
 
@@ -5291,11 +5321,13 @@ fn tdom_template_processor_hint(target: &str) -> Option<TemplateHint> {
             language: "tdom".to_string(),
             profile: None,
             library: None,
+            detection: LanguageDetection::CalleeInference,
         }),
         "tdom.svg" | "tdom.processor.svg" => Some(TemplateHint {
             language: "tdom".to_string(),
             profile: Some("svg".to_string()),
             library: None,
+            detection: LanguageDetection::CalleeInference,
         }),
         _ => None,
     }
@@ -5316,6 +5348,7 @@ pub struct TemplateStringInfo {
     pub variable_name: Option<String>,
     pub function_name: Option<String>,
     pub language: Option<String>,
+    pub language_detection: Option<LanguageDetection>,
     pub profile: Option<String>,
     pub library: Option<String>,
     pub string_start: String,
@@ -6505,6 +6538,7 @@ html = t"""
             variable_name: None,
             function_name: None,
             language: Some("html".to_string()),
+            language_detection: Some(LanguageDetection::Annotation),
             profile: None,
             library: None,
             string_start: "t\"".to_string(),
@@ -6571,6 +6605,7 @@ html = t"""
             variable_name: None,
             function_name: None,
             language: Some("yaml".to_string()),
+            language_detection: Some(LanguageDetection::Annotation),
             profile: None,
             library: None,
             string_start: "t\"".to_string(),
@@ -6769,6 +6804,10 @@ html_content: Annotated[Template, "html"] = t"<h1>{title}</h1>"
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("html".to_string()));
+        assert_eq!(
+            templates[0].language_detection,
+            Some(LanguageDetection::Annotation)
+        );
         assert_eq!(templates[0].variable_name, Some("html_content".to_string()));
         assert!(templates[0].formatting_wrapper_location.is_none());
     }
@@ -6831,6 +6870,10 @@ content: html = t"<h1>Title</h1>"
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("html".to_string()));
+        assert_eq!(
+            templates[0].language_detection,
+            Some(LanguageDetection::Annotation)
+        );
         assert_eq!(templates[0].variable_name, Some("content".to_string()));
         assert_eq!(templates[0].content, "<h1>Title</h1>");
     }
@@ -6986,6 +7029,10 @@ def render_page() -> Annotated[Template, "html"]:
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].content, "<main>{}</main>");
         assert_eq!(templates[0].language, Some("html".to_string()));
+        assert_eq!(
+            templates[0].language_detection,
+            Some(LanguageDetection::ReturnAnnotation)
+        );
     }
 
     #[test]
@@ -7151,6 +7198,10 @@ page = tdom.html(t"<div>{name}</div>")
 
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("tdom".to_string()));
+        assert_eq!(
+            templates[0].language_detection,
+            Some(LanguageDetection::CalleeInference)
+        );
         assert_eq!(templates[0].profile, None);
     }
 

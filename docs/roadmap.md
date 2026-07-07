@@ -6,9 +6,6 @@
 - **Syntax Highlighting** — Supports HTML, T-HTML, TDOM, SQL, JavaScript, CSS, JSON, YAML, TOML
 - **Type Alias Support** — Recognizes `type html = Annotated[Template, "html"]`
 - **Linting (`check` command)** — Validate template strings for syntax errors
-
-## In Progress
-
 - **Statistics (`stats` command)** — Analyze template string usage across codebases
 
 ## Planned

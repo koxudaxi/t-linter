@@ -1,0 +1,13 @@
+- id: t-linter
+  name: t-linter check
+  description: Validate embedded languages in Python template strings (PEP 750)
+  entry: t-linter check --error-on-issues
+  language: python
+  types: [python]
+
+- id: t-linter-format
+  name: t-linter format
+  description: Format embedded languages in Python template strings (PEP 750)
+  entry: t-linter format
+  language: python
+  types: [python]

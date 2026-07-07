@@ -12,6 +12,7 @@
 
 - [Check Command](https://t-linter.koxudaxi.dev/usage/cli/check/): The `check` command validates Python template strings for syntax errors in embedded languages.
 - [Format Command](https://t-linter.koxudaxi.dev/usage/cli/format/): The `format` command rewrites supported Python template strings in place.
+- [Stats Command](https://t-linter.koxudaxi.dev/usage/cli/stats/): The `stats` command counts Python template strings without running lint diagnostics.
 - [LSP Server](https://t-linter.koxudaxi.dev/usage/cli/lsp/): t-linter includes a built-in Language Server Protocol (LSP) server for editor integration.
 
 - [Configuration](https://t-linter.koxudaxi.dev/usage/configuration/): t-linter can be configured via `pyproject.toml` and ignore files.

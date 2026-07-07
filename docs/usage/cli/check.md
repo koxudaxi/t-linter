@@ -89,6 +89,43 @@ t-linter check file.py --format github
 ::error file=example.py,line=4,col=47,title=t-linter(embedded-parse-error)::Expected a JSON value. (language=json)
 ```
 
+### SARIF
+
+```bash
+t-linter check file.py --format sarif
+```
+
+Use SARIF output with GitHub code scanning:
+
+```yaml
+- name: Run t-linter
+  run: t-linter check . --format sarif > t-linter.sarif
+
+- name: Upload SARIF
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: t-linter.sarif
+```
+
+## Fixes
+
+Some diagnostics include suggested edits. Apply them in place with `--fix`:
+
+```bash
+t-linter check file.py --fix
+```
+
+Preview the same edits without writing files with `--diff`:
+
+```bash
+t-linter check file.py --diff
+```
+
+`--fix` and `--diff` are mutually exclusive. Fixes are taken from the filtered
+diagnostic list, so ignored or suppressed diagnostics are not rewritten. The
+initial fixable rules are selected `sql-*` diagnostics and selected
+`template-schema-*` diagnostics.
+
 ## Error on Issues
 
 Use `--error-on-issues` to exit with a non-zero code when issues are found:

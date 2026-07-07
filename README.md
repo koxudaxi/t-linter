@@ -142,12 +142,17 @@ t-linter check file.py
 # Check a directory
 t-linter check src/
 
-# Output formats: human (default), json, github
+# Output formats: human (default), json, github, sarif
 t-linter check file.py --format json
 t-linter check file.py --format github  # GitHub Actions annotations
+t-linter check file.py --format sarif   # SARIF 2.1.0
 
 # Exit with error code if issues found (useful for CI)
 t-linter check file.py --error-on-issues
+
+# Apply or preview suggested edits
+t-linter check file.py --fix
+t-linter check file.py --diff
 ```
 
 Example output:
@@ -192,6 +197,15 @@ For CI pipelines that also use Ruff, run the tools explicitly in sequence:
 ```bash
 ruff check --fix . && ruff format . && t-linter format .
 ruff check . && ruff format --check . && t-linter format --check .
+```
+
+### Stats
+
+Count template strings without running diagnostics:
+
+```bash
+t-linter stats .
+t-linter stats . --format json
 ```
 
 ### LSP Server
@@ -392,5 +406,5 @@ For `html`, `<title>{value}</title>` is allowed and treated as escaped text.
 - ✅ **Type Alias Support** - Recognizes `type html = Annotated[Template, "html"]`
 - ✅ **Linting (`check` command)** - Validate template strings for syntax errors
 - ✅ **Formatting (`format` command)** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML
-- 🚧 **Statistics (`stats` command)** - Analyze template string usage across codebases
+- ✅ **Statistics (`stats` command)** - Analyze template string usage across codebases
 - 📋 **Cross-file Type Resolution** - Track type aliases across module boundaries

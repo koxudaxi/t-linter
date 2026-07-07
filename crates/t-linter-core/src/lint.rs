@@ -1,7 +1,8 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use globset::Glob;
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 use tstring_html::{Attribute, AttributeLike, Node as HtmlNode};
@@ -11,7 +12,7 @@ use tstring_thtml as backend_thtml;
 
 use crate::backend::TemplateBackend;
 use crate::parser::{CallableParameter, CallableValueType, ModuleContext};
-use crate::project_config::{ProjectConfig, SqlConfig, load_project_config_for_path};
+use crate::project_config::{ProjectConfig, RuleSeverity, SqlConfig, load_project_config_for_path};
 use crate::tdom::resolve_component_signature;
 use crate::{TemplatePart, TemplateStringInfo, TemplateStringParser};
 
@@ -232,6 +233,8 @@ pub fn lint_source_with_config(
     )?);
 
     sort_and_dedup_diagnostics(&mut diagnostics);
+    apply_suppressions(&mut diagnostics, source, &templates)?;
+    apply_rule_config(&mut diagnostics, config, path);
 
     Ok(LintFileResult {
         file: path.to_path_buf(),
@@ -260,6 +263,207 @@ pub fn file_read_error(path: &Path) -> LintFileResult {
             source_of_truth: None,
             suggested_edits: Vec::new(),
         }],
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Suppression {
+    line: usize,
+    own_line: bool,
+    rules: Option<Vec<String>>,
+}
+
+fn apply_suppressions(
+    diagnostics: &mut Vec<LintDiagnostic>,
+    source: &str,
+    templates: &[TemplateStringInfo],
+) -> Result<()> {
+    if diagnostics.is_empty() || !source.contains("t-linter:") {
+        return Ok(());
+    }
+
+    let suppressions = collect_suppressions(source)?;
+    if suppressions.is_empty() {
+        return Ok(());
+    }
+
+    diagnostics.retain(|diagnostic| !is_suppressed(diagnostic, &suppressions, templates));
+    Ok(())
+}
+
+fn collect_suppressions(source: &str) -> Result<Vec<Suppression>> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .context("Failed to initialize Python parser")?;
+    let Some(tree) = parser.parse(source, None) else {
+        return Ok(Vec::new());
+    };
+
+    let query = Query::new(&tree_sitter_python::LANGUAGE.into(), "(comment) @comment")
+        .context("Failed to create suppression comment query")?;
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut suppressions = Vec::new();
+
+    while let Some(match_) = matches.next() {
+        for capture in match_.captures {
+            let node = capture.node;
+            let text = node.utf8_text(source.as_bytes())?;
+            let Some(rules) = parse_suppression_rules(text) else {
+                continue;
+            };
+
+            let start = node.start_position();
+            let line = start.row + 1;
+            let prefix = lines
+                .get(start.row)
+                .and_then(|line_text| line_text.get(..start.column))
+                .unwrap_or_default();
+
+            suppressions.push(Suppression {
+                line,
+                own_line: prefix.trim().is_empty(),
+                rules,
+            });
+        }
+    }
+
+    Ok(suppressions)
+}
+
+fn parse_suppression_rules(comment: &str) -> Option<Option<Vec<String>>> {
+    let body = comment.trim().strip_prefix('#')?.trim_start();
+    let rest = body.strip_prefix("t-linter:")?.trim_start();
+    let rest = rest.strip_prefix("ignore")?.trim();
+    if rest.is_empty() {
+        return Some(None);
+    }
+
+    let inner = rest.strip_prefix('[')?.strip_suffix(']')?.trim();
+    if inner.is_empty() {
+        return None;
+    }
+
+    let mut rules = Vec::new();
+    for rule in inner.split(',').map(str::trim) {
+        if rule.is_empty()
+            || !rule
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        {
+            return None;
+        }
+        rules.push(rule.to_string());
+    }
+    Some(Some(rules))
+}
+
+fn is_suppressed(
+    diagnostic: &LintDiagnostic,
+    suppressions: &[Suppression],
+    templates: &[TemplateStringInfo],
+) -> bool {
+    if diagnostic.rule == RULE_FILE_READ_ERROR {
+        return false;
+    }
+
+    if suppressions.iter().any(|suppression| {
+        suppression_applies_to_line(suppression, diagnostic.start_line, diagnostic)
+    }) {
+        return true;
+    }
+
+    let Some(template) = templates
+        .iter()
+        .find(|template| template_contains_line(template, diagnostic.start_line))
+    else {
+        return false;
+    };
+
+    suppressions.iter().any(|suppression| {
+        suppression_applies_to_line(suppression, template.location.start_line, diagnostic)
+    })
+}
+
+fn suppression_applies_to_line(
+    suppression: &Suppression,
+    line: usize,
+    diagnostic: &LintDiagnostic,
+) -> bool {
+    let line_matches = match suppression.own_line {
+        true => suppression.line.checked_add(1) == Some(line),
+        false => suppression.line == line,
+    };
+
+    line_matches && suppression_matches_rule(suppression, &diagnostic.rule)
+}
+
+fn suppression_matches_rule(suppression: &Suppression, rule: &str) -> bool {
+    match &suppression.rules {
+        Some(rules) => rules.iter().any(|candidate| candidate == rule),
+        None => true,
+    }
+}
+
+fn template_contains_line(template: &TemplateStringInfo, line: usize) -> bool {
+    (template.location.start_line..=template.location.end_line).contains(&line)
+}
+
+fn apply_rule_config(diagnostics: &mut Vec<LintDiagnostic>, config: &ProjectConfig, path: &Path) {
+    if diagnostics.is_empty()
+        || (config.ignore.is_empty()
+            && config.severity.is_empty()
+            && config.per_file_ignores.is_empty())
+    {
+        return;
+    }
+
+    let per_file_ignored_rules = matching_per_file_ignored_rules(config, path);
+    diagnostics.retain(|diagnostic| {
+        if !rule_config_can_ignore(&diagnostic.rule) {
+            return true;
+        }
+        if config.ignore.iter().any(|rule| rule == &diagnostic.rule) {
+            return false;
+        }
+        !per_file_ignored_rules.contains(diagnostic.rule.as_str())
+    });
+
+    for diagnostic in diagnostics {
+        if let Some(severity) = config.severity.get(&diagnostic.rule) {
+            diagnostic.severity = configured_severity(*severity);
+        }
+    }
+}
+
+fn matching_per_file_ignored_rules<'a>(config: &'a ProjectConfig, path: &Path) -> HashSet<&'a str> {
+    let mut rules = HashSet::new();
+    let Ok(relative_path) = path.strip_prefix(&config.root) else {
+        return rules;
+    };
+
+    for (pattern, pattern_rules) in &config.per_file_ignores {
+        let Ok(glob) = Glob::new(pattern) else {
+            continue;
+        };
+        if glob.compile_matcher().is_match(relative_path) {
+            rules.extend(pattern_rules.iter().map(String::as_str));
+        }
+    }
+
+    rules
+}
+
+fn rule_config_can_ignore(rule: &str) -> bool {
+    !matches!(rule, RULE_FILE_READ_ERROR | RULE_PYTHON_PARSE_ERROR)
+}
+
+fn configured_severity(severity: RuleSeverity) -> LintSeverity {
+    match severity {
+        RuleSeverity::Error => LintSeverity::Error,
+        RuleSeverity::Warning => LintSeverity::Warning,
     }
 }
 

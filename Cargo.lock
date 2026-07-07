@@ -1279,6 +1279,7 @@ name = "t-linter-core"
 version = "0.9.1"
 dependencies = [
  "anyhow",
+ "globset",
  "regex",
  "serde",
  "serde_json",
