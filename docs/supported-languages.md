@@ -46,6 +46,31 @@ For backend-powered languages (HTML, T-HTML, TDOM, JSON, YAML, TOML), t-linter s
 
 For Tree-sitter-only languages (CSS, JavaScript, SQL), t-linter uses Tree-sitter for both highlighting and validation. Formatting is not yet available for these languages.
 
+## JSON Notes
+
+JSON templates can be bound to Python schema models for additional
+`t-linter check` diagnostics:
+
+```python
+from typing import Annotated, TypedDict
+from string.templatelib import Template
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+    name: str
+
+payload: Annotated[Template, "json", Json(schema=Order)] = t'{{"id": 1}}'
+```
+
+`Json(schema=Order)` binds the schema, while `"json"` keeps normal JSON syntax
+validation, formatting, and highlighting enabled. `Annotated[Template,
+Json(schema=Order)]` and `payload: Json[Order] = t"..."` are also supported for
+schema-binding checks, but they do not replace `"json"` language metadata.
+t-linter checks required keys, unknown static keys, and static scalar value
+shapes against local or imported `TypedDict` and dataclass models. See
+[Check Command](usage/cli/check.md#json-schema-binding) for details.
+
 ## SQL Notes
 
 SQL templates always receive Tree-sitter syntax validation when they are annotated as `"sql"`.
@@ -75,11 +100,16 @@ t-linter sql prepare .
 t-linter sql prepare --check .
 ```
 
-The cache is written to `.t-linter/sql-cache/`. `t-linter sql prepare --check`
-reports stale cache entries when PostgreSQL is reachable; if the database is
-unavailable, it trusts the existing committed cache and exits successfully.
-When the cache is present, interpolation type checking can narrow plain psycopg
-parameters from PostgreSQL types even if the database is unavailable.
+The cache is written to `.t-linter/sql-cache/` and should be committed with the
+queries that use it. `t-linter sql prepare --check` reports stale or missing
+cache entries when PostgreSQL is reachable. If the configured database URL
+resolves but the database is unavailable and a committed cache exists, it trusts
+that cache and exits successfully. When the cache is present, LSP interpolation
+type checking can narrow plain psycopg parameters from PostgreSQL types even if
+the editor session has no live database.
+
+See [SQL Catalog Cache](usage/sql-catalog-cache.md) for the end-to-end workflow,
+CI behavior, and an example diagnostic.
 
 ## HTML Notes
 

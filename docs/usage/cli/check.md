@@ -136,6 +136,63 @@ t-linter check file.py --error-on-issues
 
 This is useful for CI/CD pipelines.
 
+## JSON Schema Binding
+
+JSON templates can be bound to a Python schema marker. t-linter then checks the
+static JSON object against a `TypedDict` or dataclass model without executing the
+Python file.
+
+Use `Annotated[Template, "json", Json(schema=Model)]` when you want normal JSON
+syntax validation plus schema binding:
+
+```python
+from typing import Annotated, NotRequired, TypedDict
+from string.templatelib import Template
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+    name: str
+    note: NotRequired[str]
+
+payload: Annotated[Template, "json", Json(schema=Order)] = (
+    t'{{"id": "abc", "nme": "Ada"}}'
+)
+```
+
+`Json(schema=Order)` binds the schema. The `"json"` metadata keeps the normal
+embedded JSON parser, formatter, and highlighter path enabled. The same
+schema-binding checks can also be written without language metadata as
+`Annotated[Template, Json(schema=Order)]`, or directly as `Json[Order]`:
+
+```python
+from typing import TypedDict
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+    name: str
+
+payload: Json[Order] = t'{{"id": 1}}'
+```
+
+Those shorter forms do not replace `"json"` metadata when you also need regular
+JSON syntax diagnostics, formatting, or LSP highlighting.
+
+t-linter reports:
+
+- `template-schema-missing-key` for required schema keys that are absent
+- `template-schema-unknown-key` for static JSON keys that are not in the schema
+- `template-schema-type-shape` when a static value shape does not match the
+  schema, such as a JSON string where the schema expects `int`
+- `binding-unresolved` when the referenced schema model cannot be resolved
+
+Supported schema sources are local or imported `TypedDict` classes and dataclass
+classes. `TypedDict(total=False)`, `Required[...]`, `NotRequired[...]`, and
+dataclass defaults affect required-key diagnostics. Static scalar checks cover
+`int`, `float`, `str`, `bool`, `None`, `list[...]`, and `dict[...]`; interpolated
+values are left to interpolation type checking.
+
 ## Exit Codes
 
 | Code | Meaning |

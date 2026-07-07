@@ -12,6 +12,7 @@ t-linter validates and formats embedded languages inside Python template strings
 
 - **`t-linter check`** — validate template string syntax
 - **`t-linter format`** — canonically reformat supported template literals
+- **`t-linter sql prepare`** — cache PostgreSQL parameter metadata for psycopg SQL type narrowing
 - **`t-linter lsp`** — start the Language Server Protocol server for editor integration
 
 ## Features
@@ -20,7 +21,9 @@ t-linter validates and formats embedded languages inside Python template strings
 - **Formatting** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML templates
 - **Syntax Highlighting** - Smart highlighting via LSP semantic tokens
 - **Type-based Detection** - Understands `Annotated[Template, "html"]` and type aliases
-- **Interpolation Type Checking** - Optional LSP diagnostics for JSON, YAML, TOML interpolation values and TDOM component prop interpolations through Ty, Pyright, or Pyrefly
+- **Interpolation Type Checking** - Optional LSP diagnostics for JSON, YAML, TOML, psycopg SQL, and TDOM interpolations through Ty, Pyright, or Pyrefly
+- **SQL Catalog Cache** - Narrows psycopg SQL parameters from PostgreSQL metadata, even when the editor session has no live database
+- **JSON Schema Binding** - Checks JSON template keys and static value shapes against `TypedDict` or dataclass models with `Json(schema=...)`
 - **Callee Inference** - Detects backend languages from helpers such as `tdom.html(...)`
 - **Fast** - Single Rust binary with Tree-sitter parsers
 
@@ -65,6 +68,15 @@ Start the LSP server for editor integration:
 ```bash
 t-linter lsp
 ```
+
+Prepare psycopg SQL catalog metadata for type-aware editor diagnostics:
+
+```bash
+DATABASE_URL=postgresql://postgres:postgres@localhost/app t-linter sql prepare .
+```
+
+See [SQL Catalog Cache](usage/sql-catalog-cache.md) for the cache workflow and
+CI recommendations.
 
 ## Quick Start Example
 
