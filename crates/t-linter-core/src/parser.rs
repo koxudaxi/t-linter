@@ -118,6 +118,20 @@ struct VariableAssignment {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PsycopgReceiverKind {
+    Connection,
+    Cursor,
+}
+
+#[derive(Debug, Clone)]
+struct PsycopgBinding {
+    scope: ScopeKey,
+    name: String,
+    binding_start: usize,
+    kind: PsycopgReceiverKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NameBindingKind {
     Import,
     Definition,
@@ -327,6 +341,13 @@ impl TemplateStringParser {
             &scope_directives,
             &name_bindings,
         )?;
+        let psycopg_bindings = self.collect_psycopg_receiver_bindings(
+            &tree,
+            source,
+            &context,
+            &scope_directives,
+            &name_bindings,
+        )?;
         self.last_module_context = context.clone();
         self.last_module_type_data = module_type_data;
 
@@ -337,6 +358,7 @@ impl TemplateStringParser {
             &mut templates,
             &context,
             &variable_language_hints,
+            &psycopg_bindings,
             &assignments,
             &scope_directives,
             &name_bindings,
@@ -1341,6 +1363,80 @@ impl TemplateStringParser {
             .collect())
     }
 
+    fn collect_psycopg_receiver_bindings(
+        &self,
+        tree: &Tree,
+        source: &str,
+        context: &ModuleContext,
+        scope_directives: &[ScopeDirective],
+        name_bindings: &[NameBinding],
+    ) -> Result<Vec<PsycopgBinding>> {
+        let query_str = r#"
+        (assignment
+            left: (identifier) @target
+            right: (_) @value)
+
+        (with_item) @with_item
+        "#;
+
+        let query = Query::new(&tree_sitter_python::LANGUAGE.into(), query_str)
+            .context("Failed to create psycopg receiver query")?;
+
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+        let mut candidates = Vec::new();
+
+        while let Some(match_) = matches.next() {
+            let mut target = None;
+            let mut value = None;
+            let mut with_item = None;
+
+            for capture in match_.captures {
+                match query.capture_names()[capture.index as usize] {
+                    "target" => target = Some(capture.node),
+                    "value" => value = Some(capture.node),
+                    "with_item" => with_item = Some(capture.node),
+                    _ => {}
+                }
+            }
+
+            if let (Some(target), Some(value)) = (target, value) {
+                candidates.push((target.start_byte(), target, value));
+                continue;
+            }
+
+            if let Some(with_item) = with_item
+                && let Some((target, value)) = with_item_binding_nodes(with_item)
+            {
+                candidates.push((target.start_byte(), target, value));
+            }
+        }
+
+        candidates.sort_by_key(|(binding_start, _, _)| *binding_start);
+        let mut bindings = Vec::new();
+        for (_, target, value) in candidates {
+            let Some(kind) = self.psycopg_receiver_kind_for_expression(
+                value,
+                source,
+                context,
+                &bindings,
+                scope_directives,
+                name_bindings,
+            )?
+            else {
+                continue;
+            };
+            bindings.push(PsycopgBinding {
+                scope: enclosing_scope(target),
+                name: target.utf8_text(source.as_bytes())?.to_string(),
+                binding_start: target.start_byte(),
+                kind,
+            });
+        }
+
+        Ok(bindings)
+    }
+
     fn find_strings_with_query(
         &mut self,
         tree: &Tree,
@@ -1348,6 +1444,7 @@ impl TemplateStringParser {
         templates: &mut Vec<TemplateStringInfo>,
         context: &ModuleContext,
         variable_language_hints: &HashMap<AssignmentKey, TemplateHint>,
+        psycopg_bindings: &[PsycopgBinding],
         assignments: &[VariableAssignment],
         scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
@@ -1408,6 +1505,7 @@ impl TemplateStringParser {
                     func_name,
                     context,
                     variable_language_hints,
+                    psycopg_bindings,
                     assignments,
                     scope_directives,
                     name_bindings,
@@ -1462,6 +1560,7 @@ impl TemplateStringParser {
         func_name: Option<&str>,
         context: &ModuleContext,
         variable_language_hints: &HashMap<AssignmentKey, TemplateHint>,
+        psycopg_bindings: &[PsycopgBinding],
         assignments: &[VariableAssignment],
         scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
@@ -1476,6 +1575,7 @@ impl TemplateStringParser {
                 func_name,
                 context,
                 variable_language_hints,
+                psycopg_bindings,
                 assignments,
                 scope_directives,
                 name_bindings,
@@ -1519,6 +1619,7 @@ impl TemplateStringParser {
                 &node,
                 source,
                 context,
+                psycopg_bindings,
                 assignments,
                 scope_directives,
                 name_bindings,
@@ -1585,6 +1686,7 @@ impl TemplateStringParser {
         func_name: Option<&str>,
         context: &ModuleContext,
         variable_language_hints: &HashMap<AssignmentKey, TemplateHint>,
+        psycopg_bindings: &[PsycopgBinding],
         assignments: &[VariableAssignment],
         scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
@@ -1658,6 +1760,7 @@ impl TemplateStringParser {
                 &node,
                 source,
                 context,
+                psycopg_bindings,
                 assignments,
                 scope_directives,
                 name_bindings,
@@ -1896,6 +1999,7 @@ impl TemplateStringParser {
         string_node: &Node,
         source: &str,
         context: &ModuleContext,
+        psycopg_bindings: &[PsycopgBinding],
         assignments: &[VariableAssignment],
         scope_directives: &[ScopeDirective],
         name_bindings: &[NameBinding],
@@ -1910,6 +2014,19 @@ impl TemplateStringParser {
                 _ => None,
             })
             .and_then(|call_node| call_node.child_by_field_name("function"));
+
+        if let Some(hint) = self.infer_psycopg_template_hint_from_function_call(
+            func_name,
+            *string_node,
+            callee_node,
+            source,
+            context,
+            psycopg_bindings,
+            scope_directives,
+            name_bindings,
+        )? {
+            return Ok(Some(hint));
+        }
 
         let Some(signatures) = self.lookup_callable_signatures(
             func_name,
@@ -1966,6 +2083,173 @@ impl TemplateStringParser {
         )
     }
 
+    fn infer_psycopg_template_hint_from_function_call(
+        &self,
+        func_name: &str,
+        template_node: Node,
+        callee_node: Option<Node>,
+        source: &str,
+        context: &ModuleContext,
+        psycopg_bindings: &[PsycopgBinding],
+        scope_directives: &[ScopeDirective],
+        name_bindings: &[NameBinding],
+    ) -> Result<Option<TemplateHint>> {
+        if !psycopg_callee_name_could_accept_template(func_name) {
+            return Ok(None);
+        }
+
+        let Some(argument) = template_call_argument_for_node(template_node, source)? else {
+            return Ok(None);
+        };
+
+        if psycopg_processor_argument_matches(argument)
+            && let Some(callee_node) = callee_node
+            && let Some(target) = self.resolve_callee_import_target(
+                func_name,
+                Some(callee_node),
+                source,
+                context,
+                &[],
+                scope_directives,
+                name_bindings,
+            )?
+            && let Some(hint) = psycopg_template_processor_hint(&target)
+        {
+            return Ok(Some(hint));
+        }
+
+        if !psycopg_execute_query_argument_matches(argument) {
+            return Ok(None);
+        }
+
+        let Some(callee_node) = callee_node else {
+            return Ok(None);
+        };
+        let Some(receiver_kind) = self.psycopg_execute_receiver_kind(
+            callee_node,
+            source,
+            context,
+            psycopg_bindings,
+            scope_directives,
+            name_bindings,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        match receiver_kind {
+            PsycopgReceiverKind::Connection | PsycopgReceiverKind::Cursor => {
+                Ok(Some(psycopg_sql_template_hint()))
+            }
+        }
+    }
+
+    fn psycopg_execute_receiver_kind(
+        &self,
+        callee_node: Node,
+        source: &str,
+        context: &ModuleContext,
+        psycopg_bindings: &[PsycopgBinding],
+        scope_directives: &[ScopeDirective],
+        name_bindings: &[NameBinding],
+    ) -> Result<Option<PsycopgReceiverKind>> {
+        if !matches!(
+            attribute_name(callee_node, source)?,
+            Some("execute" | "executemany")
+        ) {
+            return Ok(None);
+        }
+        let Some(object) = callee_node.child_by_field_name("object") else {
+            return Ok(None);
+        };
+
+        self.psycopg_receiver_kind_for_expression(
+            object,
+            source,
+            context,
+            psycopg_bindings,
+            scope_directives,
+            name_bindings,
+        )
+    }
+
+    fn psycopg_receiver_kind_for_expression(
+        &self,
+        expression: Node,
+        source: &str,
+        context: &ModuleContext,
+        psycopg_bindings: &[PsycopgBinding],
+        scope_directives: &[ScopeDirective],
+        name_bindings: &[NameBinding],
+    ) -> Result<Option<PsycopgReceiverKind>> {
+        let expression = unwrap_parenthesized_expression(expression);
+        match expression.kind() {
+            "identifier" => resolve_prior_psycopg_receiver_kind(
+                expression,
+                source,
+                psycopg_bindings,
+                scope_directives,
+                name_bindings,
+            ),
+            "call" => self.psycopg_receiver_kind_for_call(
+                expression,
+                source,
+                context,
+                psycopg_bindings,
+                scope_directives,
+                name_bindings,
+            ),
+            _ => Ok(None),
+        }
+    }
+
+    fn psycopg_receiver_kind_for_call(
+        &self,
+        call_node: Node,
+        source: &str,
+        context: &ModuleContext,
+        psycopg_bindings: &[PsycopgBinding],
+        scope_directives: &[ScopeDirective],
+        name_bindings: &[NameBinding],
+    ) -> Result<Option<PsycopgReceiverKind>> {
+        let Some(function_node) = call_node.child_by_field_name("function") else {
+            return Ok(None);
+        };
+        let function_text = function_node.utf8_text(source.as_bytes())?;
+
+        if let Some(target) = self.resolve_callee_import_target(
+            function_text,
+            Some(function_node),
+            source,
+            context,
+            &[],
+            scope_directives,
+            name_bindings,
+        )? && target == "psycopg.connect"
+        {
+            return Ok(Some(PsycopgReceiverKind::Connection));
+        }
+
+        if !matches!(attribute_name(function_node, source)?, Some("cursor")) {
+            return Ok(None);
+        }
+        let Some(object) = function_node.child_by_field_name("object") else {
+            return Ok(None);
+        };
+
+        match self.psycopg_receiver_kind_for_expression(
+            object,
+            source,
+            context,
+            psycopg_bindings,
+            scope_directives,
+            name_bindings,
+        )? {
+            Some(PsycopgReceiverKind::Connection) => Ok(Some(PsycopgReceiverKind::Cursor)),
+            _ => Ok(None),
+        }
+    }
+
     fn infer_template_hint_from_explicit_callee_target(
         &self,
         func_name: &str,
@@ -1999,6 +2283,10 @@ impl TemplateStringParser {
     ) -> Result<Option<TemplateHint>> {
         if !visited.insert(target.to_string()) {
             return Ok(None);
+        }
+
+        if let Some(hint) = psycopg_template_processor_hint(target) {
+            return Ok(Some(hint));
         }
 
         if let Some(hint) = tdom_template_processor_hint(target) {
@@ -3660,6 +3948,157 @@ fn call_arguments<'a>(argument_list: Node<'a>, source: &'a str) -> Result<Vec<Ca
     Ok(arguments)
 }
 
+fn template_call_argument_for_node<'a>(
+    template_node: Node<'a>,
+    source: &'a str,
+) -> Result<Option<CallArgument<'a>>> {
+    let Some(argument_list) = template_node
+        .parent()
+        .and_then(|parent| match parent.kind() {
+            "argument_list" => Some(parent),
+            "keyword_argument" => parent.parent(),
+            _ => None,
+        })
+    else {
+        return Ok(None);
+    };
+
+    for argument in call_arguments(argument_list, source)? {
+        if argument.value.id() == template_node.id() || node_contains(argument.value, template_node)
+        {
+            return Ok(Some(argument));
+        }
+    }
+
+    Ok(None)
+}
+
+fn psycopg_callee_name_could_accept_template(func_name: &str) -> bool {
+    matches!(
+        func_name.rsplit('.').next(),
+        Some("as_string" | "as_bytes" | "execute" | "executemany")
+    )
+}
+
+fn psycopg_processor_argument_matches(argument: CallArgument<'_>) -> bool {
+    matches!(argument.keyword, None | Some("obj" | "template")) && argument.position == 0
+}
+
+fn psycopg_execute_query_argument_matches(argument: CallArgument<'_>) -> bool {
+    match argument.keyword {
+        Some("query") => true,
+        None => argument.position == 0,
+        _ => false,
+    }
+}
+
+fn psycopg_sql_template_hint() -> TemplateHint {
+    TemplateHint {
+        language: "sql".to_string(),
+        profile: None,
+        library: Some("psycopg".to_string()),
+    }
+}
+
+fn psycopg_template_processor_hint(target: &str) -> Option<TemplateHint> {
+    match target {
+        "psycopg.sql.as_string" | "psycopg.sql.as_bytes" => Some(psycopg_sql_template_hint()),
+        _ => None,
+    }
+}
+
+fn with_item_binding_nodes(with_item: Node) -> Option<(Node, Node)> {
+    let value = with_item.child_by_field_name("value")?;
+    if value.kind() != "as_pattern" {
+        return None;
+    }
+    let target = value.child_by_field_name("alias")?;
+    let expression = as_pattern_value_node(value)?;
+    Some((target, expression))
+}
+
+fn as_pattern_value_node(as_pattern: Node) -> Option<Node> {
+    let alias = as_pattern.child_by_field_name("alias")?;
+    let mut cursor = as_pattern.walk();
+    as_pattern
+        .named_children(&mut cursor)
+        .find(|child| child.id() != alias.id() && child.kind() != "as_pattern_target")
+}
+
+fn unwrap_parenthesized_expression(mut node: Node) -> Node {
+    while node.kind() == "parenthesized_expression" {
+        let mut cursor = node.walk();
+        let Some(child) = node.named_children(&mut cursor).next() else {
+            return node;
+        };
+        node = child;
+    }
+    node
+}
+
+fn attribute_name<'a>(node: Node, source: &'a str) -> Result<Option<&'a str>> {
+    if node.kind() != "attribute" {
+        return Ok(None);
+    }
+    let Some(attribute) = node.child_by_field_name("attribute") else {
+        return Ok(None);
+    };
+    Ok(Some(attribute.utf8_text(source.as_bytes())?))
+}
+
+fn resolve_prior_psycopg_receiver_kind(
+    identifier: Node,
+    source: &str,
+    psycopg_bindings: &[PsycopgBinding],
+    scope_directives: &[ScopeDirective],
+    name_bindings: &[NameBinding],
+) -> Result<Option<PsycopgReceiverKind>> {
+    let Some(binding) = resolve_prior_name_binding_for_identifier(
+        identifier,
+        source,
+        name_bindings,
+        scope_directives,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    Ok(psycopg_bindings
+        .iter()
+        .rev()
+        .find(|candidate| {
+            candidate.name == binding.name
+                && candidate.scope.start == binding.scope.start
+                && candidate.scope.end == binding.scope.end
+                && candidate.binding_start == binding.binding_start
+        })
+        .map(|binding| binding.kind))
+}
+
+fn resolve_prior_name_binding_for_identifier(
+    identifier: Node,
+    source: &str,
+    bindings: &[NameBinding],
+    scope_directives: &[ScopeDirective],
+) -> Result<Option<NameBinding>> {
+    let name = identifier.utf8_text(source.as_bytes())?;
+    let scope_chain = filtered_scope_chain(identifier, name, scope_directives);
+    let use_position = identifier.start_byte();
+
+    for scope in &scope_chain {
+        if let Some(binding) = bindings.iter().rev().find(|binding| {
+            binding.name == name
+                && binding.scope.start == scope.start
+                && binding.scope.end == scope.end
+                && binding.binding_start < use_position
+        }) {
+            return Ok(Some(binding.clone()));
+        }
+    }
+
+    Ok(None)
+}
+
 fn resolve_callable_parameter<'a>(
     signatures: &'a [CallableParameter],
     position: usize,
@@ -4838,6 +5277,11 @@ fn should_resolve_imported_signatures(import_path: &str) -> bool {
             | "tdom.processor.svg"
             | "typing.Annotated"
             | "typing_extensions.Annotated"
+            | "psycopg"
+            | "psycopg.sql"
+            | "psycopg.connect"
+            | "psycopg.sql.as_string"
+            | "psycopg.sql.as_bytes"
     )
 }
 
@@ -6805,6 +7249,123 @@ icon = render_svg(t"<clipPath id='mask'></clipPath>")
         assert_eq!(templates[0].profile, Some("svg".to_string()));
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_psycopg_sql_is_inferred_from_as_string() {
+        let source = r#"
+from psycopg import sql as psql
+
+rendered = psql.as_string(t"SELECT * FROM users WHERE id = {user_id}")
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("sql".to_string()));
+        assert_eq!(templates[0].library, Some("psycopg".to_string()));
+    }
+
+    #[test]
+    fn test_psycopg_sql_is_inferred_from_execute_receiver_bindings() {
+        let source = r#"
+import psycopg as pg
+
+conn = pg.connect("dbname=app")
+cur = conn.cursor()
+conn.execute(t"SELECT * FROM users WHERE id = {user_id}")
+cur.executemany(query=t"INSERT INTO logs VALUES ({event})", params=events)
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 2);
+        assert!(templates.iter().all(|template| {
+            template.language == Some("sql".to_string())
+                && template.library == Some("psycopg".to_string())
+        }));
+    }
+
+    #[test]
+    fn test_psycopg_sql_is_inferred_from_with_aliases_and_direct_chain() {
+        let source = r#"
+from psycopg import connect
+
+with connect("dbname=app") as conn:
+    conn.execute(t"SELECT * FROM accounts WHERE id = {account_id}")
+    with conn.cursor() as cur:
+        cur.execute(t"SELECT * FROM logs WHERE user_id = {user_id}")
+
+connect("dbname=app").cursor().execute(t"SELECT * FROM audit WHERE id = {audit_id}")
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 3);
+        assert!(templates.iter().all(|template| {
+            template.language == Some("sql".to_string())
+                && template.library == Some("psycopg".to_string())
+        }));
+    }
+
+    #[test]
+    fn test_psycopg_sql_inference_ignores_params_and_non_psycopg_receivers() {
+        let source = r#"
+import psycopg
+import sqlite3
+
+conn = psycopg.connect("dbname=app")
+cur = conn.cursor()
+cur.execute("SELECT * FROM users WHERE id = %s", t"{user_id}")
+
+sqlite_conn = sqlite3.connect(":memory:")
+sqlite_cur = sqlite_conn.cursor()
+sqlite_cur.execute(t"SELECT * FROM users WHERE id = {user_id}")
+
+class CustomCursor:
+    def execute(self, query):
+        return None
+
+custom_cur = CustomCursor()
+custom_cur.execute(t"SELECT * FROM custom WHERE id = {user_id}")
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 3);
+        assert_eq!(templates[0].language, None);
+        assert_eq!(templates[0].library, None);
+        assert_eq!(templates[1].language, None);
+        assert_eq!(templates[1].library, None);
+        assert_eq!(templates[2].language, None);
+        assert_eq!(templates[2].library, None);
+    }
+
+    #[test]
+    fn test_psycopg_sql_inference_requires_prior_receiver_binding() {
+        let source = r#"
+import psycopg
+
+def run():
+    cur.execute(t"SELECT * FROM users WHERE id = {user_id}")
+    conn = psycopg.connect("dbname=app")
+    cur = conn.cursor()
+    cur = make_cursor()
+    cur.execute(t"SELECT * FROM logs WHERE id = {log_id}")
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 2);
+        assert_eq!(templates[0].language, None);
+        assert_eq!(templates[0].library, None);
+        assert_eq!(templates[1].language, None);
+        assert_eq!(templates[1].library, None);
     }
 
     #[test]
