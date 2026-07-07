@@ -482,6 +482,31 @@ query: Annotated[Template, "sql"] = t"SELECT * FROM users WHERE id = {user_id!r}
 }
 
 #[test]
+fn check_psycopg_sql_rules_run_for_inferred_execute_templates() {
+    let dir = test_dir("psycopg-inferred-execute");
+    write_file(
+        &dir.join("query.py"),
+        r#"import psycopg
+
+conn = psycopg.connect("dbname=app")
+cur = conn.cursor()
+cur.execute(t"SELECT * FROM users WHERE id = {user_id!r}")
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "query.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "sql-conversion-unsupported");
+    assert_eq!(json["diagnostics"][0]["language"], "sql");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_psycopg_sql_static_rules_report_expected_diagnostics() {
     let dir = test_dir("psycopg-static-rules");
     write_file(
