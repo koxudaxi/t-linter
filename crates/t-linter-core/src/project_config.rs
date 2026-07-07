@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectConfig {
@@ -11,6 +11,19 @@ pub struct ProjectConfig {
     pub extend_exclude: Vec<String>,
     pub ignore_file: Option<String>,
     pub line_length: Option<usize>,
+    pub sql: SqlConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct SqlConfig {
+    pub library: Option<String>,
+    #[serde(alias = "databaseUrl")]
+    pub database_url: Option<String>,
+    #[serde(alias = "searchPath")]
+    pub search_path: Option<String>,
+    #[serde(alias = "extraParamTypes")]
+    pub extra_param_types: Vec<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -37,6 +50,7 @@ struct TLinterConfig {
         deserialize_with = "deserialize_optional_line_length"
     )]
     line_length: Option<usize>,
+    sql: Option<SqlConfig>,
 }
 
 pub fn load_project_config_for_path(path: &Path) -> Result<ProjectConfig> {
@@ -71,6 +85,7 @@ pub fn load_project_config(root: &Path) -> Result<ProjectConfig> {
         extend_exclude: config.extend_exclude.unwrap_or_default(),
         ignore_file: config.ignore_file,
         line_length: config.line_length,
+        sql: config.sql.unwrap_or_default(),
     })
 }
 
@@ -112,6 +127,23 @@ mod tests {
         assert_eq!(config.root, temp.path());
         assert_eq!(config.line_length, Some(96));
         assert_eq!(config.extend_exclude, vec!["vendor".to_string()]);
+    }
+
+    #[test]
+    fn load_project_config_reads_sql_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("pyproject.toml"),
+            "[tool.t-linter.sql]\nlibrary = \"psycopg\"\ndatabase-url = \"env:DATABASE_URL\"\nsearch-path = \"public\"\nextra-param-types = [\"myapp.Money\"]\n",
+        )
+        .expect("write pyproject");
+
+        let config = load_project_config(temp.path()).expect("load config");
+
+        assert_eq!(config.sql.library.as_deref(), Some("psycopg"));
+        assert_eq!(config.sql.database_url.as_deref(), Some("env:DATABASE_URL"));
+        assert_eq!(config.sql.search_path.as_deref(), Some("public"));
+        assert_eq!(config.sql.extra_param_types, vec!["myapp.Money"]);
     }
 
     #[test]

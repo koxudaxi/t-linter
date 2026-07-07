@@ -8,6 +8,8 @@ pub mod parser;
 pub mod project_config;
 pub(crate) mod python;
 pub mod shadow;
+#[cfg(feature = "sql")]
+pub(crate) mod sql;
 pub(crate) mod tdom;
 
 pub use formatting::{
@@ -18,14 +20,14 @@ pub use formatting::{
 pub use highlighter::{HighlightedRange, TemplateHighlighter};
 pub use lint::{
     DiagnosticData, DiagnosticEdit, DiagnosticEditRange, LintDiagnostic, LintFileResult,
-    LintRunSummary, LintSeverity, file_read_error, lint_source,
+    LintRunSummary, LintSeverity, file_read_error, lint_source, lint_source_with_config,
 };
 pub use parser::{
     Expression, InterpolationInfo, Location, StaticTextSegment, TemplatePart, TemplateStringInfo,
     TemplateStringParser,
 };
 pub use project_config::{
-    ProjectConfig, find_config_root, load_project_config, load_project_config_for_path,
+    ProjectConfig, SqlConfig, find_config_root, load_project_config, load_project_config_for_path,
 };
 pub use shadow::{ShadowCheckSite, ShadowDocument, synthesize_for_type_check};
 

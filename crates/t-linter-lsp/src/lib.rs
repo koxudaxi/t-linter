@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use t_linter_core::{
     DiagnosticData, DiagnosticEdit, FormatOptions as CoreFormatOptions, LintDiagnostic,
-    ShadowDocument, TemplateHighlighter, TemplateStringInfo, TemplateStringParser,
-    format_document_range_with_options, format_document_with_options, lint_source,
-    load_project_config_for_path, synthesize_for_type_check,
+    LintSeverity, ShadowDocument, SqlConfig, TemplateHighlighter, TemplateStringInfo,
+    TemplateStringParser, format_document_range_with_options, format_document_with_options,
+    lint_source_with_config, load_project_config_for_path, synthesize_for_type_check,
 };
 use tower_lsp::jsonrpc::Result as JsonRpcResult;
 use tower_lsp::lsp_types::*;
@@ -852,6 +852,7 @@ impl TLinterLanguageServer {
         let document_cache = Arc::clone(&self.document_cache);
         let diagnostic_tasks = Arc::clone(&self.diagnostic_tasks);
         let type_checker_state = Arc::clone(&self.type_checker);
+        let config = Arc::clone(&self.config);
         let task_uri = uri.clone();
 
         let handle = tokio::spawn(async move {
@@ -876,7 +877,26 @@ impl TLinterLanguageServer {
                 return;
             };
 
-            let diagnostics = match lint_source(&path, &text) {
+            let mut project_config = match load_project_config_for_path(&path) {
+                Ok(config) => config,
+                Err(err) => {
+                    client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!(
+                                "Failed to load t-linter config for {}: {}",
+                                path.display(),
+                                err
+                            ),
+                        )
+                        .await;
+                    remove_diagnostic_task_if_current(&diagnostic_tasks, &task_uri, generation);
+                    return;
+                }
+            };
+            project_config.sql = merge_sql_config(project_config.sql, &config.read().await.sql);
+
+            let diagnostics = match lint_source_with_config(&path, &text, &project_config) {
                 Ok(result) => result
                     .diagnostics
                     .iter()
@@ -1468,13 +1488,20 @@ fn lint_diagnostic_to_lsp(diagnostic: &LintDiagnostic, source: &str) -> Result<D
     };
     Ok(Diagnostic {
         range: location_to_lsp_range(&location, source)?,
-        severity: Some(DiagnosticSeverity::ERROR),
+        severity: Some(lint_severity_to_lsp(diagnostic.severity)),
         code: Some(NumberOrString::String(diagnostic.rule.clone())),
         source: Some("t-linter".to_string()),
         message: diagnostic.message.clone(),
         data: Some(serde_json::to_value(lint_diagnostic_data(diagnostic))?),
         ..Default::default()
     })
+}
+
+fn lint_severity_to_lsp(severity: LintSeverity) -> DiagnosticSeverity {
+    match severity {
+        LintSeverity::Error => DiagnosticSeverity::ERROR,
+        LintSeverity::Warning => DiagnosticSeverity::WARNING,
+    }
 }
 
 fn lint_diagnostic_data(diagnostic: &LintDiagnostic) -> DiagnosticData {
@@ -2236,6 +2263,8 @@ struct TLinterInitializationOptions {
     ruff_pipeline: Option<RuffPipelineConfig>,
     #[serde(default)]
     type_checking: Option<TypeCheckerConfig>,
+    #[serde(default)]
+    sql: Option<SqlConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2245,6 +2274,7 @@ pub struct TLinterConfig {
     pub highlight_untyped_templates: bool,
     pub ruff_pipeline: RuffPipelineConfig,
     pub type_checking: TypeCheckerConfig,
+    pub sql: SqlConfig,
 }
 
 impl Default for TLinterConfig {
@@ -2255,6 +2285,7 @@ impl Default for TLinterConfig {
             highlight_untyped_templates: true,
             ruff_pipeline: RuffPipelineConfig::default(),
             type_checking: TypeCheckerConfig::default(),
+            sql: SqlConfig::default(),
         }
     }
 }
@@ -2280,7 +2311,24 @@ fn parse_initialization_config(
             .unwrap_or(defaults.highlight_untyped_templates),
         ruff_pipeline: options.ruff_pipeline.unwrap_or(defaults.ruff_pipeline),
         type_checking: options.type_checking.unwrap_or(defaults.type_checking),
+        sql: merge_sql_config(defaults.sql, &options.sql.unwrap_or_default()),
     }
+}
+
+fn merge_sql_config(mut base: SqlConfig, override_config: &SqlConfig) -> SqlConfig {
+    if override_config.library.is_some() {
+        base.library = override_config.library.clone();
+    }
+    if override_config.database_url.is_some() {
+        base.database_url = override_config.database_url.clone();
+    }
+    if override_config.search_path.is_some() {
+        base.search_path = override_config.search_path.clone();
+    }
+    if !override_config.extra_param_types.is_empty() {
+        base.extra_param_types = override_config.extra_param_types.clone();
+    }
+    base
 }
 
 fn configuration_settings(settings: serde_json::Value) -> Option<serde_json::Value> {
@@ -2731,7 +2779,7 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
         let diagnostic = LintDiagnostic {
             file: PathBuf::from("example.py"),
             rule: "demo-rule".to_string(),
-            severity: LintSeverity::Error,
+            severity: LintSeverity::Warning,
             message: "boom".to_string(),
             language: Some("html".to_string()),
             start_line: 2,
@@ -2753,6 +2801,7 @@ multiline: Annotated[Template, "unknown"] = t"""<div>
             }],
         };
         let lsp_diagnostic = lint_diagnostic_to_lsp(&diagnostic, source).expect("diagnostic");
+        assert_eq!(lsp_diagnostic.severity, Some(DiagnosticSeverity::WARNING));
         assert_eq!(lsp_diagnostic.range.start.line, 1);
         assert_eq!(lsp_diagnostic.range.start.character, 2);
         assert_eq!(
@@ -2977,6 +3026,12 @@ payload: Annotated[Template, "json"] = t'{{"name": {名前}, "age": {age}}}'
                     "command": "/tmp/ty",
                     "args": ["server"],
                     "python": "/tmp/python"
+                },
+                "sql": {
+                    "library": "psycopg",
+                    "databaseUrl": "env:DATABASE_URL",
+                    "searchPath": "public",
+                    "extraParamTypes": ["myapp.Money"]
                 }
             })),
             TLinterConfig::default(),
@@ -2990,6 +3045,10 @@ payload: Annotated[Template, "json"] = t'{{"name": {名前}, "age": {age}}}'
         assert!(config.type_checking.enabled);
         assert_eq!(config.type_checking.command.as_deref(), Some("/tmp/ty"));
         assert_eq!(config.type_checking.python.as_deref(), Some("/tmp/python"));
+        assert_eq!(config.sql.library.as_deref(), Some("psycopg"));
+        assert_eq!(config.sql.database_url.as_deref(), Some("env:DATABASE_URL"));
+        assert_eq!(config.sql.search_path.as_deref(), Some("public"));
+        assert_eq!(config.sql.extra_param_types, vec!["myapp.Money"]);
     }
 
     #[test]

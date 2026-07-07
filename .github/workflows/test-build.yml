@@ -43,3 +43,25 @@ jobs:
       run: |
         pip install dist/*.whl
         t-linter --version
+
+  psycopg-conformance:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        python-version: "3.14"
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@1.94.0
+
+    - name: Build t-linter
+      run: cargo build --bin t-linter
+
+    - name: Run psycopg conformance
+      run: |
+        uv venv --python 3.14 .psycopg-venv
+        uv pip install --python .psycopg-venv/bin/python "psycopg[binary]>=3.3"
+        T_LINTER_BIN="$PWD/target/debug/t-linter" .psycopg-venv/bin/python scripts/psycopg_conformance.py

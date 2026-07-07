@@ -11,6 +11,7 @@ use tstring_thtml as backend_thtml;
 
 use crate::backend::TemplateBackend;
 use crate::parser::{CallableParameter, CallableValueType, ModuleContext};
+use crate::project_config::{ProjectConfig, SqlConfig, load_project_config_for_path};
 use crate::tdom::resolve_component_signature;
 use crate::{TemplatePart, TemplateStringInfo, TemplateStringParser};
 
@@ -30,6 +31,7 @@ const RULE_BINDING_UNRESOLVED: &str = "binding-unresolved";
 #[serde(rename_all = "snake_case")]
 pub enum LintSeverity {
     Error,
+    Warning,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -191,6 +193,15 @@ enum ResolvedPropValue {
 }
 
 pub fn lint_source(path: &Path, source: &str) -> Result<LintFileResult> {
+    let config = load_project_config_for_path(path)?;
+    lint_source_with_config(path, source, &config)
+}
+
+pub fn lint_source_with_config(
+    path: &Path,
+    source: &str,
+    config: &ProjectConfig,
+) -> Result<LintFileResult> {
     let python_diagnostic = lint_python_source(path, source)?;
 
     let mut parser = TemplateStringParser::new()?;
@@ -210,6 +221,7 @@ pub fn lint_source(path: &Path, source: &str) -> Result<LintFileResult> {
             template,
             &module_context,
             &static_spread_analysis,
+            &config.sql,
         )?);
     }
     diagnostics.extend(lint_json_schema_bindings(
@@ -294,6 +306,7 @@ fn lint_template(
     template: &TemplateStringInfo,
     module_context: &ModuleContext,
     static_spread_analysis: &StaticSpreadAnalysis,
+    sql_config: &SqlConfig,
 ) -> Result<Vec<LintDiagnostic>> {
     let Some(language) = template
         .language
@@ -319,47 +332,56 @@ fn lint_template(
     let processed = prepare_template_for_lint(template, &language);
     let tree = parse_embedded(&language, &processed.content)?;
 
-    if !tree.root_node().has_error() {
-        return Ok(Vec::new());
+    let mut diagnostics = Vec::new();
+    if tree.root_node().has_error() {
+        let error_nodes = collect_error_nodes(tree.root_node());
+        let nodes = if error_nodes.is_empty() {
+            vec![tree.root_node()]
+        } else {
+            error_nodes
+        };
+
+        for node in nodes {
+            let start_offset =
+                map_processed_offset(&processed.processed_to_original, node.start_byte());
+            let mut end_offset =
+                map_processed_offset(&processed.processed_to_original, node.end_byte());
+
+            if end_offset <= start_offset {
+                end_offset = next_char_boundary(&template.content, start_offset);
+            }
+
+            let ((start_line, start_column), (end_line, end_column)) =
+                map_content_range_to_document(template, start_offset, end_offset);
+
+            diagnostics.push(LintDiagnostic {
+                rule: RULE_EMBEDDED_PARSE_ERROR.to_string(),
+                severity: LintSeverity::Error,
+                language: Some(language.clone()),
+                message: format!("Invalid {} syntax in template string", language),
+                file: path.to_path_buf(),
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+                expected_type: None,
+                found_type: None,
+                schema_pointer: None,
+                source_of_truth: None,
+                suggested_edits: Vec::new(),
+            });
+        }
     }
 
-    let mut diagnostics = Vec::new();
-    let error_nodes = collect_error_nodes(tree.root_node());
-    let nodes = if error_nodes.is_empty() {
-        vec![tree.root_node()]
-    } else {
-        error_nodes
-    };
-
-    for node in nodes {
-        let start_offset =
-            map_processed_offset(&processed.processed_to_original, node.start_byte());
-        let mut end_offset =
-            map_processed_offset(&processed.processed_to_original, node.end_byte());
-
-        if end_offset <= start_offset {
-            end_offset = next_char_boundary(&template.content, start_offset);
-        }
-
-        let ((start_line, start_column), (end_line, end_column)) =
-            map_content_range_to_document(template, start_offset, end_offset);
-
-        diagnostics.push(LintDiagnostic {
-            rule: RULE_EMBEDDED_PARSE_ERROR.to_string(),
-            severity: LintSeverity::Error,
-            language: Some(language.clone()),
-            message: format!("Invalid {} syntax in template string", language),
-            file: path.to_path_buf(),
-            start_line,
-            start_column,
-            end_line,
-            end_column,
-            expected_type: None,
-            found_type: None,
-            schema_pointer: None,
-            source_of_truth: None,
-            suggested_edits: Vec::new(),
-        });
+    #[cfg(feature = "sql")]
+    if language == "sql" && crate::sql::psycopg::is_enabled(sql_config, template) {
+        diagnostics.extend(crate::sql::psycopg::lint_rules(
+            path,
+            template,
+            &tree,
+            sql_config,
+            module_context,
+        ));
     }
 
     sort_and_dedup_diagnostics(&mut diagnostics);

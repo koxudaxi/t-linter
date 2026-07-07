@@ -9,8 +9,9 @@ use clap::Subcommand;
 use serde::Serialize;
 use t_linter_core::{
     FormatError, FormatOptions as CoreFormatOptions, LintDiagnostic, LintFileResult,
-    LintRunSummary, apply_template_edits, file_read_error, format_document_in_file_with_options,
-    format_document_with_options, lint_source, load_project_config_for_path,
+    LintRunSummary, LintSeverity, apply_template_edits, file_read_error,
+    format_document_in_file_with_options, format_document_with_options, lint_source,
+    load_project_config_for_path,
 };
 use tempfile::NamedTempFile;
 
@@ -444,10 +445,11 @@ fn print_human_report(report: &CheckReport) {
             .unwrap_or_default();
 
         println!(
-            "{}:{}:{}: error[{}] {}{}",
+            "{}:{}:{}: {}[{}] {}{}",
             diagnostic.file.display(),
             diagnostic.start_line,
             diagnostic.start_column,
+            severity_label(diagnostic.severity),
             diagnostic.rule,
             diagnostic.message,
             language
@@ -469,9 +471,10 @@ fn print_github_report(report: &CheckReport) {
         if let Some(language) = &diagnostic.language {
             message.push_str(&format!(" (language={language})"));
         }
+        let annotation = severity_label(diagnostic.severity);
 
         println!(
-            "::error file={},line={},col={},title={}::{}",
+            "::{annotation} file={},line={},col={},title={}::{}",
             escape_github_property(&diagnostic.file.display().to_string()),
             diagnostic.start_line,
             diagnostic.start_column,
@@ -503,4 +506,11 @@ fn escape_github_message(message: &str) -> String {
         .replace('%', "%25")
         .replace('\r', "%0D")
         .replace('\n', "%0A")
+}
+
+fn severity_label(severity: LintSeverity) -> &'static str {
+    match severity {
+        LintSeverity::Error => "error",
+        LintSeverity::Warning => "warning",
+    }
 }
