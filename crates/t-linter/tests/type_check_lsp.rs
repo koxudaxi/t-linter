@@ -140,6 +140,54 @@ fn write_type_checker_config_files(workspace: &Path, checker: &str) {
     }
 }
 
+fn write_sql_type_fixture_files(workspace: &Path) {
+    write_file(
+        &workspace.join("pyproject.toml"),
+        "[tool.t-linter.sql]\nlibrary = \"psycopg\"\nextra-param-types = [\"myapp.Money\"]\n",
+    );
+    write_file(&workspace.join("myapp.pyi"), "class Money: ...\n");
+    write_file(&workspace.join("string").join("__init__.pyi"), "");
+    write_file(
+        &workspace.join("string").join("templatelib.pyi"),
+        "class Template: ...\n",
+    );
+    write_file(
+        &workspace.join("psycopg").join("__init__.pyi"),
+        r#"from . import sql
+
+class Cursor:
+    def execute(self, query: object, params: object = ...) -> object: ...
+    def executemany(self, query: object, params_seq: object = ...) -> object: ...
+
+class Connection:
+    def cursor(self) -> Cursor: ...
+
+def connect(*args: object, **kwargs: object) -> Connection: ...
+"#,
+    );
+    write_file(
+        &workspace.join("psycopg").join("sql.pyi"),
+        r#"class Identifier: ...
+class SQL: ...
+class Composed: ...
+class Literal: ...
+
+def as_string(template: object) -> object: ...
+def as_bytes(template: object) -> object: ...
+"#,
+    );
+    write_file(
+        &workspace.join("psycopg").join("types").join("__init__.pyi"),
+        "",
+    );
+    write_file(
+        &workspace.join("psycopg").join("types").join("json.pyi"),
+        r#"class Json: ...
+class Jsonb: ...
+"#,
+    );
+}
+
 struct LspClient {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -435,6 +483,8 @@ fn type_check_input() -> &'static str {
     r#"from typing import Annotated
 from string.templatelib import Template
 from tdom import html
+import psycopg
+from myapp import Money
 
 class User:
     name: str
@@ -453,6 +503,11 @@ def handler(user: User, age: int, name: str) -> None:
     payload_toml = t'{user} = {age}\nlabel = "{age}"\n'
     run_toml(payload_toml)
     payload_tdom = html(t'<{Card} title={age} count={name} owner={age} labels={name} label="Hello {age}" />')
+
+def run_sql(table: int, fragment: object, plain: object, money: Money) -> None:
+    conn = psycopg.connect("dbname=app")
+    cur = conn.cursor()
+    cur.execute(t"SELECT {fragment:q}, {plain}, {money} FROM users WHERE {table:i} = id")
 "#
 }
 
@@ -464,7 +519,10 @@ fn expected_payload_span(source: &str, assignment: &str, marker: &str) -> (u64, 
     let payload_line = source.lines().nth(line as usize).expect("payload line");
     let marker_start = payload_line.find(marker).expect("interpolation marker");
     let interpolation_start = marker.find('{').expect("interpolation start") + 1;
-    let interpolation_end = marker.find('}').expect("interpolation end");
+    let interpolation_end = marker[interpolation_start..]
+        .find(':')
+        .map(|offset| interpolation_start + offset)
+        .unwrap_or_else(|| marker.find('}').expect("interpolation end"));
     let start = (marker_start + interpolation_start) as u64;
     let end = (marker_start + interpolation_end) as u64;
     (line, start, end)
@@ -502,6 +560,7 @@ fn lsp_reports_interpolation_type_error_from_real_type_checkers() {
     for checker in checkers {
         let dir = test_dir(checker.name);
         write_type_checker_config_files(&dir, checker.checker);
+        write_sql_type_fixture_files(&dir);
         let file = dir.join("example.py");
         let source = type_check_input();
         write_file(&file, source);
@@ -518,7 +577,7 @@ fn lsp_reports_interpolation_type_error_from_real_type_checkers() {
             .collect::<Vec<_>>();
         assert_eq!(
             type_diagnostics.len(),
-            11,
+            14,
             "{} diagnostics: {diagnostics:?}",
             checker.name
         );
@@ -577,6 +636,18 @@ fn lsp_reports_interpolation_type_error_from_real_type_checkers() {
                 "tdom component prop 'label' string fragment",
             ),
             expected_payload_span(source, "payload_tdom =", "label=\"Hello {age}\""),
+        );
+        assert_diagnostic_span(
+            diagnostic_with_message(&type_diagnostics, "psycopg format spec ':i'"),
+            expected_payload_span(source, "cur.execute(", "{table:i}"),
+        );
+        assert_diagnostic_span(
+            diagnostic_with_message(&type_diagnostics, "psycopg format spec ':q'"),
+            expected_payload_span(source, "cur.execute(", "{fragment:q}"),
+        );
+        assert_diagnostic_span(
+            diagnostic_with_message(&type_diagnostics, "psycopg SQL parameter"),
+            expected_payload_span(source, "cur.execute(", "{plain}"),
         );
 
         client.shutdown();

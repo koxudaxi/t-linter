@@ -209,11 +209,11 @@ The LSP server provides:
 
 - **Semantic Tokens** — syntax highlighting for embedded languages
 - **Diagnostics** — real-time validation with 250ms debouncing
-- **Interpolation Type Checking** — optional JSON, YAML, TOML interpolation value diagnostics and TDOM component prop interpolation diagnostics through Ty, Pyright, or Pyrefly
+- **Interpolation Type Checking** — optional JSON, YAML, TOML, psycopg SQL interpolation value diagnostics and TDOM component prop interpolation diagnostics through Ty, Pyright, or Pyrefly
 - **Document Formatting** — full document and range formatting
 - **Code Actions** — `source.fixAll.t-linter` for document-level rewrites and `refactor.rewrite.t-linter` for single-template selection rewrites
 
-Interpolation value type checking is opt-in and applies to JSON, YAML, TOML templates and TDOM component props. Enable it from an LSP client with initialization options:
+Interpolation value type checking is opt-in and applies to JSON, YAML, TOML, psycopg SQL templates and TDOM component props. Enable it from an LSP client with initialization options:
 
 ```json
 {
