@@ -415,10 +415,10 @@ If save-time formatting does not run:
 Source: https://t-linter.koxudaxi.dev/usage/interpolation-type-checking/
 
 Interpolation type checking is an opt-in LSP feature that checks values inserted
-into typed JSON, YAML, TOML template strings and TDOM component props. It uses
-each template backend to decide what Python type an interpolation position
-accepts, asks Ty, Pyright, or Pyrefly to check that expression, and reports the
-result back on the original `{expression}`.
+into typed JSON, YAML, TOML, and psycopg SQL template strings, plus TDOM
+component props. It uses each template backend to decide what Python type an
+interpolation position accepts, asks Ty, Pyright, or Pyrefly to check that
+expression, and reports the result back on the original `{expression}`.
 
 The feature is intentionally separate from `t-linter check`. The CLI still runs
 the built-in template syntax checks only; interpolation value diagnostics require
@@ -431,7 +431,7 @@ The type checker has five parts:
 | Layer | Responsibility |
 |---|---|
 | Parser and language resolver | Finds PEP 750 template strings and resolves their embedded language from annotations, aliases, function parameters, and supported callees. |
-| Template backend | Computes contextual interpolation type requirements for a language. JSON, YAML, TOML, and TDOM component props currently return requirements. |
+| Template backend | Computes contextual interpolation type requirements for a language. JSON, YAML, TOML, psycopg SQL, and TDOM component props currently return requirements. |
 | Shadow document synthesizer | Creates an in-memory Python document that preserves the original line count and adds type-check assignments for the selected checker. |
 | Type checker client | Starts and reuses a dedicated Ty, Pyright, or Pyrefly language server, syncs the shadow document, and collects diagnostics. |
 | Diagnostic remapper | Filters backend-specific assignment errors and maps them back to the original interpolation ranges. |
@@ -441,7 +441,7 @@ The data flow is:
 ```text
 open Python document
   -> parse template strings and resolve template languages
-  -> ask the JSON/YAML/TOML backend or TDOM component-prop backend for interpolation requirements
+  -> ask the JSON/YAML/TOML/SQL backend or TDOM component-prop backend for interpolation requirements
   -> synthesize same-line annotated assignments in a shadow Python document
   -> sync that shadow document to a dedicated type checker server
   -> collect pull or publish diagnostics from that server
@@ -513,7 +513,7 @@ be matched against type checker diagnostics.
 ## Backend Requirements
 
 Backends own the logic for their DSL. t-linter does not hard-code JSON, YAML,
-TOML, or TDOM AST traversal rules in the LSP layer.
+TOML, SQL, or TDOM AST traversal rules in the LSP layer.
 
 Each backend returns an `InterpolationTypeRequirement` containing:
 
@@ -534,14 +534,19 @@ Examples of backend decisions:
 | TOML key | `str` |
 | TOML string fragment | `str` |
 | TOML value | `str \| int \| float \| bool \| datetime.date \| datetime.time \| datetime.datetime \| list[object] \| dict[str, object]` |
+| psycopg SQL parameter `{value}` or `{value:l}` | `bool \| int \| float \| decimal.Decimal \| str \| bytes \| datetime.date \| datetime.datetime \| datetime.time \| datetime.timedelta \| uuid.UUID \| list \| psycopg.types.json.Json \| psycopg.types.json.Jsonb \| None` |
+| psycopg identifier `{value:i}` | `str \| psycopg.sql.Identifier` |
+| psycopg SQL fragment `{value:q}` | `string.templatelib.Template \| psycopg.sql.SQL \| psycopg.sql.Composed` |
 | TDOM component prop `title={value}` where `title: str` | `str` |
 | TDOM component prop `items={value}` where `items: list[str]` | `list[str]` |
 | TDOM component prop string fragment `label="Hi {name}"` | `str` |
 
 HTML and T-HTML currently return no interpolation type requirements. TDOM
 returns requirements only for component prop interpolations whose component
-signature can be resolved by t-linter. Tree-sitter-only languages such as CSS,
-JavaScript, and SQL are also not part of this mechanism.
+signature can be resolved by t-linter. SQL returns requirements only for
+psycopg templates resolved from supported call chains or enabled with
+`[tool.t-linter.sql] library = "psycopg"`. Tree-sitter-only languages such as
+CSS and JavaScript are not part of this mechanism.
 
 ## Runtime Behavior
 
