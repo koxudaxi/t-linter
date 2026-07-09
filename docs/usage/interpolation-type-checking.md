@@ -18,6 +18,7 @@ The type checker has five parts:
 |---|---|
 | Parser and language resolver | Finds PEP 750 template strings and resolves their embedded language from annotations, aliases, function parameters, and supported callees. |
 | Template backend | Computes contextual interpolation type requirements for a language. JSON, YAML, TOML, psycopg SQL, and TDOM component props currently return requirements. |
+| SQL catalog cache | Optionally supplies PostgreSQL parameter types for psycopg SQL templates prepared with `t-linter sql prepare`. |
 | Shadow document synthesizer | Creates an in-memory Python document that preserves the original line count and adds type-check assignments for the selected checker. |
 | Type checker client | Starts and reuses a dedicated Ty, Pyright, or Pyrefly language server, syncs the shadow document, and collects diagnostics. |
 | Diagnostic remapper | Filters backend-specific assignment errors and maps them back to the original interpolation ranges. |
@@ -28,6 +29,7 @@ The data flow is:
 open Python document
   -> parse template strings and resolve template languages
   -> ask the JSON/YAML/TOML/SQL backend or TDOM component-prop backend for interpolation requirements
+  -> read SQL catalog cache entries when a psycopg SQL parameter can be narrowed from PostgreSQL metadata
   -> synthesize same-line annotated assignments in a shadow Python document
   -> sync that shadow document to a dedicated type checker server
   -> collect pull or publish diagnostics from that server
@@ -135,14 +137,19 @@ psycopg templates resolved from supported call chains or enabled with
 `[tool.t-linter.sql] library = "psycopg"`. Tree-sitter-only languages such as
 CSS and JavaScript are not part of this mechanism.
 
-Run `t-linter sql prepare .` to populate `.t-linter/sql-cache/` from a configured
-PostgreSQL database. `t-linter sql prepare --check .` compares the committed
+For catalog-backed psycopg SQL narrowing, run `t-linter sql prepare .` to
+populate `.t-linter/sql-cache/` from a configured PostgreSQL database. The LSP
+then reads the committed cache and can report type diagnostics without opening a
+database connection. `t-linter sql prepare --check .` compares the committed
 cache with the current schema and exits with status 2 if it is stale. If the
-live describe call cannot reach PostgreSQL, `--check` falls back to the existing
-committed cache and exits successfully.
+configured database URL resolves but the live describe call cannot reach
+PostgreSQL, `--check` falls back to the existing committed cache and exits
+successfully.
+
 For CLI usage, set `T_LINTER_SQL_PYTHON` to a Python interpreter with `psycopg`
 installed, or run `t-linter sql prepare` from an environment whose `PATH`
-already resolves such a Python.
+already resolves such a Python. See [SQL Catalog Cache](sql-catalog-cache.md)
+for configuration, cache workflow, CI behavior, and an end-to-end example.
 
 ## Runtime Behavior
 
@@ -244,10 +251,13 @@ The relevant implementation files are:
 | File | Role |
 |---|---|
 | `crates/t-linter-core/src/backend.rs` | Normalizes language names and delegates syntax, formatting, and interpolation requirement calls to `tstring-*` backends. |
+| `crates/t-linter-core/src/sql/catalog.rs` | Builds normalized SQL catalog queries, reads and writes cache entries, resolves database URLs, and translates describe responses into cache metadata. |
 | `crates/t-linter-core/src/shadow.rs` | Builds `ShadowDocument` and `ShadowCheckSite` values, inserts same-line assignments, skips unsafe expressions, and preserves line counts. |
+| `crates/t-linter-cli/src/sql_prepare.rs` | Implements `t-linter sql prepare`, starts the Python describe helper, and writes or checks catalog cache files. |
 | `crates/t-linter-lsp/src/type_checker.rs` | Manages `TypeCheckerConfig`, `TypeCheckerClient`, checker discovery, startup, JSON-RPC, document sync, diagnostic collection, and shutdown. |
+| `crates/t-linter-lsp/src/sql_catalog.rs` and `crates/t-linter-lsp/helpers/sql_describe.py` | Describe psycopg SQL queries through a Python helper when live metadata is needed. |
 | `crates/t-linter-lsp/src/lib.rs` | Runs the LSP diagnostic pipeline, calls shadow synthesis, filters backend assignment diagnostics, remaps diagnostics, and merges the final publish payload. |
-| `crates/t-linter/tests/type_check_lsp.rs` | End-to-end coverage against real Ty, Pyright, and Pyrefly binaries for JSON, YAML, TOML, and TDOM component prop remapping. |
+| `crates/t-linter/tests/type_check_lsp.rs` | End-to-end coverage against real Ty, Pyright, and Pyrefly binaries for JSON, YAML, TOML, TDOM component prop remapping, and SQL catalog cache diagnostics. |
 
 The backend crates expose their requirements through
 `interpolation_type_requirements` or a resolver-backed variant such as
