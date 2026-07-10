@@ -129,24 +129,29 @@ initial fixable rules are selected `sql-*` diagnostics and selected
 ## JSON Schema Bindings
 
 For JSON templates, t-linter can compare static object keys and values against
-`TypedDict` schema annotations. The schema binding is carried by
-`json_tstring.Json` marker kwargs:
+`TypedDict` or dataclass schema annotations. The schema binding is carried by
+`json_tstring.Json` marker kwargs; the marker also declares the JSON template
+language.
 
 ```python
-from typing import Annotated, TypedDict
+from typing import Annotated, NotRequired, TypedDict
 from string.templatelib import Template
 from json_tstring import Json
 
 class Order(TypedDict):
     id: int
     name: str
+    note: NotRequired[str]
 
-payload: Annotated[Template, Json(schema=Order)] = t'{"id": "abc"}'
+payload: Annotated[Template, Json(schema=Order)] = (
+    t'{{"id": "abc", "nme": "Ada"}}'
+)
 ```
 
 This template is parsed as JSON and checked against `Order`. t-linter reports
-`template-schema-type-shape` for `"id": "abc"` and
-`template-schema-missing-key` for the missing `name` key.
+`template-schema-type-shape` for `"id": "abc"`,
+`template-schema-unknown-key` for `"nme"`, and `template-schema-missing-key`
+for the missing `name` key.
 
 The supported binding forms are:
 
@@ -159,9 +164,8 @@ aliased: OrderPayload = t'{"id": 1, "name": "Ada"}'
 ```
 
 `Json(schema=...)` may be imported directly, imported with an alias, or used as
-`json_tstring.Json(...)`. The direct `Json[Order]` annotation is also accepted
-as a shorthand, but `Json(schema=Order)` is the preferred form because marker
-kwargs are where schema, dialect, and future options live.
+`json_tstring.Json(...)`. `Json(schema=Order)` is the preferred form because
+marker kwargs are where schema, dialect, and future options live.
 
 String language metadata is still supported as the lightweight tier:
 `Annotated[Template, "json"]`. Do not combine it with a marker for new code. If
@@ -169,6 +173,33 @@ String language metadata is still supported as the lightweight tier:
 `template-metadata-redundant-language` and suggests removing the string. If the
 string and marker disagree, or if an annotation contains multiple language
 markers, t-linter reports `template-metadata-conflict`.
+
+The direct `Json[Order]` annotation is also accepted:
+
+```python
+from typing import TypedDict
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+    name: str
+
+payload: Json[Order] = t'{{"id": 1}}'
+```
+
+t-linter reports:
+
+- `template-schema-missing-key` for required schema keys that are absent
+- `template-schema-unknown-key` for static JSON keys that are not in the schema
+- `template-schema-type-shape` when a static value shape does not match the
+  schema, such as a JSON string where the schema expects `int`
+- `binding-unresolved` when the referenced schema model cannot be resolved
+
+Supported schema sources are local or imported `TypedDict` classes and dataclass
+classes. `TypedDict(total=False)`, `Required[...]`, `NotRequired[...]`, and
+dataclass defaults affect required-key diagnostics. Static scalar checks cover
+`int`, `float`, `str`, `bool`, `None`, `list[...]`, and `dict[...]`; interpolated
+values are left to interpolation type checking.
 
 ## Error on Issues
 

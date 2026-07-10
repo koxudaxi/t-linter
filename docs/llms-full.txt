@@ -14,6 +14,7 @@ t-linter validates and formats embedded languages inside Python template strings
 
 - **`t-linter check`** — validate template string syntax
 - **`t-linter format`** — canonically reformat supported template literals
+- **`t-linter sql prepare`** — cache PostgreSQL parameter metadata for psycopg SQL type narrowing
 - **`t-linter lsp`** — start the Language Server Protocol server for editor integration
 
 ## Features
@@ -21,8 +22,10 @@ t-linter validates and formats embedded languages inside Python template strings
 - **Linting** - Detect syntax errors in embedded HTML, JSON, YAML, TOML, CSS, JavaScript, SQL
 - **Formatting** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML templates
 - **Syntax Highlighting** - Smart highlighting via LSP semantic tokens
-- **Type-based Detection** - Supports lightweight string metadata and marker classes with `tstring_language`
-- **Interpolation Type Checking** - Optional LSP diagnostics for JSON, YAML, TOML interpolation values and TDOM component prop interpolations through Ty, Pyright, or Pyrefly
+- **Type-based Detection** - Understands `Annotated[Template, "html"]`, type aliases, and marker classes with `tstring_language`
+- **Interpolation Type Checking** - Optional LSP diagnostics for JSON, YAML, TOML, psycopg SQL, and TDOM interpolations through Ty, Pyright, or Pyrefly
+- **SQL Catalog Cache** - Narrows psycopg SQL parameters from PostgreSQL metadata, even when the editor session has no live database
+- **JSON Schema Binding** - Checks JSON template keys and static value shapes against `TypedDict` or dataclass models with `Json(schema=...)`
 - **Callee Inference** - Detects backend languages from helpers such as `tdom.html(...)`
 - **Fast** - Single Rust binary with Tree-sitter parsers
 
@@ -67,6 +70,15 @@ Start the LSP server for editor integration:
 ```bash
 t-linter lsp
 ```
+
+Prepare psycopg SQL catalog metadata for type-aware editor diagnostics:
+
+```bash
+DATABASE_URL=postgresql://postgres:postgres@localhost/app t-linter sql prepare .
+```
+
+See [SQL Catalog Cache](usage/sql-catalog-cache.md) for the cache workflow and
+CI recommendations.
 
 ## Quick Start Example
 
@@ -452,6 +464,7 @@ The type checker has five parts:
 |---|---|
 | Parser and language resolver | Finds PEP 750 template strings and resolves their embedded language from annotations, aliases, function parameters, and supported callees. |
 | Template backend | Computes contextual interpolation type requirements for a language. JSON, YAML, TOML, psycopg SQL, and TDOM component props currently return requirements. |
+| SQL catalog cache | Optionally supplies PostgreSQL parameter types for psycopg SQL templates prepared with `t-linter sql prepare`. |
 | Shadow document synthesizer | Creates an in-memory Python document that preserves the original line count and adds type-check assignments for the selected checker. |
 | Type checker client | Starts and reuses a dedicated Ty, Pyright, or Pyrefly language server, syncs the shadow document, and collects diagnostics. |
 | Diagnostic remapper | Filters backend-specific assignment errors and maps them back to the original interpolation ranges. |
@@ -462,6 +475,7 @@ The data flow is:
 open Python document
   -> parse template strings and resolve template languages
   -> ask the JSON/YAML/TOML/SQL backend or TDOM component-prop backend for interpolation requirements
+  -> read SQL catalog cache entries when a psycopg SQL parameter can be narrowed from PostgreSQL metadata
   -> synthesize same-line annotated assignments in a shadow Python document
   -> sync that shadow document to a dedicated type checker server
   -> collect pull or publish diagnostics from that server
@@ -569,14 +583,19 @@ psycopg templates resolved from supported call chains or enabled with
 `[tool.t-linter.sql] library = "psycopg"`. Tree-sitter-only languages such as
 CSS and JavaScript are not part of this mechanism.
 
-Run `t-linter sql prepare .` to populate `.t-linter/sql-cache/` from a configured
-PostgreSQL database. `t-linter sql prepare --check .` compares the committed
+For catalog-backed psycopg SQL narrowing, run `t-linter sql prepare .` to
+populate `.t-linter/sql-cache/` from a configured PostgreSQL database. The LSP
+then reads the committed cache and can report type diagnostics without opening a
+database connection. `t-linter sql prepare --check .` compares the committed
 cache with the current schema and exits with status 2 if it is stale. If the
-live describe call cannot reach PostgreSQL, `--check` falls back to the existing
-committed cache and exits successfully.
+configured database URL resolves but the live describe call cannot reach
+PostgreSQL, `--check` falls back to the existing committed cache and exits
+successfully.
+
 For CLI usage, set `T_LINTER_SQL_PYTHON` to a Python interpreter with `psycopg`
 installed, or run `t-linter sql prepare` from an environment whose `PATH`
-already resolves such a Python.
+already resolves such a Python. See [SQL Catalog Cache](sql-catalog-cache.md)
+for configuration, cache workflow, CI behavior, and an end-to-end example.
 
 ## Runtime Behavior
 
@@ -678,10 +697,13 @@ The relevant implementation files are:
 | File | Role |
 |---|---|
 | `crates/t-linter-core/src/backend.rs` | Normalizes language names and delegates syntax, formatting, and interpolation requirement calls to `tstring-*` backends. |
+| `crates/t-linter-core/src/sql/catalog.rs` | Builds normalized SQL catalog queries, reads and writes cache entries, resolves database URLs, and translates describe responses into cache metadata. |
 | `crates/t-linter-core/src/shadow.rs` | Builds `ShadowDocument` and `ShadowCheckSite` values, inserts same-line assignments, skips unsafe expressions, and preserves line counts. |
+| `crates/t-linter-cli/src/sql_prepare.rs` | Implements `t-linter sql prepare`, starts the Python describe helper, and writes or checks catalog cache files. |
 | `crates/t-linter-lsp/src/type_checker.rs` | Manages `TypeCheckerConfig`, `TypeCheckerClient`, checker discovery, startup, JSON-RPC, document sync, diagnostic collection, and shutdown. |
+| `crates/t-linter-lsp/src/sql_catalog.rs` and `crates/t-linter-lsp/helpers/sql_describe.py` | Describe psycopg SQL queries through a Python helper when live metadata is needed. |
 | `crates/t-linter-lsp/src/lib.rs` | Runs the LSP diagnostic pipeline, calls shadow synthesis, filters backend assignment diagnostics, remaps diagnostics, and merges the final publish payload. |
-| `crates/t-linter/tests/type_check_lsp.rs` | End-to-end coverage against real Ty, Pyright, and Pyrefly binaries for JSON, YAML, TOML, and TDOM component prop remapping. |
+| `crates/t-linter/tests/type_check_lsp.rs` | End-to-end coverage against real Ty, Pyright, and Pyrefly binaries for JSON, YAML, TOML, TDOM component prop remapping, and SQL catalog cache diagnostics. |
 
 The backend crates expose their requirements through
 `interpolation_type_requirements` or a resolver-backed variant such as
@@ -690,6 +712,161 @@ another DSL to this mechanism should start in that DSL backend, not in the LSP
 remapper. The LSP layer should remain language-agnostic: it consumes requirement
 records, synthesizes Python assignments, and maps checker diagnostics back to
 source locations.
+
+---
+
+# SQL Catalog Cache
+
+Source: https://t-linter.koxudaxi.dev/usage/sql-catalog-cache/
+
+The SQL catalog cache lets t-linter use PostgreSQL schema metadata when checking
+psycopg SQL template parameters. It is useful when a template contains a plain
+SQL parameter such as `{user_id}` and the database column tells t-linter that the
+parameter should be an `int`, `str`, `datetime`, or another PostgreSQL-backed
+Python type.
+
+Catalog-backed checks are split into two phases:
+
+1. `t-linter sql prepare` connects to PostgreSQL and writes cache files under
+   `.t-linter/sql-cache/`.
+2. LSP interpolation type checking reads those cache files and asks Ty, Pyright,
+   or Pyrefly to check the Python expression against the cached parameter type.
+
+The LSP does not need a live database when the cache is already present.
+
+## Configure
+
+Enable psycopg SQL handling and point t-linter at a PostgreSQL database:
+
+```toml
+[tool.t-linter.sql]
+library = "psycopg"
+database-url = "env:DATABASE_URL"
+search-path = "public"
+```
+
+`database-url` accepts either a literal PostgreSQL URL or `env:NAME`, which
+reads the connection string from an environment variable. `search-path` is
+optional, but setting it keeps describe results aligned with how the application
+resolves unqualified table names.
+
+When `database-url` uses `env:NAME`, that environment variable must be set before
+prepare runs. The offline cache fallback applies after the URL has been resolved
+and the connection or describe request fails; it does not hide a missing
+environment variable.
+
+The CLI helper is a Python subprocess that imports `psycopg`. Run
+`t-linter sql prepare` from an environment where `python3` resolves to a Python
+with `psycopg` installed, or set `T_LINTER_SQL_PYTHON` explicitly:
+
+```bash
+T_LINTER_SQL_PYTHON=.venv/bin/python t-linter sql prepare .
+```
+
+## Prepare The Cache
+
+Run prepare against the files that contain SQL templates:
+
+```bash
+DATABASE_URL=postgresql://postgres:postgres@localhost/app \
+  t-linter sql prepare .
+```
+
+This command:
+
+- finds psycopg SQL templates
+- converts plain template interpolations into PostgreSQL placeholders such as
+  `$1`, `$2`
+- asks PostgreSQL for parameter and column types
+- writes one cache file per normalized SQL query under `.t-linter/sql-cache/`
+
+Commit the generated `.t-linter/sql-cache/` files with the code that uses those
+queries. The committed cache is what editor diagnostics can use later when the
+database is not running.
+
+## Check In CI
+
+Use `--check` to verify that committed cache files are still current:
+
+```bash
+DATABASE_URL=postgresql://postgres:postgres@localhost/app \
+  t-linter sql prepare --check .
+```
+
+`--check` behavior depends on database availability:
+
+| Situation | Behavior |
+|---|---|
+| PostgreSQL is reachable and the cache matches | exits `0` |
+| PostgreSQL is reachable and the cache is stale or missing | exits `2` |
+| Database URL resolves, PostgreSQL is unreachable, and a committed cache exists | trusts the existing cache and exits `0` |
+| Database URL resolves, PostgreSQL is unreachable, and no cache exists | exits `2` |
+
+That fallback is intentional. It lets lightweight CI or editor sessions reuse a
+known-good cache, while a database-backed CI job can still catch schema drift.
+
+## LSP Diagnostics
+
+After the cache is prepared, enable interpolation type checking in the LSP:
+
+```json
+{
+  "typeChecking": {
+    "enabled": true,
+    "checker": "ty"
+  }
+}
+```
+
+Given this table:
+
+```sql
+CREATE TABLE users (
+  id integer PRIMARY KEY,
+  name text NOT NULL
+);
+```
+
+and this Python source:
+
+```python
+from typing import Annotated
+from string.templatelib import Template
+
+def find_user(user_id: str) -> None:
+    query: Annotated[Template, "sql"] = (
+        t"SELECT name FROM users WHERE id = {user_id}"
+    )
+```
+
+`t-linter sql prepare` records that the first SQL parameter is PostgreSQL
+`int4`. During LSP diagnostics, t-linter narrows `{user_id}` to Python `int` and
+reports an `interpolation-type-error` because the expression is annotated as
+`str`.
+
+The diagnostic is reported on the original `{user_id}` expression. The generated
+type-checking code is internal and is never written to the source file.
+
+## What The Cache Covers
+
+Catalog-backed narrowing applies to plain psycopg SQL parameters, including
+`{value}`, `{value:s}`, `{value:b}`, and `{value:t}`. Structural psycopg
+interpolations such as `{table:i}` and SQL fragments such as `{fragment:q}` are
+checked by the normal psycopg rules instead of the catalog cache.
+
+The cache is keyed by normalized SQL text. If the query text changes, prepare
+writes a new cache entry. If the database schema changes in a way that changes
+described parameter or column types, `t-linter sql prepare --check` reports the
+old cache as stale when PostgreSQL is reachable.
+
+## Timeouts
+
+The describe helper has a default 10 second request timeout. Override it when a
+slow database needs more time:
+
+```bash
+T_LINTER_SQL_DESCRIBE_TIMEOUT_SECONDS=30 t-linter sql prepare .
+```
 
 ---
 
@@ -826,24 +1003,29 @@ initial fixable rules are selected `sql-*` diagnostics and selected
 ## JSON Schema Bindings
 
 For JSON templates, t-linter can compare static object keys and values against
-`TypedDict` schema annotations. The schema binding is carried by
-`json_tstring.Json` marker kwargs:
+`TypedDict` or dataclass schema annotations. The schema binding is carried by
+`json_tstring.Json` marker kwargs; the marker also declares the JSON template
+language.
 
 ```python
-from typing import Annotated, TypedDict
+from typing import Annotated, NotRequired, TypedDict
 from string.templatelib import Template
 from json_tstring import Json
 
 class Order(TypedDict):
     id: int
     name: str
+    note: NotRequired[str]
 
-payload: Annotated[Template, Json(schema=Order)] = t'{"id": "abc"}'
+payload: Annotated[Template, Json(schema=Order)] = (
+    t'{{"id": "abc", "nme": "Ada"}}'
+)
 ```
 
 This template is parsed as JSON and checked against `Order`. t-linter reports
-`template-schema-type-shape` for `"id": "abc"` and
-`template-schema-missing-key` for the missing `name` key.
+`template-schema-type-shape` for `"id": "abc"`,
+`template-schema-unknown-key` for `"nme"`, and `template-schema-missing-key`
+for the missing `name` key.
 
 The supported binding forms are:
 
@@ -856,9 +1038,8 @@ aliased: OrderPayload = t'{"id": 1, "name": "Ada"}'
 ```
 
 `Json(schema=...)` may be imported directly, imported with an alias, or used as
-`json_tstring.Json(...)`. The direct `Json[Order]` annotation is also accepted
-as a shorthand, but `Json(schema=Order)` is the preferred form because marker
-kwargs are where schema, dialect, and future options live.
+`json_tstring.Json(...)`. `Json(schema=Order)` is the preferred form because
+marker kwargs are where schema, dialect, and future options live.
 
 String language metadata is still supported as the lightweight tier:
 `Annotated[Template, "json"]`. Do not combine it with a marker for new code. If
@@ -866,6 +1047,33 @@ String language metadata is still supported as the lightweight tier:
 `template-metadata-redundant-language` and suggests removing the string. If the
 string and marker disagree, or if an annotation contains multiple language
 markers, t-linter reports `template-metadata-conflict`.
+
+The direct `Json[Order]` annotation is also accepted:
+
+```python
+from typing import TypedDict
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+    name: str
+
+payload: Json[Order] = t'{{"id": 1}}'
+```
+
+t-linter reports:
+
+- `template-schema-missing-key` for required schema keys that are absent
+- `template-schema-unknown-key` for static JSON keys that are not in the schema
+- `template-schema-type-shape` when a static value shape does not match the
+  schema, such as a JSON string where the schema expects `int`
+- `binding-unresolved` when the referenced schema model cannot be resolved
+
+Supported schema sources are local or imported `TypedDict` classes and dataclass
+classes. `TypedDict(total=False)`, `Required[...]`, `NotRequired[...]`, and
+dataclass defaults affect required-key diagnostics. Static scalar checks cover
+`int`, `float`, `str`, `bool`, `None`, `list[...]`, and `dict[...]`; interpolated
+values are left to interpolation type checking.
 
 ## Error on Issues
 
@@ -1451,7 +1659,9 @@ carry schema, dialect, and option metadata on normal Python objects instead of
 reserving more bare strings.
 
 The built-in `json_tstring.Json` marker declares the JSON language when it is
-used in template metadata or as the template annotation itself:
+used in template metadata or as the template annotation itself. Its `schema`
+option also enables `t-linter check` diagnostics for local or imported
+`TypedDict` and dataclass models:
 
 ```python
 from typing import Annotated, TypedDict
@@ -1478,6 +1688,10 @@ code. If the string and marker agree, t-linter reports a redundant-language
 warning with a fix to remove the string. If they disagree, or if one
 `Annotated[...]` contains more than one language marker, t-linter reports a
 metadata conflict.
+
+t-linter checks required keys, unknown static keys, and static scalar value
+shapes against schema models. See
+[Check Command](usage/cli/check.md#json-schema-bindings) for details.
 
 Custom marker classes can declare a language structurally with
 `tstring_language`; no t-linter-specific base class is required. The class may
@@ -1525,11 +1739,16 @@ t-linter sql prepare .
 t-linter sql prepare --check .
 ```
 
-The cache is written to `.t-linter/sql-cache/`. `t-linter sql prepare --check`
-reports stale cache entries when PostgreSQL is reachable; if the database is
-unavailable, it trusts the existing committed cache and exits successfully.
-When the cache is present, interpolation type checking can narrow plain psycopg
-parameters from PostgreSQL types even if the database is unavailable.
+The cache is written to `.t-linter/sql-cache/` and should be committed with the
+queries that use it. `t-linter sql prepare --check` reports stale or missing
+cache entries when PostgreSQL is reachable. If the configured database URL
+resolves but the database is unavailable and a committed cache exists, it trusts
+that cache and exits successfully. When the cache is present, LSP interpolation
+type checking can narrow plain psycopg parameters from PostgreSQL types even if
+the editor session has no live database.
+
+See [SQL Catalog Cache](usage/sql-catalog-cache.md) for the end-to-end workflow,
+CI behavior, and an example diagnostic.
 
 ## HTML Notes
 

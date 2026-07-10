@@ -55,7 +55,9 @@ carry schema, dialect, and option metadata on normal Python objects instead of
 reserving more bare strings.
 
 The built-in `json_tstring.Json` marker declares the JSON language when it is
-used in template metadata or as the template annotation itself:
+used in template metadata or as the template annotation itself. Its `schema`
+option also enables `t-linter check` diagnostics for local or imported
+`TypedDict` and dataclass models:
 
 ```python
 from typing import Annotated, TypedDict
@@ -82,6 +84,10 @@ code. If the string and marker agree, t-linter reports a redundant-language
 warning with a fix to remove the string. If they disagree, or if one
 `Annotated[...]` contains more than one language marker, t-linter reports a
 metadata conflict.
+
+t-linter checks required keys, unknown static keys, and static scalar value
+shapes against schema models. See
+[Check Command](usage/cli/check.md#json-schema-bindings) for details.
 
 Custom marker classes can declare a language structurally with
 `tstring_language`; no t-linter-specific base class is required. The class may
@@ -129,11 +135,16 @@ t-linter sql prepare .
 t-linter sql prepare --check .
 ```
 
-The cache is written to `.t-linter/sql-cache/`. `t-linter sql prepare --check`
-reports stale cache entries when PostgreSQL is reachable; if the database is
-unavailable, it trusts the existing committed cache and exits successfully.
-When the cache is present, interpolation type checking can narrow plain psycopg
-parameters from PostgreSQL types even if the database is unavailable.
+The cache is written to `.t-linter/sql-cache/` and should be committed with the
+queries that use it. `t-linter sql prepare --check` reports stale or missing
+cache entries when PostgreSQL is reachable. If the configured database URL
+resolves but the database is unavailable and a committed cache exists, it trusts
+that cache and exits successfully. When the cache is present, LSP interpolation
+type checking can narrow plain psycopg parameters from PostgreSQL types even if
+the editor session has no live database.
+
+See [SQL Catalog Cache](usage/sql-catalog-cache.md) for the end-to-end workflow,
+CI behavior, and an example diagnostic.
 
 ## HTML Notes
 
