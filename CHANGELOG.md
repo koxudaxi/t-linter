@@ -4,6 +4,48 @@ All notable changes to this project are documented in this file.
 This changelog is generated from GitHub Releases and may include manual corrections when release metadata needs adjustment.
 
 ---
+## [0.10.0](https://github.com/koxudaxi/t-linter/releases/tag/0.10.0) - 2026-07-10
+
+## Breaking Changes
+
+
+### CLI Changes
+* `stats` command now accepts multiple paths instead of a single path - The `stats` subcommand changed from `t-linter stats <path>` (single positional argument, defaulting to `.`) to `t-linter stats [paths]...` (multiple positional arguments). Scripts passing exactly one path still work, but the underlying function signature changed from `stats(path: String) -> Result<()>` to `stats(paths: Vec<String>, format: StatsFormat) -> Result<i32>`, and the exit code behavior changed: it now returns exit code `2` when files fail to read/parse instead of exit code `1`. (#61)
+
+### Default Behavior Changes
+* `lint_source_with_config` now applies inline suppressions and rule configuration filters - Previously, `lint_source_with_config` returned all diagnostics. It now automatically filters diagnostics based on `# t-linter: ignore` comments in source code and `ignore`/`per-file-ignores` settings from `pyproject.toml`, and applies severity overrides from the `severity` config. Code that relied on receiving the full unfiltered diagnostic list from this function will now see fewer diagnostics when suppression comments or ignore config are present. (#61)
+* New `template-metadata-conflict` diagnostic (error severity) - Templates with conflicting language metadata (e.g., a string language and a marker type declaring different languages, or multiple marker types) now emit an error-level diagnostic. Code like `Annotated[Template, "yaml", Json]` will fail linting where it was previously accepted. (#62)
+* New `template-metadata-redundant-language` diagnostic (warning severity) - Templates with a string language that matches the marker type's language (e.g., `Annotated[Template, "json", Json]`) now emit a warning with a suggested fix to remove the redundant string. (#62)
+* JSON schema bindings now resolve through type aliases - Type aliases like `type OrderPayload = Annotated[Template, Json(schema=Order)]` are now followed when resolving schema bindings, which may surface new `template-schema-missing-key`, `template-schema-unknown-key`, or `template-schema-type-shape` diagnostics on templates that were previously unchecked. (#62)
+
+### Language Detection Changes
+* Marker types now contribute to language detection - Template marker types (e.g., `json_tstring.Json` and custom classes with a `tstring_language` attribute) are now recognized as language indicators. Templates annotated with `Annotated[Template, Json(schema=Order)]` (without an explicit `"json"` string) will now detect `language="json"` and receive embedded JSON parse-error diagnostics where previously no language validation occurred. This may surface new `embedded-parse-error` diagnostics on previously clean code. (#62)
+  Before (no embedded parse error reported):
+  ```python
+  payload: Annotated[Template, Json(schema=Order)] = t'[1,,2]'
+  ```
+  After (reports `embedded-parse-error` for invalid JSON):
+  ```python
+  payload: Annotated[Template, Json(schema=Order)] = t'[1,,2]'
+  # ^ now emits: embedded-parse-error (language: json)
+  ```
+
+## What's Changed
+* Add schema binding diagnostics by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/55
+* Add psycopg SQL static rules by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/56
+* Infer psycopg SQL template calls by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/57
+* Add psycopg SQL type requirements by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/58
+* Add psycopg SQL catalog cache by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/59
+* Add lint controls and reports by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/61
+* Improve SQL catalog docs by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/60
+* Support template marker languages by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/62
+* Document template marker languages by @koxudaxi in https://github.com/koxudaxi/t-linter/pull/63
+
+
+**Full Changelog**: https://github.com/koxudaxi/t-linter/compare/0.9.1...0.10.0
+
+---
+
 ## [0.9.1](https://github.com/koxudaxi/t-linter/releases/tag/0.9.1) - 2026-07-05
 
 ## What's Changed
