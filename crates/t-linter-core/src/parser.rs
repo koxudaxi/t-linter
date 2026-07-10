@@ -19,6 +19,7 @@ use wait_timeout::ChildExt;
 pub struct ModuleContext {
     pub type_aliases: HashMap<String, String>,
     pub imports: HashMap<String, String>,
+    pub template_language_markers: HashMap<String, String>,
     pub callable_signatures: HashMap<String, CallableSignature>,
     pub local_callable_signature_names: HashSet<String>,
     imported_module_paths: HashSet<String>,
@@ -199,6 +200,10 @@ enum TypeExpr {
     Name(QualifiedName),
     StringLiteral(String),
     NoneLiteral,
+    Call {
+        function: QualifiedName,
+        args: String,
+    },
     Generic {
         base: QualifiedName,
         args: Vec<TypeExpr>,
@@ -221,6 +226,7 @@ struct ModuleTypeData {
     is_complete: bool,
     imports: HashMap<String, String>,
     alias_exprs: HashMap<String, TypeExpr>,
+    template_language_markers: HashMap<String, String>,
     callable_signatures: HashMap<String, CallableSignature>,
     local_callable_signature_names: HashSet<String>,
     imported_module_paths: HashSet<String>,
@@ -234,6 +240,7 @@ impl Default for ModuleTypeData {
             is_complete: true,
             imports: HashMap::new(),
             alias_exprs: HashMap::new(),
+            template_language_markers: HashMap::new(),
             callable_signatures: HashMap::new(),
             local_callable_signature_names: HashSet::new(),
             imported_module_paths: HashSet::new(),
@@ -412,6 +419,7 @@ impl TemplateStringParser {
         )?;
 
         context.imports = module_type_data.imports.clone();
+        context.template_language_markers = module_type_data.template_language_markers.clone();
         context.callable_signatures = module_type_data.callable_signatures.clone();
         context.local_callable_signature_names =
             module_type_data.local_callable_signature_names.clone();
@@ -552,6 +560,13 @@ impl TemplateStringParser {
                 current_module_name,
                 current_module_is_package,
             )?;
+            self.collect_template_language_markers(
+                tree,
+                source,
+                &mut module_type_data,
+                module_cache,
+                import_resolution_filter,
+            )?;
             self.collect_type_aliases(tree, source, &mut module_type_data)?;
             self.collect_local_callable_signatures(
                 tree,
@@ -571,6 +586,153 @@ impl TemplateStringParser {
         })();
         self.module_load_stack.pop();
         build_result
+    }
+
+    fn collect_template_language_markers(
+        &mut self,
+        tree: &Tree,
+        source: &str,
+        module_type_data: &mut ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        import_resolution_filter: Option<&HashSet<String>>,
+    ) -> Result<()> {
+        let query = Query::new(
+            &tree_sitter_python::LANGUAGE.into(),
+            r#"
+            (class_definition
+                name: (identifier) @name
+                body: (block) @body) @class
+            "#,
+        )
+        .context("Failed to create template language marker query")?;
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+        let mut classes = Vec::new();
+
+        while let Some(match_) = matches.next() {
+            let mut class_node = None;
+            let mut name_node = None;
+            let mut body_node = None;
+            for capture in match_.captures {
+                match query.capture_names()[capture.index as usize] {
+                    "class" => class_node = Some(capture.node),
+                    "name" => name_node = Some(capture.node),
+                    "body" => body_node = Some(capture.node),
+                    _ => {}
+                }
+            }
+            let (Some(class_node), Some(name_node), Some(body_node)) =
+                (class_node, name_node, body_node)
+            else {
+                continue;
+            };
+            let statement_node = class_node
+                .parent()
+                .filter(|parent| parent.kind() == "decorated_definition")
+                .unwrap_or(class_node);
+            if !is_module_level_statement(statement_node) {
+                continue;
+            }
+            classes.push((
+                name_node.utf8_text(source.as_bytes())?.to_string(),
+                class_node,
+                body_node,
+            ));
+        }
+
+        for (name, _, body_node) in &classes {
+            let Some(language) = template_language_marker_from_body(*body_node, source)? else {
+                continue;
+            };
+            module_type_data
+                .template_language_markers
+                .insert(name.clone(), language);
+        }
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (name, class_node, _) in &classes {
+                if module_type_data
+                    .template_language_markers
+                    .contains_key(name)
+                {
+                    continue;
+                }
+                let Some(language) = self.template_language_marker_from_bases(
+                    *class_node,
+                    source,
+                    module_type_data,
+                    module_cache,
+                )?
+                else {
+                    continue;
+                };
+                module_type_data
+                    .template_language_markers
+                    .insert(name.clone(), language);
+                changed = true;
+            }
+        }
+
+        for (local_name, import_target) in module_type_data.imports.clone() {
+            if import_resolution_filter.is_some_and(|filter| !filter.contains(&local_name)) {
+                continue;
+            }
+            if module_type_data
+                .template_language_markers
+                .contains_key(&local_name)
+                || self.import_path_resolves_to_module(&import_target)
+            {
+                continue;
+            }
+            let mut visited = HashSet::new();
+            let Some(language) = self.resolve_template_marker_import_target(
+                &import_target,
+                module_cache,
+                &mut visited,
+            )?
+            else {
+                continue;
+            };
+            module_type_data
+                .template_language_markers
+                .insert(local_name, language);
+        }
+
+        Ok(())
+    }
+
+    fn template_language_marker_from_bases(
+        &mut self,
+        class_node: Node,
+        source: &str,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+    ) -> Result<Option<String>> {
+        let Some(superclasses) = class_node.child_by_field_name("superclasses") else {
+            return Ok(None);
+        };
+        let mut cursor = superclasses.walk();
+        for base in superclasses.named_children(&mut cursor) {
+            if matches!(
+                base.kind(),
+                "keyword_argument" | "list_splat" | "dictionary_splat"
+            ) {
+                continue;
+            }
+            let base_expr = parse_type_expr(base.utf8_text(source.as_bytes())?);
+            let mut visited = HashSet::new();
+            if let Some(language) = self.resolve_template_marker_language_expr(
+                &base_expr,
+                module_type_data,
+                module_cache,
+                &mut visited,
+            )? {
+                return Ok(Some(language));
+            }
+        }
+        Ok(None)
     }
 
     fn collect_type_aliases(
@@ -2573,6 +2735,14 @@ impl TemplateStringParser {
     ) -> Result<ResolvedTypeInfo> {
         match expr {
             TypeExpr::Name(name) => {
+                if let Some(language) = self.resolve_template_marker_language_name(
+                    name,
+                    module_type_data,
+                    module_cache,
+                    visited,
+                )? {
+                    return Ok(resolved_template_language_marker_type_info(language));
+                }
                 self.resolve_name_type_info(name, module_type_data, module_cache, visited)
             }
             TypeExpr::StringLiteral(_) => Ok(ResolvedTypeInfo::default()),
@@ -2582,6 +2752,17 @@ impl TemplateStringParser {
                 value_types: Vec::new(),
                 accepts_none: true,
             }),
+            TypeExpr::Call { function, .. } => {
+                if let Some(language) = self.resolve_template_marker_language_name(
+                    function,
+                    module_type_data,
+                    module_cache,
+                    visited,
+                )? {
+                    return Ok(resolved_template_language_marker_type_info(language));
+                }
+                Ok(ResolvedTypeInfo::default())
+            }
             TypeExpr::Union(parts) => {
                 let mut merged = ResolvedTypeInfo::default();
                 for part in parts {
@@ -2632,7 +2813,17 @@ impl TemplateStringParser {
                         Ok(merged)
                     }
                     Some("Literal") => Ok(resolve_literal_type_info(args)),
-                    _ => Ok(ResolvedTypeInfo::default()),
+                    _ => {
+                        if let Some(language) = self.resolve_template_marker_language_name(
+                            base,
+                            module_type_data,
+                            module_cache,
+                            visited,
+                        )? {
+                            return Ok(resolved_template_language_marker_type_info(language));
+                        }
+                        Ok(ResolvedTypeInfo::default())
+                    }
                 }
             }
             TypeExpr::Unknown(_) => Ok(ResolvedTypeInfo::default()),
@@ -2868,15 +3059,163 @@ impl TemplateStringParser {
             .transpose()?
             .unwrap_or_default();
 
-        if args.len() >= 2
-            && self.is_template_expr(&args[0], module_type_data, module_cache, visited)?
-            && let TypeExpr::StringLiteral(language) = &args[1]
+        if args.len() < 2
+            || !self.is_template_expr(&args[0], module_type_data, module_cache, visited)?
         {
-            resolved.template_language = Some(language.clone());
-            resolved.template_profile = args.iter().skip(2).find_map(template_profile_metadata);
+            return Ok(resolved);
+        }
+
+        let metadata = &args[1..];
+        if let Some(language) = metadata.iter().find_map(|arg| match arg {
+            TypeExpr::StringLiteral(language) => Some(language.clone()),
+            _ => None,
+        }) {
+            resolved.template_language = Some(language);
+        }
+        if resolved.template_language.is_none() {
+            for arg in metadata {
+                if let Some(language) = self.resolve_template_marker_language_expr(
+                    arg,
+                    module_type_data,
+                    module_cache,
+                    visited,
+                )? {
+                    resolved.template_language = Some(language);
+                    break;
+                }
+            }
+        }
+        if resolved.template_profile.is_none() {
+            resolved.template_profile = metadata.iter().find_map(template_profile_metadata);
         }
 
         Ok(resolved)
+    }
+
+    fn resolve_template_marker_language_expr(
+        &mut self,
+        expr: &TypeExpr,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        visited: &mut HashSet<(ModuleCacheKey, String)>,
+    ) -> Result<Option<String>> {
+        match expr {
+            TypeExpr::Name(name)
+            | TypeExpr::Generic { base: name, .. }
+            | TypeExpr::Call { function: name, .. } => self.resolve_template_marker_language_name(
+                name,
+                module_type_data,
+                module_cache,
+                visited,
+            ),
+            TypeExpr::StringLiteral(_)
+            | TypeExpr::NoneLiteral
+            | TypeExpr::Union(_)
+            | TypeExpr::Unknown(_) => Ok(None),
+        }
+    }
+
+    fn resolve_template_marker_language_name(
+        &mut self,
+        name: &QualifiedName,
+        module_type_data: &ModuleTypeData,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        visited: &mut HashSet<(ModuleCacheKey, String)>,
+    ) -> Result<Option<String>> {
+        let raw_name = name.as_string();
+        if let Some(language) = builtin_template_marker_language(&raw_name) {
+            return Ok(Some(language.to_string()));
+        }
+
+        if name.parts.len() == 1 {
+            let alias_name = &name.parts[0];
+            if let Some(language) = module_type_data.template_language_markers.get(alias_name) {
+                return Ok(Some(language.clone()));
+            }
+            if let Some(alias_expr) = module_type_data.alias_exprs.get(alias_name) {
+                let visit_key = (module_type_data.module_key.clone(), alias_name.to_string());
+                if !visited.insert(visit_key.clone()) {
+                    return Ok(None);
+                }
+                let language = self.resolve_template_marker_language_expr(
+                    alias_expr,
+                    module_type_data,
+                    module_cache,
+                    visited,
+                )?;
+                visited.remove(&visit_key);
+                if language.is_some() {
+                    return Ok(language);
+                }
+            }
+            let Some(import_target) = module_type_data.imports.get(alias_name) else {
+                return Ok(None);
+            };
+            return self.resolve_template_marker_import_target(
+                import_target,
+                module_cache,
+                visited,
+            );
+        }
+
+        if let Some(import_target) = expand_qualified_name(name, &module_type_data.imports) {
+            return self.resolve_template_marker_import_target(
+                &import_target,
+                module_cache,
+                visited,
+            );
+        }
+
+        Ok(None)
+    }
+
+    fn resolve_template_marker_import_target(
+        &mut self,
+        import_target: &str,
+        module_cache: &mut HashMap<PathBuf, ModuleTypeData>,
+        visited: &mut HashSet<(ModuleCacheKey, String)>,
+    ) -> Result<Option<String>> {
+        if let Some(language) = builtin_template_marker_language(import_target) {
+            return Ok(Some(language.to_string()));
+        }
+        if self.import_path_resolves_to_module(import_target) {
+            return Ok(None);
+        }
+        let Some((module_name, symbol_name)) = import_target.rsplit_once('.') else {
+            return Ok(None);
+        };
+        let Some(imported_module) =
+            self.load_imported_module_type_data(module_name, module_cache)?
+        else {
+            return Ok(None);
+        };
+        if let Some(language) = imported_module.template_language_markers.get(symbol_name) {
+            return Ok(Some(language.clone()));
+        }
+        if let Some(alias_expr) = imported_module.alias_exprs.get(symbol_name) {
+            let visit_key = (imported_module.module_key.clone(), symbol_name.to_string());
+            if !visited.insert(visit_key.clone()) {
+                return Ok(None);
+            }
+            let language = self.resolve_template_marker_language_expr(
+                alias_expr,
+                &imported_module,
+                module_cache,
+                visited,
+            )?;
+            visited.remove(&visit_key);
+            if language.is_some() {
+                return Ok(language);
+            }
+        }
+        if let Some(reexport_target) = imported_module.imports.get(symbol_name) {
+            return self.resolve_template_marker_import_target(
+                reexport_target,
+                module_cache,
+                visited,
+            );
+        }
+        Ok(None)
     }
 
     fn is_template_expr(
@@ -2922,6 +3261,7 @@ impl TemplateStringParser {
                 Ok(false)
             }
             TypeExpr::Generic { .. }
+            | TypeExpr::Call { .. }
             | TypeExpr::Union(_)
             | TypeExpr::StringLiteral(_)
             | TypeExpr::NoneLiteral
@@ -2989,6 +3329,15 @@ fn parse_type_expr(type_text: &str) -> TypeExpr {
         return TypeExpr::StringLiteral(string_literal);
     }
 
+    if let Some((function, args)) = split_call_expr(type_text) {
+        return TypeExpr::Call {
+            function: parse_qualified_name(function).unwrap_or(QualifiedName {
+                parts: vec![function.trim().to_string()],
+            }),
+            args: args.to_string(),
+        };
+    }
+
     if let Some((base, args_text)) = split_generic_expr(type_text) {
         return TypeExpr::Generic {
             base: parse_qualified_name(base).unwrap_or(QualifiedName {
@@ -3006,6 +3355,64 @@ fn parse_type_expr(type_text: &str) -> TypeExpr {
     }
 
     TypeExpr::Unknown(type_text.to_string())
+}
+
+fn split_call_expr(type_text: &str) -> Option<(&str, &str)> {
+    let text = type_text.trim();
+    if !text.ends_with(')') {
+        return None;
+    }
+
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut call_start = None;
+
+    for (index, ch) in text.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            '(' if bracket_depth == 0 && brace_depth == 0 && paren_depth == 0 => {
+                call_start = Some(index);
+                paren_depth += 1;
+            }
+            '(' => paren_depth += 1,
+            ')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                if paren_depth == 0 && call_start.is_some() && index + ch.len_utf8() != text.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let start = call_start?;
+    let function = text[..start].trim();
+    if function.is_empty() || paren_depth != 0 || bracket_depth != 0 || brace_depth != 0 {
+        return None;
+    }
+    Some((function, text[start + 1..text.len() - 1].trim()))
 }
 
 fn parse_qualified_name(type_text: &str) -> Option<QualifiedName> {
@@ -3120,6 +3527,7 @@ fn checker_type_annotation_from_expr(expr: &TypeExpr) -> Option<String> {
         TypeExpr::Name(name) => Some(name.as_string()),
         TypeExpr::StringLiteral(value) => Some(value.clone()),
         TypeExpr::NoneLiteral => Some("None".to_string()),
+        TypeExpr::Call { function, args } => Some(format!("{}({})", function.as_string(), args)),
         TypeExpr::Generic { base, args } => {
             let args = args
                 .iter()
@@ -3497,6 +3905,38 @@ fn template_profile_metadata(arg: &TypeExpr) -> Option<String> {
         .map(str::to_string)
 }
 
+fn builtin_template_marker_language(target: &str) -> Option<&'static str> {
+    match target {
+        "json_tstring.Json" => Some("json"),
+        _ => None,
+    }
+}
+
+fn template_language_marker_from_body(body: Node, source: &str) -> Result<Option<String>> {
+    let mut cursor = body.walk();
+    for statement in body.named_children(&mut cursor) {
+        let Some(assignment) = dataclass_field_assignment_node(statement) else {
+            continue;
+        };
+        let Some(left) = assignment.child_by_field_name("left") else {
+            continue;
+        };
+        if left.kind() != "identifier" || left.utf8_text(source.as_bytes())? != "tstring_language" {
+            continue;
+        }
+        let Some(right) = assignment.child_by_field_name("right") else {
+            continue;
+        };
+        let Some(language) = parse_string_literal(right.utf8_text(source.as_bytes())?) else {
+            continue;
+        };
+        if !language.trim().is_empty() {
+            return Ok(Some(language));
+        }
+    }
+    Ok(None)
+}
+
 fn resolve_literal_type_info(args: &[TypeExpr]) -> ResolvedTypeInfo {
     let mut resolved = ResolvedTypeInfo::default();
     for arg in args {
@@ -3518,10 +3958,17 @@ fn resolve_literal_type_info(args: &[TypeExpr]) -> ResolvedTypeInfo {
                     push_value_type(&mut resolved.value_types, CallableValueType::Int);
                 }
             }
-            TypeExpr::Generic { .. } | TypeExpr::Union(_) => {}
+            TypeExpr::Call { .. } | TypeExpr::Generic { .. } | TypeExpr::Union(_) => {}
         }
     }
     resolved
+}
+
+fn resolved_template_language_marker_type_info(language: String) -> ResolvedTypeInfo {
+    ResolvedTypeInfo {
+        template_language: Some(language),
+        ..ResolvedTypeInfo::default()
+    }
 }
 
 fn merge_resolved_type_info(target: &mut ResolvedTypeInfo, other: ResolvedTypeInfo) {
@@ -6994,6 +7441,245 @@ config: Annotated[Template, "toml", "profile:1.0"] = t"title = {title}"
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].language, Some("toml".to_string()));
         assert_eq!(templates[0].profile, Some("1.0".to_string()));
+    }
+
+    #[test]
+    fn test_annotated_template_marker_metadata_detection() {
+        let source = r#"
+from typing import Annotated, TypedDict
+from string.templatelib import Template
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+
+payload: Annotated[Template, Json(schema=Order)] = t'{"id": {order_id}}'
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("json".to_string()));
+        assert_eq!(
+            templates[0].language_detection,
+            Some(LanguageDetection::Annotation)
+        );
+    }
+
+    #[test]
+    fn test_annotated_template_marker_metadata_respects_explicit_language() {
+        let source = r#"
+from typing import Annotated, TypedDict
+from string.templatelib import Template
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+
+payload: Annotated[Template, "yaml", Json(schema=Order)] = t'{"id": {order_id}}'
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_annotated_template_marker_metadata_accepts_class_and_instance() {
+        let source = r#"
+from typing import Annotated, TypedDict
+from string.templatelib import Template
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+
+class_marker: Annotated[Template, Json] = t'{"id": {order_id}}'
+instance_marker: Annotated[Template, Json()] = t'{"id": {order_id}}'
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 2);
+        assert!(templates.iter().all(|template| {
+            template.language == Some("json".to_string())
+                && template.language_detection == Some(LanguageDetection::Annotation)
+        }));
+    }
+
+    #[test]
+    fn test_annotated_template_marker_metadata_supports_alias_and_dotted_imports() {
+        let source = r#"
+from typing import Annotated, TypedDict
+from string.templatelib import Template
+from json_tstring import Json as JsonMarker
+import json_tstring
+
+class Order(TypedDict):
+    id: int
+
+aliased: Annotated[Template, JsonMarker(schema=Order)] = t'{"id": {order_id}}'
+dotted: Annotated[Template, json_tstring.Json(schema=Order)] = t'{"id": {order_id}}'
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 2);
+        assert!(templates.iter().all(|template| {
+            template.language == Some("json".to_string())
+                && template.language_detection == Some(LanguageDetection::Annotation)
+        }));
+    }
+
+    #[test]
+    fn test_annotated_template_marker_metadata_handles_nested_commas() {
+        let source = r#"
+from typing import Annotated, TypedDict
+from string.templatelib import Template
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+
+payload: Annotated[Template, Json(schema=dict[str, tuple[Order, Order]])] = t'{"id": {order_id}}'
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("json".to_string()));
+    }
+
+    #[test]
+    fn test_generic_template_marker_annotation_detection() {
+        let source = r#"
+from typing import TypedDict
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+
+payload: Json[Order] = t'{"id": {order_id}}'
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("json".to_string()));
+        assert_eq!(
+            templates[0].language_detection,
+            Some(LanguageDetection::Annotation)
+        );
+    }
+
+    #[test]
+    fn test_imported_template_language_marker_attribute_detection() {
+        let dir = parser_test_dir("template-language-marker-attribute");
+        write_file(
+            &dir.join("markers.py"),
+            r#"from typing import Final, final
+
+@final
+class DataTemplate:
+    tstring_language: Final = "yaml"
+"#,
+        );
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+from markers import DataTemplate
+
+payload: Annotated[Template, DataTemplate()] = t"name: {name}"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_installed_stub_template_language_marker_attribute_detection() {
+        let dir = parser_test_dir("template-language-marker-stub");
+        let site_packages = project_site_packages(&dir);
+        write_file(
+            &site_packages.join("markers.pyi"),
+            r#"from typing import Final
+
+class DataTemplate:
+    tstring_language: Final = "yaml"
+"#,
+        );
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+from markers import DataTemplate
+
+payload: Annotated[Template, DataTemplate()] = t"name: {name}"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser
+            .find_template_strings_in_file(source, &dir.join("app.py"))
+            .unwrap();
+
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
+    }
+
+    #[test]
+    fn test_dunder_template_language_marker_attribute_is_ignored() {
+        let source = r#"
+from typing import Annotated
+from string.templatelib import Template
+
+class DataTemplate:
+    __tstring_language__ = "yaml"
+
+payload: Annotated[Template, DataTemplate()] = t"name: {name}"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, None);
+    }
+
+    #[test]
+    fn test_template_language_marker_inherits_static_base_attribute() {
+        let source = r#"
+from typing import Annotated, Final
+from string.templatelib import Template
+
+class BaseTemplate:
+    tstring_language: Final = "yaml"
+
+class DataTemplate(BaseTemplate):
+    pass
+
+payload: Annotated[Template, DataTemplate()] = t"name: {name}"
+"#;
+
+        let mut parser = TemplateStringParser::new().unwrap();
+        let templates = parser.find_template_strings(source).unwrap();
+
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].language, Some("yaml".to_string()));
     }
 
     #[test]

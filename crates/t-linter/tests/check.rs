@@ -245,6 +245,160 @@ payload: Annotated[Template, Json(schema=Order)] = t'{{"id": "abc", "nme": "Ada"
 }
 
 #[test]
+fn check_json_marker_metadata_enables_json_parse_diagnostics() {
+    let dir = test_dir("json-marker-language");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated, TypedDict
+from string.templatelib import Template
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+
+payload: Annotated[Template, Json(schema=Order)] = t'[1,,2]'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "embedded-parse-error");
+    assert_eq!(json["diagnostics"][0]["language"], "json");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_template_metadata_language_conflict() {
+    let dir = test_dir("template-metadata-conflict");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+from json_tstring import Json
+
+payload: Annotated[Template, "yaml", Json] = t'{{"id": 1}}'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "template-metadata-conflict");
+    assert_eq!(json["diagnostics"][0]["severity"], "error");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("marker language 'json'")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_redundant_template_metadata_language() {
+    let dir = test_dir("template-metadata-redundant");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated
+from string.templatelib import Template
+from json_tstring import Json
+
+payload: Annotated[Template, "json", Json] = t'{{"id": 1}}'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(
+        json["diagnostics"][0]["rule"],
+        "template-metadata-redundant-language"
+    );
+    assert_eq!(json["diagnostics"][0]["severity"], "warning");
+    assert_eq!(json["diagnostics"][0]["suggested_edits"][0]["new_text"], "");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_reports_multiple_template_metadata_markers() {
+    let dir = test_dir("template-metadata-multiple-markers");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated, Final
+from string.templatelib import Template
+from json_tstring import Json
+
+class YamlTemplate:
+    tstring_language: Final = "yaml"
+
+payload: Annotated[Template, Json, YamlTemplate] = t'{{"id": 1}}'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "template-metadata-conflict");
+    assert_eq!(json["diagnostics"][0]["severity"], "error");
+    assert!(
+        json["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("at most one language marker")
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_resolves_json_schema_binding_marker_alias() {
+    let dir = test_dir("json-schema-marker-alias");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated, TypedDict
+from string.templatelib import Template
+from json_tstring import Json as JsonMarker
+
+class Order(TypedDict):
+    id: int
+
+payload: Annotated[Template, JsonMarker(schema=Order)] = t'{{"id": "abc"}}'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 1);
+    assert_eq!(json["diagnostics"][0]["rule"], "template-schema-type-shape");
+    assert_eq!(json["diagnostics"][0]["language"], "json");
+    assert_eq!(json["diagnostics"][0]["schema_pointer"], "/id");
+    assert_eq!(json["diagnostics"][0]["source_of_truth"], "Order");
+    assert_eq!(json["diagnostics"][0]["expected_type"], "integer");
+    assert_eq!(json["diagnostics"][0]["found_type"], "string");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn check_reports_json_generic_binding_and_unresolved_binding() {
     let dir = test_dir("json-generic-binding");
     write_file(
@@ -256,7 +410,52 @@ class Order(TypedDict):
     id: int
 
 ok: Json[Order] = t'{{"id": 1}}'
+bad: Json[Order] = t'{{"id": "abc"}}'
 missing: Json[MissingOrder] = t'{{"id": 1}}'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let rules = json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|diagnostic| diagnostic["rule"].as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 2);
+    assert!(rules.contains(&"template-schema-type-shape"));
+    assert!(rules.contains(&"binding-unresolved"));
+    let shape = json["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|diagnostic| diagnostic["rule"] == "template-schema-type-shape")
+        .unwrap();
+    assert_eq!(shape["schema_pointer"], "/id");
+    assert_eq!(shape["source_of_truth"], "Order");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_resolves_json_schema_binding_type_alias() {
+    let dir = test_dir("json-schema-type-alias");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated, TypedDict
+from string.templatelib import Template
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+
+type OrderPayload = Annotated[Template, Json(schema=Order)]
+
+payload: OrderPayload = t'{{"id": "abc"}}'
 "#,
     );
 
@@ -266,7 +465,39 @@ missing: Json[MissingOrder] = t'{{"id": 1}}'
 
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(json["summary"]["diagnostics"], 1);
-    assert_eq!(json["diagnostics"][0]["rule"], "binding-unresolved");
+    assert_eq!(json["diagnostics"][0]["rule"], "template-schema-type-shape");
+    assert_eq!(json["diagnostics"][0]["language"], "json");
+    assert_eq!(json["diagnostics"][0]["schema_pointer"], "/id");
+    assert_eq!(json["diagnostics"][0]["source_of_truth"], "Order");
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn check_ignores_non_module_json_schema_type_alias() {
+    let dir = test_dir("json-schema-local-type-alias");
+    write_file(
+        &dir.join("broken.py"),
+        r#"from typing import Annotated, TypedDict
+from string.templatelib import Template
+from json_tstring import Json
+
+class Order(TypedDict):
+    id: int
+
+def configure() -> None:
+    type Payload = Annotated[Template, Json(schema=Order)]
+
+payload: Payload = t'{{"id": "abc"}}'
+"#,
+    );
+
+    let output = run_check(&dir, &["check", "broken.py", "--format", "json"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(json["summary"]["diagnostics"], 0);
 
     let _ = fs::remove_dir_all(dir);
 }
