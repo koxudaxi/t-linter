@@ -20,7 +20,7 @@ t-linter validates and formats embedded languages inside Python template strings
 - **Linting** - Detect syntax errors in embedded HTML, JSON, YAML, TOML, CSS, JavaScript, SQL
 - **Formatting** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML templates
 - **Syntax Highlighting** - Smart highlighting via LSP semantic tokens
-- **Type-based Detection** - Understands `Annotated[Template, "html"]` and type aliases
+- **Type-based Detection** - Understands `Annotated[Template, "html"]`, type aliases, and marker classes with `tstring_language`
 - **Interpolation Type Checking** - Optional LSP diagnostics for JSON, YAML, TOML, psycopg SQL, and TDOM interpolations through Ty, Pyright, or Pyrefly
 - **SQL Catalog Cache** - Narrows psycopg SQL parameters from PostgreSQL metadata, even when the editor session has no live database
 - **JSON Schema Binding** - Checks JSON template keys and static value shapes against `TypedDict` or dataclass models with `Json(schema=...)`

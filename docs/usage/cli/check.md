@@ -126,24 +126,12 @@ diagnostic list, so ignored or suppressed diagnostics are not rewritten. The
 initial fixable rules are selected `sql-*` diagnostics and selected
 `template-schema-*` diagnostics.
 
-## Error on Issues
+## JSON Schema Bindings
 
-Use `--error-on-issues` to exit with a non-zero code when issues are found:
-
-```bash
-t-linter check file.py --error-on-issues
-```
-
-This is useful for CI/CD pipelines.
-
-## JSON Schema Binding
-
-JSON templates can be bound to a Python schema marker. t-linter then checks the
-static JSON object against a `TypedDict` or dataclass model without executing the
-Python file.
-
-Use `Annotated[Template, "json", Json(schema=Model)]` when you want normal JSON
-syntax validation plus schema binding:
+For JSON templates, t-linter can compare static object keys and values against
+`TypedDict` or dataclass schema annotations. The schema binding is carried by
+`json_tstring.Json` marker kwargs; the marker also declares the JSON template
+language.
 
 ```python
 from typing import Annotated, NotRequired, TypedDict
@@ -155,15 +143,38 @@ class Order(TypedDict):
     name: str
     note: NotRequired[str]
 
-payload: Annotated[Template, "json", Json(schema=Order)] = (
+payload: Annotated[Template, Json(schema=Order)] = (
     t'{{"id": "abc", "nme": "Ada"}}'
 )
 ```
 
-`Json(schema=Order)` binds the schema. The `"json"` metadata keeps the normal
-embedded JSON parser, formatter, and highlighter path enabled. The same
-schema-binding checks can also be written without language metadata as
-`Annotated[Template, Json(schema=Order)]`, or directly as `Json[Order]`:
+This template is parsed as JSON and checked against `Order`. t-linter reports
+`template-schema-type-shape` for `"id": "abc"`,
+`template-schema-unknown-key` for `"nme"`, and `template-schema-missing-key`
+for the missing `name` key.
+
+The supported binding forms are:
+
+```python
+payload: Annotated[Template, Json(schema=Order)] = t'{"id": 1, "name": "Ada"}'
+default_json: Annotated[Template, Json] = t'{"id": 1, "name": "Ada"}'
+
+type OrderPayload = Annotated[Template, Json(schema=Order)]
+aliased: OrderPayload = t'{"id": 1, "name": "Ada"}'
+```
+
+`Json(schema=...)` may be imported directly, imported with an alias, or used as
+`json_tstring.Json(...)`. `Json(schema=Order)` is the preferred form because
+marker kwargs are where schema, dialect, and future options live.
+
+String language metadata is still supported as the lightweight tier:
+`Annotated[Template, "json"]`. Do not combine it with a marker for new code. If
+`"json"` and `Json(...)` are used together, t-linter reports
+`template-metadata-redundant-language` and suggests removing the string. If the
+string and marker disagree, or if an annotation contains multiple language
+markers, t-linter reports `template-metadata-conflict`.
+
+The direct `Json[Order]` annotation is also accepted:
 
 ```python
 from typing import TypedDict
@@ -175,9 +186,6 @@ class Order(TypedDict):
 
 payload: Json[Order] = t'{{"id": 1}}'
 ```
-
-Those shorter forms do not replace `"json"` metadata when you also need regular
-JSON syntax diagnostics, formatting, or LSP highlighting.
 
 t-linter reports:
 
@@ -192,6 +200,16 @@ classes. `TypedDict(total=False)`, `Required[...]`, `NotRequired[...]`, and
 dataclass defaults affect required-key diagnostics. Static scalar checks cover
 `int`, `float`, `str`, `bool`, `None`, `list[...]`, and `dict[...]`; interpolated
 values are left to interpolation type checking.
+
+## Error on Issues
+
+Use `--error-on-issues` to exit with a non-zero code when issues are found:
+
+```bash
+t-linter check file.py --error-on-issues
+```
+
+This is useful for CI/CD pipelines.
 
 ## Exit Codes
 

@@ -46,10 +46,18 @@ For backend-powered languages (HTML, T-HTML, TDOM, JSON, YAML, TOML), t-linter s
 
 For Tree-sitter-only languages (CSS, JavaScript, SQL), t-linter uses Tree-sitter for both highlighting and validation. Formatting is not yet available for these languages.
 
-## JSON Notes
+## Template Metadata Markers
 
-JSON templates can be bound to Python schema models for additional
-`t-linter check` diagnostics:
+String metadata remains the lightweight way to declare a template language:
+`Annotated[Template, "json"]`. It needs no imports and will not be deprecated.
+t-linter also recognizes Python marker classes, which let language packages
+carry schema, dialect, and option metadata on normal Python objects instead of
+reserving more bare strings.
+
+The built-in `json_tstring.Json` marker declares the JSON language when it is
+used in template metadata or as the template annotation itself. Its `schema`
+option also enables `t-linter check` diagnostics for local or imported
+`TypedDict` and dataclass models:
 
 ```python
 from typing import Annotated, TypedDict
@@ -58,18 +66,45 @@ from json_tstring import Json
 
 class Order(TypedDict):
     id: int
-    name: str
 
-payload: Annotated[Template, "json", Json(schema=Order)] = t'{{"id": 1}}'
+payload: Annotated[Template, Json(schema=Order)] = t'{"id": {order_id}}'
+default_payload: Annotated[Template, Json] = t'{"id": {order_id}}'
+
+type OrderPayload = Annotated[Template, Json(schema=Order)]
+aliased_payload: OrderPayload = t'{"id": {order_id}}'
 ```
 
-`Json(schema=Order)` binds the schema, while `"json"` keeps normal JSON syntax
-validation, formatting, and highlighting enabled. `Annotated[Template,
-Json(schema=Order)]` and `payload: Json[Order] = t"..."` are also supported for
-schema-binding checks, but they do not replace `"json"` language metadata.
+`Annotated[Template, Json]` uses the marker class with its defaults.
+`Annotated[Template, Json()]` uses a marker instance. Marker kwargs such as
+`schema=Order` or future dialect/options belong to the marker, not to the core
+language protocol.
+
+Do not combine string language metadata and marker language metadata for new
+code. If the string and marker agree, t-linter reports a redundant-language
+warning with a fix to remove the string. If they disagree, or if one
+`Annotated[...]` contains more than one language marker, t-linter reports a
+metadata conflict.
+
 t-linter checks required keys, unknown static keys, and static scalar value
-shapes against local or imported `TypedDict` and dataclass models. See
-[Check Command](usage/cli/check.md#json-schema-binding) for details.
+shapes against schema models. See
+[Check Command](usage/cli/check.md#json-schema-bindings) for details.
+
+Custom marker classes can declare a language structurally with
+`tstring_language`; no t-linter-specific base class is required. The class may
+live in source or in a `.pyi` stub so packages can expose language metadata
+through their normal Python toolchain. Static base classes are followed, but
+dynamic decorators, metaclasses, computed values, and reassignment are not part
+of the marker protocol.
+
+```python
+from typing import Annotated, Final
+from string.templatelib import Template
+
+class YamlTemplate:
+    tstring_language: Final = "yaml"
+
+config: Annotated[Template, YamlTemplate()] = t"name: {name}"
+```
 
 ## SQL Notes
 

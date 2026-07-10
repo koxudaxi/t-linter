@@ -37,7 +37,7 @@ t-linter validates and formats embedded languages inside Python template strings
 - 🔍 **Linting** - Detect syntax errors in embedded HTML, JSON, YAML, TOML, CSS, JavaScript, SQL
 - 🧹 **Formatting** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML templates
 - 🎨 **Syntax Highlighting** - Smart highlighting via LSP semantic tokens
-- 🔧 **Type-based Detection** - Understands `Annotated[Template, "html"]` and type aliases
+- 🔧 **Type-based Detection** - Understands `Annotated[Template, "html"]`, type aliases, and marker classes with `tstring_language`
 - 🧪 **Interpolation Type Checking** - Optional LSP diagnostics for JSON, YAML, TOML, psycopg SQL, and TDOM interpolations through Ty, Pyright, or Pyrefly
 - 🗄️ **SQL Catalog Cache** - Narrows psycopg SQL parameters from PostgreSQL metadata, even when the editor session has no live database
 - 📐 **JSON Schema Binding** - Checks JSON template keys and static value shapes against `TypedDict` or dataclass models with `Json(schema=...)`
@@ -179,17 +179,17 @@ class Order(TypedDict):
     name: str
     note: NotRequired[str]
 
-payload: Annotated[Template, "json", Json(schema=Order)] = (
+payload: Annotated[Template, Json(schema=Order)] = (
     t'{{"id": "abc", "nme": "Ada"}}'
 )
 ```
 
-`Json(schema=Order)` binds the schema, while `"json"` keeps the normal JSON
-syntax validation, formatting, and highlighting path enabled. The shorter
-`Annotated[Template, Json(schema=Order)]` and `payload: Json[Order] = t"..."`
-forms also run schema-binding checks, but they do not replace `"json"` language
-metadata. t-linter reads the annotation text only; the template is still a
-normal Python template string.
+`Json(schema=Order)` declares the JSON template language and binds the schema.
+`payload: Json[Order] = t"..."` is also accepted as a shorthand. Plain string
+metadata such as `Annotated[Template, "json"]` remains supported for
+language-only detection, but new code should not combine it with `Json(...)`;
+t-linter reports redundant or conflicting language metadata. t-linter reads the
+annotation text only; the template is still a normal Python template string.
 
 Exit codes:
 
@@ -461,7 +461,7 @@ For `html`, `<title>{value}</title>` is allowed and treated as escaped text.
 ### Planned Features
 - ✅ **Language Server Protocol (LSP)** - Fully implemented
 - ✅ **Syntax Highlighting** - Supports HTML, T-HTML, TDOM, SQL, JavaScript, CSS, JSON, YAML, TOML
-- ✅ **Type Alias Support** - Recognizes `type html = Annotated[Template, "html"]`
+- ✅ **Type Alias and Marker Support** - Recognizes `type html = Annotated[Template, "html"]` and marker classes with `tstring_language`
 - ✅ **Linting (`check` command)** - Validate template strings for syntax errors
 - ✅ **Formatting (`format` command)** - Canonical formatting for HTML, T-HTML, TDOM, JSON, YAML, TOML
 - ✅ **Statistics (`stats` command)** - Analyze template string usage across codebases
